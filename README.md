@@ -91,3 +91,5 @@ The extension value is hashed deterministically to pick an address inside the co
 ## License
 
 See the repository for license details.
+
+Inspired by [vproxy](https://github.com/vproxy-tools/vproxy) — a high-performance transparent proxy solution.
