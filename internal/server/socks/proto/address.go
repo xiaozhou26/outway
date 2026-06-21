@@ -1,0 +1,147 @@
+package proto
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net/netip"
+)
+
+// AddressType is the SOCKS5 address type code.
+type AddressType uint8
+
+const (
+	AddrIPv4   AddressType = 0x01
+	AddrDomain AddressType = 0x03
+	AddrIPv6   AddressType = 0x04
+)
+
+// Address is a SOCKS5 destination address: either a socket address or a
+// domain:port pair.
+type Address struct {
+	// Socket is non-nil for IPv4/IPv6 socket addresses.
+	Socket *netip.AddrPort
+	// Domain holds the hostname (when Socket is nil).
+	Domain string
+	// Port is the destination port (used with Domain).
+	Port uint16
+}
+
+// SocketAddress builds an Address from a socket address.
+func SocketAddress(addr netip.AddrPort) Address {
+	a := addr
+	return Address{Socket: &a}
+}
+
+// DomainAddress builds an Address from a domain and port.
+func DomainAddress(domain string, port uint16) Address {
+	return Address{Domain: domain, Port: port}
+}
+
+// Unspecified returns the unspecified IPv4 address (used in replies).
+func Unspecified() Address {
+	a := netip.AddrPortFrom(netip.IPv4Unspecified(), 0)
+	return Address{Socket: &a}
+}
+
+// MaxSerializedLen is the maximum length of a serialized address (1 + 1 + 255 + 2).
+const MaxSerializedLen = 1 + 1 + 255 + 2
+
+// Len returns the serialized length of the address.
+func (a Address) Len() int {
+	if a.Socket != nil {
+		if a.Socket.Addr().Is4() {
+			return 1 + 4 + 2
+		}
+		return 1 + 16 + 2
+	}
+	return 1 + 1 + len(a.Domain) + 2
+}
+
+// MarshalTo writes the address to w in SOCKS5 wire format.
+func (a Address) MarshalTo(w io.Writer) error {
+	if a.Socket != nil {
+		ap := *a.Socket
+		if ap.Addr().Is4() {
+			b := make([]byte, 0, 7)
+			b = append(b, byte(AddrIPv4))
+			v4 := ap.Addr().As4()
+			b = append(b, v4[:]...)
+			var p [2]byte
+			binary.BigEndian.PutUint16(p[:], ap.Port())
+			b = append(b, p[:]...)
+			return writeAll(w, b)
+		}
+		b := make([]byte, 0, 19)
+		b = append(b, byte(AddrIPv6))
+		v6 := ap.Addr().As16()
+		b = append(b, v6[:]...)
+		var p [2]byte
+		binary.BigEndian.PutUint16(p[:], ap.Port())
+		b = append(b, p[:]...)
+		return writeAll(w, b)
+	}
+	domain := []byte(a.Domain)
+	if len(domain) > 255 {
+		return fmt.Errorf("domain too long: %d", len(domain))
+	}
+	b := make([]byte, 0, 4+len(domain))
+	b = append(b, byte(AddrDomain))
+	b = append(b, byte(len(domain)))
+	b = append(b, domain...)
+	var p [2]byte
+	binary.BigEndian.PutUint16(p[:], a.Port)
+	b = append(b, p[:]...)
+	return writeAll(w, b)
+}
+
+// ReadAddress reads a SOCKS5 address from r.
+func ReadAddress(r io.Reader) (Address, error) {
+	atyp, err := readU8(r)
+	if err != nil {
+		return Address{}, err
+	}
+	switch AddressType(atyp) {
+	case AddrIPv4:
+		var buf [6]byte
+		if err := readFull(r, buf[:]); err != nil {
+			return Address{}, err
+		}
+		addr := netip.AddrFrom4([4]byte{buf[0], buf[1], buf[2], buf[3]})
+		port := binary.BigEndian.Uint16(buf[4:])
+		ap := netip.AddrPortFrom(addr, port)
+		return Address{Socket: &ap}, nil
+	case AddrDomain:
+		ln, err := readU8(r)
+		if err != nil {
+			return Address{}, err
+		}
+		buf := make([]byte, int(ln)+2)
+		if err := readFull(r, buf); err != nil {
+			return Address{}, err
+		}
+		port := binary.BigEndian.Uint16(buf[ln:])
+		return Address{Domain: string(buf[:ln]), Port: port}, nil
+	case AddrIPv6:
+		var buf [18]byte
+		if err := readFull(r, buf[:]); err != nil {
+			return Address{}, err
+		}
+		var addr16 [16]byte
+		copy(addr16[:], buf[:16])
+		addr := netip.AddrFrom16(addr16)
+		port := binary.BigEndian.Uint16(buf[16:])
+		ap := netip.AddrPortFrom(addr, port)
+		return Address{Socket: &ap}, nil
+	default:
+		return Address{}, fmt.Errorf("unsupported address type %#x", atyp)
+	}
+}
+
+// String returns a human-readable representation.
+func (a Address) String() string {
+	if a.Socket != nil {
+		return a.Socket.String()
+	}
+	return fmt.Sprintf("%s:%d", a.Domain, a.Port)
+}
