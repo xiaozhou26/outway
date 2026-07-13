@@ -50,6 +50,7 @@ func Run(args config.BootArgs) error {
 		"max_associations", args.UDP.MaxAssociations,
 		"idle_timeout_seconds", args.UDP.AssociationIdleTimeoutSecs,
 		"gso", args.UDP.GSO,
+		"gro", args.UDP.GRO,
 	)
 	warnIfUDPBufferClamped(args)
 	if err := prepareResourceLimits(args); err != nil {

@@ -56,7 +56,7 @@ const (
 // AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
 // SocketBufferBytes set to zero keeps the operating system default socket
 // buffer sizes. GSO enables Linux UDP_SEGMENT batching for same-destination
-// uniform-size sends.
+// uniform-size sends; GRO enables Linux UDP_GRO coalescing on the receive path.
 type UDPConfig struct {
 	MaxPacketSize              int
 	BatchSize                  int
@@ -68,6 +68,7 @@ type UDPConfig struct {
 	MetricsIntervalSecs        uint64
 	AssociationIdleTimeoutSecs uint64
 	GSO                        bool
+	GRO                        bool
 }
 
 // IsInterface reports whether the fallback references a network interface.
