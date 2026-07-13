@@ -46,7 +46,7 @@ outway run auto -b 127.0.0.1:1080 -u user -p pass
 ### High-concurrency IPv6 CIDR example
 
 ```bash
-sudo ./outway start -i 2604:2dc0:20e:4700::/56 --bind 0.0.0.0:9299 auto -u user -p password
+sudo ./outway start -i 2001:db8::/56 --bind 0.0.0.0:1080 auto -u user -p password
 ```
 
 The default active-connection limit is 8192. On Unix, outway raises the soft
@@ -65,7 +65,7 @@ or DNS), the kernel socket buffers are usually the first thing to overflow when
 traffic arrives in bursts. Enlarge them with `--udp-socket-buffer`:
 
 ```bash
-sudo ./outway run socks5 -i 2604:2dc0:20e:4700::/56 -b 0.0.0.0:9299 \
+sudo ./outway run socks5 -i 2001:db8::/56 -b 0.0.0.0:1080 \
   --udp-socket-buffer 8388608 -u user -p password
 ```
 
