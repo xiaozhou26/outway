@@ -511,43 +511,116 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		idleTimer.Reset(time.Duration(runtime.config.AssociationIdleTimeoutSecs) * time.Second)
 	}
 
+	// Request-direction batch senders. Client->target packets that carry a
+	// literal IP target are grouped by address family and flushed with one
+	// sendmmsg per outbound socket (Linux); domain targets stay on the async
+	// worker path so a cold DNS lookup never blocks this loop. Each writer is
+	// used only by this goroutine, so it needs no synchronization.
+	preferredWriter := newUDPBatchWriter(preferredOutbound, runtime.config.BatchSize)
+	preferredV4 := udpSocketIsV4(preferredOutbound)
+	var fallbackWriter udpBatchWriter
+	var fallbackV4 bool
+	if fallbackOutbound != nil {
+		fallbackWriter = newUDPBatchWriter(fallbackOutbound, runtime.config.BatchSize)
+		fallbackV4 = udpSocketIsV4(fallbackOutbound)
+	}
+	preferredBatch := make([]udpWritePacket, 0, runtime.config.BatchSize)
+	fallbackBatch := make([]udpWritePacket, 0, runtime.config.BatchSize)
+
+	flushBatch := func(writer udpBatchWriter, batch *[]udpWritePacket) {
+		if len(*batch) == 0 {
+			return
+		}
+		written, writeErr := writer.Write(*batch)
+		for _, write := range *batch {
+			runtime.releaseBuffer(write.owner, write.batchSlot)
+		}
+		if writeErr != nil || written != len(*batch) {
+			runtime.metrics.errors.Add(1)
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+			reportUDPError(errCh, writeErr)
+		}
+		*batch = (*batch)[:0]
+	}
+
+	// processInbound applies the fragment/authorization checks and metrics to one
+	// client packet, then either queues a literal-IP target into its family batch
+	// or dispatches a domain target to a send worker. It returns true when the
+	// packet counts as association activity.
+	processInbound := func(pkt inboundPacket) bool {
+		if pkt.frag != 0 {
+			slog.Debug("[SOCKS5][UDP] packet fragment is not supported")
+			runtime.metrics.fragmentDrops.Add(1)
+			runtime.releaseInboundPacket(pkt)
+			return false
+		}
+		if !isAuthorized(pkt.src, srcIP) {
+			slog.Debug("SOCKS5 UDP packet from unauthorized IP", "source", pkt.src, "expected", srcIP)
+			runtime.metrics.unauthorizedDrops.Add(1)
+			runtime.releaseInboundPacket(pkt)
+			return false
+		}
+		srcPort.Store(uint32(pkt.src.Port()))
+		runtime.metrics.inPackets.Add(1)
+		runtime.metrics.inBytes.Add(uint64(len(pkt.payload)))
+
+		if pkt.dst.Socket != nil {
+			target := netip.AddrPortFrom(pkt.dst.Socket.Addr().Unmap(), pkt.dst.Socket.Port())
+			batch := &preferredBatch
+			if preferredV4 != target.Addr().Is4() && fallbackWriter != nil && fallbackV4 == target.Addr().Is4() {
+				batch = &fallbackBatch
+			}
+			*batch = append(*batch, udpWritePacket{
+				buffer:    pkt.payload,
+				owner:     pkt.buffer,
+				addr:      target,
+				batchSlot: pkt.batchSlot,
+			})
+			return true
+		}
+
+		target := connect.FromHost(pkt.dst.Domain, pkt.dst.Port)
+		if !runtime.dispatch(udpSendJob{
+			associationID: associationID,
+			ctx:           ctx,
+			connector:     connector,
+			packet:        pkt,
+			target:        target,
+			preferred:     preferredOutbound,
+			fallback:      fallbackOutbound,
+			errCh:         errCh,
+		}) {
+			runtime.releaseInboundPacket(pkt)
+		}
+		return true
+	}
+
 	for {
 		select {
 		case pkt := <-inboundPkt:
-			if pkt.frag != 0 {
-				slog.Debug("[SOCKS5][UDP] packet fragment is not supported")
-				runtime.metrics.fragmentDrops.Add(1)
-				runtime.releaseInboundPacket(pkt)
-				continue
+			// Drain the packets already queued by the inbound batch reader into a
+			// single family-grouped send, bounded by BatchSize so no group can
+			// exceed the writer's message array.
+			active := processInbound(pkt)
+		drain:
+			for count := 1; count < runtime.config.BatchSize; count++ {
+				select {
+				case next := <-inboundPkt:
+					if processInbound(next) {
+						active = true
+					}
+				default:
+					break drain
+				}
 			}
-			if !isAuthorized(pkt.src, srcIP) {
-				slog.Debug("SOCKS5 UDP packet from unauthorized IP", "source", pkt.src, "expected", srcIP)
-				runtime.metrics.unauthorizedDrops.Add(1)
-				runtime.releaseInboundPacket(pkt)
-				continue
+			flushBatch(preferredWriter, &preferredBatch)
+			if fallbackWriter != nil {
+				flushBatch(fallbackWriter, &fallbackBatch)
 			}
-			resetIdle()
-			srcPort.Store(uint32(pkt.src.Port()))
-			runtime.metrics.inPackets.Add(1)
-			runtime.metrics.inBytes.Add(uint64(len(pkt.payload)))
-
-			var target connect.TargetAddr
-			if pkt.dst.Socket != nil {
-				target = connect.FromAddr(*pkt.dst.Socket)
-			} else {
-				target = connect.FromHost(pkt.dst.Domain, pkt.dst.Port)
-			}
-			if !runtime.dispatch(udpSendJob{
-				associationID: associationID,
-				ctx:           ctx,
-				connector:     connector,
-				packet:        pkt,
-				target:        target,
-				preferred:     preferredOutbound,
-				fallback:      fallbackOutbound,
-				errCh:         errCh,
-			}) {
-				runtime.releaseInboundPacket(pkt)
+			if active {
+				resetIdle()
 			}
 
 		case err := <-errCh:
@@ -735,6 +808,15 @@ func isAuthorized(src netip.AddrPort, expected netip.Addr) bool {
 		if e4 := expIP.Unmap(); e4 == srcIP {
 			return true
 		}
+	}
+	return false
+}
+
+// udpSocketIsV4 reports whether the UDP socket is bound to an IPv4 address,
+// used to route a target datagram to the matching-family outbound socket.
+func udpSocketIsV4(conn *net.UDPConn) bool {
+	if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return ua.IP.To4() != nil
 	}
 	return false
 }
