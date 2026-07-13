@@ -55,7 +55,8 @@ const (
 // selects an automatic value derived from GOMAXPROCS. MetricsIntervalSecs and
 // AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
 // SocketBufferBytes set to zero keeps the operating system default socket
-// buffer sizes.
+// buffer sizes. GSO enables Linux UDP_SEGMENT batching for same-destination
+// uniform-size sends.
 type UDPConfig struct {
 	MaxPacketSize              int
 	BatchSize                  int
@@ -66,6 +67,7 @@ type UDPConfig struct {
 	MaxAssociations            uint32
 	MetricsIntervalSecs        uint64
 	AssociationIdleTimeoutSecs uint64
+	GSO                        bool
 }
 
 // IsInterface reports whether the fallback references a network interface.

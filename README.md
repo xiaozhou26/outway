@@ -87,6 +87,13 @@ Other knobs that matter at high concurrency:
   requests are rejected rather than exhausting descriptors.
 - `--udp-metrics-interval` — logs structured counters (in/out packets, queue
   depth, drops by cause) to observe where packets are lost under load.
+- `--udp-gso` — on Linux, coalesce a burst of same-target, uniform-size
+  datagrams (e.g. a QUIC/HTTP-3 flow to one server) into a single `UDP_SEGMENT`
+  send so the kernel — or the NIC, when it supports UDP GSO offload — performs
+  the segmentation. This cuts send syscalls and stack traversals for fat
+  single-flow bursts; mixed-destination or ragged-size batches automatically
+  fall back to `sendmmsg`. Off by default; a no-op on non-Linux platforms and on
+  kernels without `UDP_SEGMENT`.
 
 #### Recommended sysctls (Linux)
 
@@ -148,6 +155,7 @@ outway self uninstall   # Remove the installed binary
 | `--udp-send-queue` | | `4096` | Global outbound UDP send queue capacity |
 | `--udp-send-workers` | | auto | Outbound UDP worker count |
 | `--udp-socket-buffer` | | `0` | `SO_RCVBUF`/`SO_SNDBUF` for UDP relay sockets in bytes; `0` keeps the system default |
+| `--udp-gso` | | `false` | Enable Linux `UDP_SEGMENT` (GSO) batching for same-target uniform-size sends |
 | `--udp-associations` | | `--concurrent` | Maximum active UDP associations |
 | `--udp-association-idle-timeout` | | disabled | Optional idle association timeout in seconds |
 | `--udp-metrics-interval` | | `30` | Structured UDP metrics log interval in seconds; `0` disables it |

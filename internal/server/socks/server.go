@@ -527,11 +527,22 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	preferredBatch := make([]udpWritePacket, 0, runtime.config.BatchSize)
 	fallbackBatch := make([]udpWritePacket, 0, runtime.config.BatchSize)
 
-	flushBatch := func(writer udpBatchWriter, batch *[]udpWritePacket) {
+	// When enabled and supported by the kernel, a batch that targets a single
+	// destination with uniform-size datagrams is sent with one UDP_SEGMENT (GSO)
+	// call instead of sendmmsg; anything else falls back to sendmmsg.
+	gsoEnabled := runtime.config.GSO && udpGSOSupported()
+
+	flushBatch := func(writer udpBatchWriter, conn *net.UDPConn, batch *[]udpWritePacket) {
 		if len(*batch) == 0 {
 			return
 		}
-		written, writeErr := writer.Write(*batch)
+		var written int
+		var writeErr error
+		if gsoSize, ok := gsoEligible(gsoEnabled, *batch); ok {
+			written, writeErr = sendUDPGSO(conn, *batch, gsoSize)
+		} else {
+			written, writeErr = writer.Write(*batch)
+		}
 		for _, write := range *batch {
 			runtime.releaseBuffer(write.owner, write.batchSlot)
 		}
@@ -615,9 +626,9 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 					break drain
 				}
 			}
-			flushBatch(preferredWriter, &preferredBatch)
+			flushBatch(preferredWriter, preferredOutbound, &preferredBatch)
 			if fallbackWriter != nil {
-				flushBatch(fallbackWriter, &fallbackBatch)
+				flushBatch(fallbackWriter, fallbackOutbound, &fallbackBatch)
 			}
 			if active {
 				resetIdle()
@@ -819,6 +830,36 @@ func udpSocketIsV4(conn *net.UDPConn) bool {
 		return ua.IP.To4() != nil
 	}
 	return false
+}
+
+// gsoEligible reports the UDP_SEGMENT size to use when the whole batch can be
+// sent as a single GSO super-datagram: at least two packets, all to the same
+// destination, every packet but the last exactly the first packet's size, and
+// the last no larger. It returns false when GSO is disabled or the batch is not
+// uniform, so the caller uses sendmmsg instead.
+func gsoEligible(enabled bool, batch []udpWritePacket) (int, bool) {
+	if !enabled || len(batch) < 2 {
+		return 0, false
+	}
+	dst := batch[0].addr
+	size := len(batch[0].buffer)
+	if size == 0 {
+		return 0, false
+	}
+	last := len(batch) - 1
+	for i := 1; i < len(batch); i++ {
+		if batch[i].addr != dst {
+			return 0, false
+		}
+		length := len(batch[i].buffer)
+		if i < last && length != size {
+			return 0, false
+		}
+		if i == last && length > size {
+			return 0, false
+		}
+	}
+	return size, true
 }
 
 // isClosed reports whether the error indicates a closed listener.
