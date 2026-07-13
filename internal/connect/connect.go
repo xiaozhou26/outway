@@ -1,4 +1,4 @@
-﻿// Package connect implements outbound connection establishment with optional
+// Package connect implements outbound connection establishment with optional
 // CIDR-based source address selection, fallback addresses/interfaces, and
 // dual-stack UDP support. It mirrors the Rust outway connect module.
 package connect
@@ -11,7 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
-	"sync"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,9 +23,9 @@ import (
 // TargetAddr represents a connection target: either a direct socket address or
 // a host:port to be resolved.
 type TargetAddr struct {
-	Addr   *netip.AddrPort // non-nil for a direct socket address
-	Host   string          // domain or IP literal (when Addr is nil)
-	Port   uint16
+	Addr *netip.AddrPort // non-nil for a direct socket address
+	Host string          // domain or IP literal (when Addr is nil)
+	Port uint16
 }
 
 // FromAddr builds a TargetAddr from a direct socket address.
@@ -47,7 +47,10 @@ type Connector struct {
 	ConnectTimeout time.Duration
 	TCPUserTimeout *time.Duration // Linux only
 	ReuseAddr      *bool
+	dialSlots      chan struct{}
 }
+
+const defaultMaxPendingDials = 512
 
 // New creates a Connector from boot configuration.
 func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connectTimeoutSec uint64, tcpUserTimeout *uint64, reuseaddr *bool) *Connector {
@@ -57,6 +60,7 @@ func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connec
 		Fallback:       fallback,
 		ConnectTimeout: time.Duration(connectTimeoutSec) * time.Second,
 		ReuseAddr:      reuseaddr,
+		dialSlots:      make(chan struct{}, defaultMaxPendingDials),
 	}
 	if tcpUserTimeout != nil {
 		d := time.Duration(*tcpUserTimeout) * time.Second
@@ -105,32 +109,105 @@ func (t *TcpConnector) SocketAddr(defaultFn func() (netip.Addr, error)) (netip.A
 
 // Connect establishes a TCP connection to the given target address.
 func (t *TcpConnector) Connect(ctx context.Context, target TargetAddr) (*net.TCPConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, t.inner.ConnectTimeout)
+	defer cancel()
+
 	var addrs []netip.AddrPort
 	if target.Addr != nil {
-		addrs = []netip.AddrPort{*target.Addr}
+		return t.connectAddr(ctx, *target.Addr)
 	} else {
-		resolved, err := resolveHost(target.Host, target.Port)
+		resolved, err := resolveHost(ctx, target.Host, target.Port)
 		if err != nil {
 			return nil, err
 		}
 		addrs = resolved
 	}
 
-	var lastErr error
-	for _, addr := range addrs {
-		conn, err := t.connectAddr(ctx, addr)
-		if err == nil {
-			return conn, nil
+	return t.connectAny(ctx, addrs)
+}
+
+func (t *TcpConnector) connectAny(ctx context.Context, addrs []netip.AddrPort) (*net.TCPConn, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("failed to connect to any resolved address")
+	}
+	if len(addrs) == 1 {
+		return t.connectAddr(ctx, addrs[0])
+	}
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan connResult)
+	start := func(addr netip.AddrPort) {
+		go func() {
+			conn, err := t.connectAddr(raceCtx, addr)
+			result := connResult{conn: conn, err: err}
+			select {
+			case results <- result:
+			case <-raceCtx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+
+	const addressFallbackDelay = 250 * time.Millisecond
+	started := 1
+	completed := 0
+	start(addrs[0])
+	timer := time.NewTimer(addressFallbackDelay)
+	defer timer.Stop()
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
-		lastErr = err
+		timer.Reset(addressFallbackDelay)
 	}
-	if lastErr == nil {
-		lastErr = errors.New("failed to connect to any resolved address")
+	var lastErr error
+
+	for {
+		select {
+		case result := <-results:
+			completed++
+			if result.err == nil {
+				cancel()
+				return result.conn, nil
+			}
+			lastErr = result.err
+			if completed == len(addrs) {
+				return nil, lastErr
+			}
+			if completed == started && started < len(addrs) {
+				start(addrs[started])
+				started++
+				if started < len(addrs) {
+					resetTimer()
+				}
+			}
+		case <-timer.C:
+			if started < len(addrs) {
+				start(addrs[started])
+				started++
+				if started < len(addrs) {
+					resetTimer()
+				}
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	return nil, lastErr
 }
 
 func (t *TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (*net.TCPConn, error) {
+	if t.inner.CIDR != nil && t.inner.CIDR.Addr().Is4() != target.Addr().Is4() {
+		if t.inner.Fallback != nil {
+			return t.connectWithFallback(ctx, target, *t.inner.Fallback)
+		}
+		return nil, fmt.Errorf("target %s address family does not match source CIDR %s; configure a fallback for dual-stack proxying", target, *t.inner.CIDR)
+	}
 	switch {
 	case t.inner.CIDR != nil && t.inner.Fallback != nil:
 		return t.connectWithCIDRFallback(ctx, target, *t.inner.CIDR, *t.inner.Fallback)
@@ -146,7 +223,17 @@ func (t *TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (
 // dialContext builds a net.Dialer with the configured source address and socket
 // options, then dials the target.
 func (t *TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindInterface string, target netip.AddrPort) (*net.TCPConn, error) {
-	dialer := &net.Dialer{Timeout: t.inner.ConnectTimeout}
+	select {
+	case t.inner.dialSlots <- struct{}{}:
+		defer func() { <-t.inner.dialSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   t.inner.ConnectTimeout,
+		KeepAlive: 60 * time.Second,
+	}
 
 	if bindIP.IsValid() {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.IP(bindIP.AsSlice()), Port: 0}
@@ -163,13 +250,13 @@ func (t *TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindI
 		return sockErr
 	}
 
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.Addr().String(), fmt.Sprint(target.Port())))
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.Addr().String(), strconv.Itoa(int(target.Port()))))
 	if err != nil {
 		return nil, err
 	}
 	tc := conn.(*net.TCPConn)
 	_ = tc.SetNoDelay(true)
-	logger().Info(fmt.Sprintf("[TCP] connect %s via %s", target, tc.LocalAddr()))
+	logger().Debug("TCP connected", "target", target, "local", tc.LocalAddr())
 	return tc, nil
 }
 
@@ -208,66 +295,75 @@ type connResult struct {
 // complete within the connect timeout it also races the fallback path,
 // returning the first success.
 func (t *TcpConnector) connectWithCIDRFallback(ctx context.Context, target netip.AddrPort, cidr netip.Prefix, fb config.Fallback) (*net.TCPConn, error) {
-	dial := func(d func() (*net.TCPConn, error)) chan connResult {
-		ch := make(chan connResult, 1)
-		go func() { c, e := d(); ch <- connResult{c, e} }()
-		return ch
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// An unbuffered result channel ensures a losing successful dial cannot be
+	// queued after the winner returns; cancellation instead closes that socket.
+	results := make(chan connResult)
+	startDial := func(dial func() (*net.TCPConn, error)) {
+		go func() {
+			conn, err := dial()
+			result := connResult{conn: conn, err: err}
+			select {
+			case results <- result:
+			case <-raceCtx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
 	}
 
-	preferred := dial(func() (*net.TCPConn, error) {
-		return t.connectWithCIDR(ctx, target, cidr)
+	startDial(func() (*net.TCPConn, error) {
+		return t.connectWithCIDR(raceCtx, target, cidr)
 	})
 
-	timer := time.NewTimer(t.inner.ConnectTimeout)
+	fallbackDelay := 500 * time.Millisecond
+	if halfTimeout := t.inner.ConnectTimeout / 2; halfTimeout < fallbackDelay {
+		fallbackDelay = halfTimeout
+	}
+	timer := time.NewTimer(fallbackDelay)
 	defer timer.Stop()
-
-	select {
-	case r := <-preferred:
-		if r.err == nil {
-			return r.conn, nil
-		}
-		return t.connectWithFallback(ctx, target, fb)
-	case <-timer.C:
-	}
-
-	// Race preferred and fallback.
-	fallback := dial(func() (*net.TCPConn, error) {
-		return t.connectWithFallback(ctx, target, fb)
-	})
+	fallbackStarted := false
+	failures := 0
+	var lastErr error
 
 	for {
 		select {
-		case r := <-preferred:
-			if r.err == nil {
-				closePending(fallback)
-				return r.conn, nil
+		case result := <-results:
+			if result.err == nil {
+				cancel()
+				return result.conn, nil
 			}
-			r2 := <-fallback
-			if r2.err == nil {
-				return r2.conn, nil
+			lastErr = result.err
+			failures++
+			if !fallbackStarted {
+				fallbackStarted = true
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				startDial(func() (*net.TCPConn, error) {
+					return t.connectWithFallback(raceCtx, target, fb)
+				})
+				continue
 			}
-			return nil, r2.err
-		case r := <-fallback:
-			if r.err == nil {
-				closePending(preferred)
-				return r.conn, nil
+			if failures == 2 {
+				return nil, lastErr
 			}
-			r2 := <-preferred
-			if r2.err == nil {
-				return r2.conn, nil
+		case <-timer.C:
+			if !fallbackStarted {
+				fallbackStarted = true
+				startDial(func() (*net.TCPConn, error) {
+					return t.connectWithFallback(raceCtx, target, fb)
+				})
 			}
-			return nil, r2.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
-}
-
-// closePending drains a result channel and closes any connection it carries.
-func closePending(ch <-chan connResult) {
-	go func() {
-		if r := <-ch; r.conn != nil {
-			_ = r.conn.Close()
-		}
-	}()
 }
 
 // UdpConnector establishes outbound UDP sockets using the parent Connector's
@@ -336,15 +432,14 @@ func (u *UdpConnector) SendPacket(ctx context.Context, pkt []byte, target Target
 	if target.Addr != nil {
 		addrs = []netip.AddrPort{*target.Addr}
 	} else {
-		resolved, err := resolveHost(target.Host, target.Port)
+		resolveCtx, cancel := context.WithTimeout(ctx, u.inner.ConnectTimeout)
+		resolved, err := resolveHost(resolveCtx, target.Host, target.Port)
+		cancel()
 		if err != nil {
 			return 0, err
 		}
 		addrs = resolved
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, u.inner.ConnectTimeout)
-	defer cancel()
 
 	var lastErr error
 	for _, addr := range addrs {
@@ -361,77 +456,34 @@ func (u *UdpConnector) SendPacket(ctx context.Context, pkt []byte, target Target
 }
 
 func (u *UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr netip.AddrPort, preferred, fallback *net.UDPConn) (int, error) {
-	if fallback == nil {
-		return u.trySendTo(pkt, addr, preferred)
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-
-	type sendResult struct {
-		n   int
-		err error
+	n, err := u.trySendTo(pkt, addr, preferred)
+	if err == nil || fallback == nil {
+		return n, err
 	}
-	dial := func(s *net.UDPConn) chan sendResult {
-		ch := make(chan sendResult, 1)
-		go func() { n, e := u.trySendTo(pkt, addr, s); ch <- sendResult{n, e} }()
-		return ch
-	}
-
-	prefCh := dial(preferred)
-	timer := time.NewTimer(u.inner.ConnectTimeout)
-	defer timer.Stop()
-
-	select {
-	case r := <-prefCh:
-		if r.err == nil {
-			return r.n, nil
-		}
-		return u.trySendTo(pkt, addr, fallback)
-	case <-timer.C:
-	}
-
-	fbCh := dial(fallback)
-	for {
-		select {
-		case r := <-prefCh:
-			if r.err == nil {
-				return r.n, nil
-			}
-			r2 := <-fbCh
-			return r2.n, r2.err
-		case r := <-fbCh:
-			if r.err == nil {
-				return r.n, nil
-			}
-			r2 := <-prefCh
-			return r2.n, r2.err
-		}
-	}
+	return u.trySendTo(pkt, addr, fallback)
 }
 
 func (u *UdpConnector) trySendTo(pkt []byte, addr netip.AddrPort, s *net.UDPConn) (int, error) {
-	n, err := s.WriteToUDP(pkt, net.UDPAddrFromAddrPort(addr))
-	if err == nil {
-		local, _ := s.LocalAddr().(*net.UDPAddr)
-		logger().Info(fmt.Sprintf("[UDP] packet sent to %s via %s, size: %d", addr, local, n))
-	}
-	return n, err
+	return s.WriteToUDP(pkt, net.UDPAddrFromAddrPort(addr))
 }
 
 // resolveHost resolves a host:port to a list of socket addresses.
-func resolveHost(host string, port uint16) ([]netip.AddrPort, error) {
+func resolveHost(ctx context.Context, host string, port uint16) ([]netip.AddrPort, error) {
 	// Fast path: literal IP.
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.AddrPort{netip.AddrPortFrom(ip, port)}, nil
 	}
 
-	ips, err := net.LookupIP(host)
+	ips, err := defaultDNSCache.Lookup(ctx, host)
 	if err != nil {
 		return nil, err
 	}
-	var addrs []netip.AddrPort
-	for _, ip := range ips {
-		if a, ok := netip.AddrFromSlice(ip); ok {
-			addrs = append(addrs, netip.AddrPortFrom(a, port))
-		}
+	addrs := make([]netip.AddrPort, len(ips))
+	for index, ip := range ips {
+		addrs[index] = netip.AddrPortFrom(ip, port)
 	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("failed to resolve %s", host)
@@ -593,9 +645,9 @@ func uint32ToIPv4(v uint32) netip.Addr {
 
 type uint128 struct{ hi, lo uint64 }
 
-func uint128One() uint128                  { return uint128{0, 1} }
-func uint128FromU64(v uint64) uint128       { return uint128{0, v} }
-func isZeroUint128(a uint128) bool          { return a.hi == 0 && a.lo == 0 }
+func uint128One() uint128             { return uint128{0, 1} }
+func uint128FromU64(v uint64) uint128 { return uint128{0, v} }
+func isZeroUint128(a uint128) bool    { return a.hi == 0 && a.lo == 0 }
 func bytesToUint128(b [16]byte) uint128 {
 	hi := uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
@@ -740,9 +792,6 @@ func applySocketOptions(fd uintptr, network, iface string, c *Connector) error {
 	}
 	return nil
 }
-
-// loggerOnce ensures a single slog logger is used.
-var loggerOnce sync.Once
 
 // readNoop silences unused-import warnings when io is not otherwise referenced.
 var _ = io.EOF

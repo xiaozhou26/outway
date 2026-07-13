@@ -3,18 +3,21 @@ package connect
 import (
 	"log/slog"
 	"os"
+	"sync/atomic"
 )
 
-var globalLogger *slog.Logger
+var globalLogger atomic.Pointer[slog.Logger]
+
+var fallbackLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 func logger() *slog.Logger {
-	if globalLogger != nil {
-		return globalLogger
+	if configured := globalLogger.Load(); configured != nil {
+		return configured
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return fallbackLogger
 }
 
 // SetLogger allows the server runtime to inject a configured logger.
 func SetLogger(l *slog.Logger) {
-	globalLogger = l
+	globalLogger.Store(l)
 }

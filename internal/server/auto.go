@@ -1,18 +1,21 @@
-﻿package server
+package server
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
-	nethttp "net/http"
 	"net"
+	nethttp "net/http"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/xiaozhou26/outway/internal/server/http"
 	"github.com/xiaozhou26/outway/internal/server/socks"
+	"github.com/xiaozhou26/outway/internal/serverbase"
 )
 
 // AutoDetectServer listens on a single port and routes each connection to the
@@ -24,6 +27,16 @@ type AutoDetectServer struct {
 	httpHdl   http.Handler
 	httpsHdl  http.Handler
 	tlsConfig *tls.Config
+	timeout   time.Duration
+	gate      *serverbase.ConnectionGate
+	tlsGate   *serverbase.ConnectionGate
+	conns     *serverbase.ConnectionSet
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	launchMu  sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewAutoDetectServer binds a TCP listener and prepares the three handlers
@@ -51,23 +64,33 @@ func NewAutoDetectServer(ctx Context, certPath, keyPath string) (*AutoDetectServ
 	if certPath != "" && keyPath != "" {
 		cfg, err := http.NewTLSConfigFromFiles(certPath, keyPath)
 		if err != nil {
+			_ = ln.Close()
 			return nil, err
 		}
 		tlsCfg = cfg.Config()
 	} else {
 		cfg, err := http.NewSelfSignedTLSConfig()
 		if err != nil {
+			_ = ln.Close()
 			return nil, err
 		}
 		tlsCfg = cfg.Config()
 	}
 
+	handler := http.NewHandler(ctx)
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &AutoDetectServer{
 		listener:  ln,
-		socksAcc:  socks.NewAcceptor(ctx),
-		httpHdl:   http.NewHandler(ctx),
-		httpsHdl:  http.NewHandler(ctx),
+		socksAcc:  socks.NewAcceptor(ctx, lifetime),
+		httpHdl:   handler,
+		httpsHdl:  handler,
 		tlsConfig: tlsCfg,
+		timeout:   time.Duration(ctx.ConnectTimeout) * time.Second,
+		gate:      serverbase.NewConnectionGate(ctx.Concurrent),
+		tlsGate:   serverbase.NewTLSHandshakeGate(ctx.Concurrent),
+		conns:     serverbase.NewConnectionSet(),
+		ctx:       lifetime,
+		cancel:    cancel,
 	}, nil
 }
 
@@ -81,35 +104,73 @@ func (s *AutoDetectServer) Start() error {
 			if isClosedErr(err) {
 				return nil
 			}
-			slog.Debug(fmt.Sprintf("Failed to accept connection: %v", err))
+			slog.Debug("Failed to accept connection", "error", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go s.accept(conn)
+		s.launchMu.Lock()
+		if !s.conns.Add(conn) {
+			s.launchMu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		if !s.gate.AcquireUntil(s.conns.Done()) {
+			s.conns.Remove(conn)
+			s.launchMu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.gate.Release()
+			defer s.conns.Remove(conn)
+			s.accept(conn)
+		}()
+		s.launchMu.Unlock()
 	}
 }
 
 // Close stops the listener.
-func (s *AutoDetectServer) Close() error { return s.listener.Close() }
+func (s *AutoDetectServer) Close() error {
+	s.closeOnce.Do(func() {
+		s.cancel()
+		connectionErr := s.conns.CloseAll()
+		listenerErr := s.listener.Close()
+		if errors.Is(listenerErr, net.ErrClosed) {
+			listenerErr = nil
+		}
+		s.launchMu.Lock()
+		s.launchMu.Unlock()
+		s.httpHdl.CloseIdleConnections()
+		var waitErr error
+		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
+			waitErr = errors.New("auto-detect handlers did not stop before shutdown timeout")
+		}
+		s.closeErr = errors.Join(connectionErr, listenerErr, waitErr)
+	})
+	return s.closeErr
+}
 
 // accept peeks at the first byte of the connection to determine the protocol
 // and dispatches to the appropriate handler.
 func (s *AutoDetectServer) accept(conn net.Conn) {
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
+	serverbase.TuneTCPConnection(conn)
 
 	// Peek the first byte to determine the protocol:
 	//   0x05         -> SOCKS5
 	//   0x00..=0x40  -> HTTPS (TLS starts with a binary byte < 0x41)
 	//   >= 0x41      -> HTTP (ASCII method: GET, POST, CONNECT, etc.)
-	br := bufio.NewReader(conn)
+	br := serverbase.AcquireBufferedReader(conn)
+	defer serverbase.ReleaseBufferedReader(br)
+	_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
 	first, err := br.Peek(1)
 	if err != nil {
-		slog.Debug(fmt.Sprintf("[AUTO] peek failed: %v", err))
+		slog.Debug("Protocol detection failed", "error", err)
 		_ = conn.Close()
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 
 	var peer netip.AddrPort
 	if ra, rerr := netip.ParseAddrPort(conn.RemoteAddr().String()); rerr == nil {
@@ -126,26 +187,38 @@ func (s *AutoDetectServer) accept(conn net.Conn) {
 		s.serveHTTPS(&bufferedConn{Conn: conn, br: br})
 	default:
 		// HTTP: serve plain HTTP.
-		s.serveHTTP(&bufferedConn{Conn: conn, br: br})
+		s.serveHTTP(conn, br)
 	}
 }
 
 // serveHTTPS wraps the connection with TLS and serves HTTP over it.
 func (s *AutoDetectServer) serveHTTPS(conn net.Conn) {
+	_ = conn.SetDeadline(time.Now().Add(s.timeout))
 	tlsConn := tls.Server(conn, s.tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		slog.Debug(fmt.Sprintf("[AUTO] TLS handshake failed: %v", err))
+	if !s.tlsGate.AcquireUntil(s.conns.Done()) {
 		_ = conn.Close()
 		return
 	}
-	br := bufio.NewReader(tlsConn)
-	bw := bufio.NewWriter(tlsConn)
+	err := tlsConn.Handshake()
+	s.tlsGate.Release()
+	if err != nil {
+		slog.Debug("Auto-detected TLS handshake failed", "error", err)
+		_ = conn.Close()
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+	br := serverbase.AcquireBufferedReader(tlsConn)
+	defer serverbase.ReleaseBufferedReader(br)
+	bw := serverbase.AcquireBufferedWriter(tlsConn)
+	defer serverbase.ReleaseBufferedWriter(bw)
 	for {
+		_ = tlsConn.SetReadDeadline(time.Now().Add(s.timeout))
 		req, err := nethttp.ReadRequest(br)
 		if err != nil {
 			break
 		}
-		keepAlive, _ := s.httpsHdl.Proxy(tlsConn, br, req, bw)
+		_ = tlsConn.SetReadDeadline(time.Time{})
+		keepAlive, _ := s.httpsHdl.Proxy(s.ctx, tlsConn, br, req, bw)
 		if !keepAlive {
 			break
 		}
@@ -154,15 +227,17 @@ func (s *AutoDetectServer) serveHTTPS(conn net.Conn) {
 }
 
 // serveHTTP serves plain HTTP on the connection.
-func (s *AutoDetectServer) serveHTTP(conn net.Conn) {
-	br := bufio.NewReader(conn)
-	bw := bufio.NewWriter(conn)
+func (s *AutoDetectServer) serveHTTP(conn net.Conn, br *bufio.Reader) {
+	bw := serverbase.AcquireBufferedWriter(conn)
+	defer serverbase.ReleaseBufferedWriter(bw)
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
 		req, err := nethttp.ReadRequest(br)
 		if err != nil {
 			break
 		}
-		keepAlive, _ := s.httpHdl.Proxy(conn, br, req, bw)
+		_ = conn.SetReadDeadline(time.Time{})
+		keepAlive, _ := s.httpHdl.Proxy(s.ctx, conn, br, req, bw)
 		if !keepAlive {
 			break
 		}
@@ -181,8 +256,8 @@ func (c *bufferedConn) Read(p []byte) (int, error) { return c.br.Read(p) }
 
 // isClosedErr reports whether the error indicates a closed listener.
 func isClosedErr(err error) bool {
-	if err == nil {
-		return false
+	if errors.Is(err, net.ErrClosed) {
+		return true
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {

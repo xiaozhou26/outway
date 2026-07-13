@@ -18,8 +18,11 @@ func NewTLSConfigFromPEM(certPEM, keyPEM []byte) (*TLSConfig, error) {
 	}
 	return &TLSConfig{cfg: &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2", "http/1.1"},
-		MinVersion:   tls.VersionTLS12,
+		// The proxy currently parses HTTP/1.x requests directly from the TLS
+		// stream. Advertising h2 would let clients negotiate a protocol this
+		// server cannot decode.
+		NextProtos: []string{"http/1.1"},
+		MinVersion: tls.VersionTLS12,
 	}}, nil
 }
 

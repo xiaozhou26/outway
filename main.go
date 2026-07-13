@@ -1,4 +1,4 @@
-﻿// Package main is the outway command-line entry point. It wires up the CLI
+// Package main is the outway command-line entry point. It wires up the CLI
 // commands (run, start, restart, stop, ps, log, self) to the server, daemon,
 // and self-update modules.
 package main
@@ -135,7 +135,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf := cmd.PersistentFlags()
 	pf.StringVarP(&flagLogLevel, "log", "L", "info", "Log level (trace / debug / info / warn / error)")
 	pf.StringVarP(&flagBind, "bind", "b", "127.0.0.1:1080", "Bind address (listen endpoint)")
-	pf.Uint32VarP(&flagConcurrent, "concurrent", "c", 1024, "Maximum concurrent active connections")
+	pf.Uint32VarP(&flagConcurrent, "concurrent", "c", 8192, "Maximum concurrent active connections")
 	pf.IntVarP(&flagWorkers, "workers", "w", 0, "Worker thread count (default: number of logical CPU cores)")
 	pf.StringVarP(&flagCIDR, "cidr", "i", "", "Base CIDR block for outbound source address selection")
 	pf.Uint8VarP(&flagCIDRRange, "cidr-range", "r", 0, "Sub-range bit width (CIDR range extension)")
@@ -224,6 +224,9 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 		return config.BootArgs{}, fmt.Errorf("unknown proxy type %q", proxyName)
 	}
 
+	if err := args.Validate(); err != nil {
+		return config.BootArgs{}, err
+	}
 	return args, nil
 }
 
@@ -249,12 +252,18 @@ func execRun(cmd *cobra.Command, _ []string) error {
 
 // execStart executes the "start" command: re-exec with "run" in daemon mode.
 func execStart(cmd *cobra.Command, _ []string) error {
+	if _, err := buildBootArgs(proxyNameFromArgs(cmd)); err != nil {
+		return err
+	}
 	runArgs := buildRunArgsFromOSArgs("start")
 	return daemon.Default().Start(runArgs)
 }
 
 // execRestart executes the "restart" command: stop then start in daemon mode.
 func execRestart(cmd *cobra.Command, _ []string) error {
+	if _, err := buildBootArgs(proxyNameFromArgs(cmd)); err != nil {
+		return err
+	}
 	runArgs := buildRunArgsFromOSArgs("restart")
 	return daemon.Default().Restart(runArgs)
 }

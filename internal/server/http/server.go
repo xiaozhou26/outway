@@ -1,4 +1,4 @@
-﻿package http
+package http
 
 import (
 	"bufio"
@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xiaozhou26/outway/internal/connect"
@@ -25,12 +27,37 @@ type HttpServer struct {
 	handler   Handler
 	tlsConfig *tls.Config
 	timeout   time.Duration
+	gate      *serverbase.ConnectionGate
+	tlsGate   *serverbase.ConnectionGate
+	conns     *serverbase.ConnectionSet
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	launchMu  sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Handler holds the authenticator and outbound connector for HTTP proxying.
 type Handler struct {
-	auth      Authenticator
-	connector *connect.Connector
+	auth       Authenticator
+	connector  *connect.Connector
+	transports *transportPool
+}
+
+const maxTransportEntries = 128
+
+type transportPool struct {
+	mu               sync.Mutex
+	connector        *connect.Connector
+	entries          map[ext.Extension]*transportEntry
+	clock            uint64
+	defaultTransport *http.Transport
+}
+
+type transportEntry struct {
+	transport *http.Transport
+	lastUsed  uint64
 }
 
 // NewHandler builds a Handler from a server Context.
@@ -41,7 +68,11 @@ func NewHandler(ctx serverbase.Context) Handler {
 	} else {
 		auth = NoAuth()
 	}
-	return Handler{auth: auth, connector: ctx.Connector}
+	return Handler{
+		auth:       auth,
+		connector:  ctx.Connector,
+		transports: newTransportPool(ctx.Connector),
+	}
 }
 
 // NewServer binds a TCP listener and returns an HTTP server.
@@ -62,10 +93,16 @@ func NewServer(ctx serverbase.Context) (*HttpServer, error) {
 			return nil, err
 		}
 	}
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &HttpServer{
 		listener: ln,
 		handler:  NewHandler(ctx),
 		timeout:  time.Duration(ctx.ConnectTimeout) * time.Second,
+		gate:     serverbase.NewConnectionGate(ctx.Concurrent),
+		tlsGate:  serverbase.NewTLSHandshakeGate(ctx.Concurrent),
+		conns:    serverbase.NewConnectionSet(),
+		ctx:      lifetime,
+		cancel:   cancel,
 	}, nil
 }
 
@@ -106,49 +143,96 @@ func (s *HttpServer) Start() error {
 			if isClosed(err) {
 				return nil
 			}
-			slog.Debug(fmt.Sprintf("Failed to accept connection: %v", err))
+			slog.Debug("Failed to accept connection", "error", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go s.accept(conn)
+		s.launchMu.Lock()
+		if !s.conns.Add(conn) {
+			s.launchMu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		if !s.gate.AcquireUntil(s.conns.Done()) {
+			s.conns.Remove(conn)
+			s.launchMu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.gate.Release()
+			defer s.conns.Remove(conn)
+			s.accept(conn)
+		}()
+		s.launchMu.Unlock()
 	}
 }
 
 // Close stops the listener.
-func (s *HttpServer) Close() error { return s.listener.Close() }
+func (s *HttpServer) Close() error {
+	s.closeOnce.Do(func() {
+		s.cancel()
+		connectionErr := s.conns.CloseAll()
+		listenerErr := s.listener.Close()
+		if errors.Is(listenerErr, net.ErrClosed) {
+			listenerErr = nil
+		}
+		s.launchMu.Lock()
+		s.launchMu.Unlock()
+		s.handler.CloseIdleConnections()
+		var waitErr error
+		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
+			waitErr = errors.New("HTTP handlers did not stop before shutdown timeout")
+		}
+		s.closeErr = errors.Join(connectionErr, listenerErr, waitErr)
+	})
+	return s.closeErr
+}
 
 // accept handles a single accepted connection, optionally performing a TLS
 // handshake, then serving HTTP requests on it.
 func (s *HttpServer) accept(conn net.Conn) {
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
+	serverbase.TuneTCPConnection(conn)
 
 	var stream net.Conn = conn
 	if s.tlsConfig != nil {
+		_ = conn.SetDeadline(time.Now().Add(s.timeout))
 		tlsConn := tls.Server(conn, s.tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
-			slog.Debug(fmt.Sprintf("[HTTP] TLS handshake failed: %v", err))
+		if !s.tlsGate.AcquireUntil(s.conns.Done()) {
 			_ = conn.Close()
 			return
 		}
+		err := tlsConn.Handshake()
+		s.tlsGate.Release()
+		if err != nil {
+			slog.Debug("HTTP TLS handshake failed", "error", err)
+			_ = conn.Close()
+			return
+		}
+		_ = conn.SetDeadline(time.Time{})
 		stream = tlsConn
 	}
 
-	br := bufio.NewReader(stream)
-	bw := bufio.NewWriter(stream)
+	br := serverbase.AcquireBufferedReader(stream)
+	defer serverbase.ReleaseBufferedReader(br)
+	bw := serverbase.AcquireBufferedWriter(stream)
+	defer serverbase.ReleaseBufferedWriter(bw)
 
 	for {
+		_ = stream.SetReadDeadline(time.Now().Add(s.timeout))
 		req, err := http.ReadRequest(br)
 		if err != nil {
 			if err != io.EOF {
-				slog.Debug(fmt.Sprintf("[HTTP] read request: %v", err))
+				slog.Debug("HTTP request read failed", "error", err)
 			}
 			break
 		}
-		keepAlive, err := s.handler.Proxy(stream, br, req, bw)
+		_ = stream.SetReadDeadline(time.Time{})
+		keepAlive, err := s.handler.Proxy(s.ctx, stream, br, req, bw)
 		if err != nil {
-			slog.Debug(fmt.Sprintf("[HTTP] serve connection: %v", err))
+			slog.Debug("HTTP connection failed", "error", err)
 			break
 		}
 		if !keepAlive {
@@ -160,7 +244,7 @@ func (s *HttpServer) accept(conn net.Conn) {
 
 // Proxy handles a single HTTP request. It returns true if the connection can
 // be kept alive for further requests.
-func (h Handler) Proxy(conn net.Conn, br *bufio.Reader, req *http.Request, bw *bufio.Writer) (bool, error) {
+func (h Handler) Proxy(ctx context.Context, conn net.Conn, br *bufio.Reader, req *http.Request, bw *bufio.Writer) (bool, error) {
 	// Authenticate the client.
 	extension, err := h.auth.Authenticate(req.Header)
 	if err != nil {
@@ -176,14 +260,14 @@ func (h Handler) Proxy(conn net.Conn, br *bufio.Reader, req *http.Request, bw *b
 	}
 
 	if req.Method == http.MethodConnect {
-		return h.handleConnect(conn, br, req, extension, bw)
+		return h.handleConnect(ctx, conn, br, req, extension, bw)
 	}
-	return h.forwardRequest(req, extension, bw)
+	return h.forwardRequest(ctx, req, extension, bw)
 }
 
 // handleConnect implements the HTTP CONNECT method: establish a TCP tunnel
 // between the client and the target.
-func (h Handler) handleConnect(client net.Conn, br *bufio.Reader, req *http.Request, extension ext.Extension, bw *bufio.Writer) (bool, error) {
+func (h Handler) handleConnect(ctx context.Context, client net.Conn, br *bufio.Reader, req *http.Request, extension ext.Extension, bw *bufio.Writer) (bool, error) {
 	target := req.URL.Host
 	if target == "" {
 		target = req.Host
@@ -199,10 +283,10 @@ func (h Handler) handleConnect(client net.Conn, br *bufio.Reader, req *http.Requ
 		return false, nil
 	}
 
-	slog.Info(fmt.Sprintf("[HTTP] %s -> %s forwarding connection", client.RemoteAddr(), target))
+	slog.Debug("HTTP tunnel forwarding", "client", client.RemoteAddr(), "target", target)
 
 	connector := h.connector.TCP(extension)
-	outbound, err := connector.Connect(context.Background(), connect.FromHost(host, port))
+	outbound, err := connector.Connect(ctx, connect.FromHost(host, port))
 	if err != nil {
 		writeResponse(bw, http.StatusBadGateway, "")
 		return false, err
@@ -215,14 +299,15 @@ func (h Handler) handleConnect(client net.Conn, br *bufio.Reader, req *http.Requ
 	// If the bufio.Reader has buffered bytes from the client, forward them to
 	// the outbound before entering the bidirectional copy.
 	if n := br.Buffered(); n > 0 {
-		buf := make([]byte, n)
-		_, _ = io.ReadFull(br, buf)
-		_, _ = outbound.Write(buf)
+		if _, err := io.CopyN(outbound, br, int64(n)); err != nil {
+			_ = outbound.Close()
+			return false, err
+		}
 	}
 
 	// Tunnel raw bytes between client and outbound.
-	fromClient, fromServer, _ := serverbase.CopyBidirectional(client, outbound)
-	slog.Info(fmt.Sprintf("[HTTP] client wrote %d bytes and received %d bytes", fromClient, fromServer))
+	fromClient, fromServer, _ := serverbase.CopyBidirectionalContext(ctx, client, outbound, serverbase.DefaultHalfCloseGrace)
+	slog.Debug("HTTP tunnel closed", "sent", fromClient, "received", fromServer)
 	_ = outbound.CloseWrite()
 	_ = outbound.Close()
 	_ = serverbase.CloseWrite(client)
@@ -231,7 +316,7 @@ func (h Handler) handleConnect(client net.Conn, br *bufio.Reader, req *http.Requ
 
 // forwardRequest forwards a non-CONNECT HTTP request to the target server and
 // writes the response back to the client.
-func (h Handler) forwardRequest(req *http.Request, extension ext.Extension, bw *bufio.Writer) (bool, error) {
+func (h Handler) forwardRequest(ctx context.Context, req *http.Request, extension ext.Extension, bw *bufio.Writer) (bool, error) {
 	// The request URL for a proxy request is absolute; for a direct request it
 	// is relative. We need to build the outbound URL.
 	outURL := *req.URL
@@ -243,43 +328,14 @@ func (h Handler) forwardRequest(req *http.Request, extension ext.Extension, bw *
 	}
 
 	// Strip hop-by-hop headers.
-	outReq := req.Clone(context.Background())
+	outReq := req.Clone(ctx)
 	outReq.URL = &outURL
 	outReq.RequestURI = ""
 	removeHopHeaders(outReq.Header)
 
-	// Connect to the target.
-	host := outURL.Hostname()
-	port := outURL.Port()
-	if port == "" {
-		port = "80"
-	}
-	portNum, err := parsePort(port)
-	if err != nil {
-		portNum = 80
-	}
-
-	connector := h.connector.TCP(extension)
-	outbound, err := connector.Connect(context.Background(), connect.FromHost(host, portNum))
+	resp, err := h.transports.Get(extension).RoundTrip(outReq)
 	if err != nil {
 		writeResponse(bw, http.StatusBadGateway, "")
-		return false, err
-	}
-	defer outbound.Close()
-
-	// Write the request to the outbound connection.
-	if err := outReq.Write(outbound); err != nil {
-		return false, err
-	}
-	if outReq.Body != nil {
-		_, _ = io.Copy(outbound, outReq.Body)
-		_ = outReq.Body.Close()
-	}
-	_ = outbound.CloseWrite()
-
-	// Read the response from the outbound and write it back to the client.
-	resp, err := http.ReadResponse(bufio.NewReader(outbound), outReq)
-	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
@@ -287,12 +343,104 @@ func (h Handler) forwardRequest(req *http.Request, extension ext.Extension, bw *
 	if err := resp.Write(bw); err != nil {
 		return false, err
 	}
-	if _, err := io.Copy(bw, resp.Body); err != nil {
-		return false, err
-	}
 	_ = bw.Flush()
 	keepAlive := req.ProtoAtLeast(1, 1) && resp.ProtoAtLeast(1, 1) && !req.Close && !resp.Close
 	return keepAlive, nil
+}
+
+func newTransportPool(connector *connect.Connector) *transportPool {
+	pool := &transportPool{
+		connector: connector,
+		entries:   make(map[ext.Extension]*transportEntry),
+	}
+	pool.defaultTransport = pool.newTransport(ext.None)
+	return pool
+}
+
+func (p *transportPool) Get(extension ext.Extension) *http.Transport {
+	if extension.Type == ext.ExtNone {
+		return p.defaultTransport
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clock++
+	if entry := p.entries[extension]; entry != nil {
+		entry.lastUsed = p.clock
+		return entry.transport
+	}
+
+	if len(p.entries) >= maxTransportEntries {
+		var oldestExtension ext.Extension
+		var oldestEntry *transportEntry
+		for candidate, entry := range p.entries {
+			if oldestEntry == nil || entry.lastUsed < oldestEntry.lastUsed {
+				oldestExtension = candidate
+				oldestEntry = entry
+			}
+		}
+		if oldestEntry != nil {
+			delete(p.entries, oldestExtension)
+			oldestEntry.transport.CloseIdleConnections()
+		}
+	}
+
+	transport := p.newTransport(extension)
+	p.entries[extension] = &transportEntry{transport: transport, lastUsed: p.clock}
+	return transport
+}
+
+func (p *transportPool) newTransport(extension ext.Extension) *http.Transport {
+	maxIdle := 16
+	maxIdlePerHost := 8
+	if extension.Type == ext.ExtNone {
+		maxIdle = 1024
+		maxIdlePerHost = 128
+	}
+	return &http.Transport{
+		Proxy:                 nil,
+		DialContext:           p.dialContext(extension),
+		ForceAttemptHTTP2:     false,
+		DisableCompression:    true,
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   maxIdlePerHost,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   p.connector.ConnectTimeout,
+		ResponseHeaderTimeout: p.connector.ConnectTimeout,
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
+func (p *transportPool) dialContext(extension ext.Extension) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, _, address string) (net.Conn, error) {
+		host, portString, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		port, err := strconv.ParseUint(portString, 10, 16)
+		if err != nil || port == 0 {
+			return nil, fmt.Errorf("invalid target port %q", portString)
+		}
+		return p.connector.TCP(extension).Connect(ctx, connect.FromHost(host, uint16(port)))
+	}
+}
+
+func (p *transportPool) CloseIdleConnections() {
+	p.mu.Lock()
+	transports := make([]*http.Transport, 0, len(p.entries)+1)
+	transports = append(transports, p.defaultTransport)
+	for _, entry := range p.entries {
+		transports = append(transports, entry.transport)
+	}
+	p.mu.Unlock()
+	for _, transport := range transports {
+		transport.CloseIdleConnections()
+	}
+}
+
+func (h Handler) CloseIdleConnections() {
+	if h.transports != nil {
+		h.transports.CloseIdleConnections()
+	}
 }
 
 // hop-by-hop headers (RFC 7230 搂6.1).
@@ -309,13 +457,17 @@ var hopHeaders = []string{
 }
 
 func removeHopHeaders(h http.Header) {
+	// Connection may name additional hop-by-hop fields. Capture those tokens
+	// before deleting the Connection header itself.
+	var connectionTokens []string
+	if conn := h.Get("Connection"); conn != "" {
+		connectionTokens = strings.Split(conn, ",")
+	}
 	for _, k := range hopHeaders {
 		h.Del(k)
 	}
-	if conn := h.Get("Connection"); conn != "" {
-		for _, tok := range strings.Split(conn, ",") {
-			h.Del(strings.TrimSpace(tok))
-		}
+	for _, tok := range connectionTokens {
+		h.Del(strings.TrimSpace(tok))
 	}
 }
 
@@ -332,7 +484,7 @@ func writeResponse(bw *bufio.Writer, status int, body string) {
 		resp.Header.Set("Proxy-Authenticate", `Basic realm="Proxy"`)
 	}
 	if body != "" {
-		resp.Body = stringBody(body)
+		resp.Body = io.NopCloser(strings.NewReader(body))
 		resp.ContentLength = int64(len(body))
 		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	}
@@ -367,22 +519,10 @@ func parsePort(s string) (uint16, error) {
 	return uint16(p), nil
 }
 
-// stringBody wraps a string as an io.ReadCloser for use as a response body.
-type stringBody string
-
-func (s stringBody) Read(p []byte) (int, error) {
-	if len(s) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, []byte(s))
-	return n, io.EOF
-}
-func (s stringBody) Close() error { return nil }
-
 // isClosed reports whether the error indicates a closed listener.
 func isClosed(err error) bool {
-	if err == nil {
-		return false
+	if errors.Is(err, net.ErrClosed) {
+		return true
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {

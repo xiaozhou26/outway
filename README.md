@@ -42,6 +42,21 @@ Example with bind address and authentication:
 outway run auto -b 127.0.0.1:1080 -u user -p pass
 ```
 
+### High-concurrency IPv6 CIDR example
+
+```bash
+sudo ./outway start -i 2604:2dc0:20e:4700::/56 --bind 0.0.0.0:9299 auto -u user -p password
+```
+
+The default active-connection limit is 8192. On Unix, outway raises the soft
+file-descriptor limit before listening and fails startup if the hard limit is
+too low. Linux CIDR route and non-local-bind configuration is also treated as
+a required startup step.
+
+An IPv6-only source CIDR can connect only to IPv6 destinations. Configure
+`--fallback` with a local address or interface when IPv4 destination support is
+required.
+
 ### Daemon (Unix)
 
 ```
@@ -65,7 +80,7 @@ outway self uninstall   # Remove the installed binary
 |------|-------|---------|-------------|
 | `--log` | `-L` | `info` | Log level (trace / debug / info / warn / error) |
 | `--bind` | `-b` | `127.0.0.1:1080` | Bind address (listen endpoint) |
-| `--concurrent` | `-c` | `1024` | Maximum concurrent active connections |
+| `--concurrent` | `-c` | `8192` | Maximum concurrent active connections |
 | `--workers` | `-w` | CPU cores | Worker thread count |
 | `--cidr` | `-i` | | Base CIDR block for outbound source selection |
 | `--cidr-range` | `-r` | `0` | Sub-range bit width (CIDR range extension) |

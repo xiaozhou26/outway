@@ -23,6 +23,10 @@ func processAlive(pid int) bool { return false }
 // sleep100ms sleeps for 100 milliseconds.
 func sleep100ms() {}
 
+func (d *Daemon) waitForStartup(pid int) error {
+	return errors.New("daemon mode is only supported on Unix platforms")
+}
+
 // PID returns 0 on non-Unix platforms.
 func (d *Daemon) PID() (int, error) { return 0, nil }
 

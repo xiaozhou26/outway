@@ -34,6 +34,23 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Race detector
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./...
+
+      - name: Linux concurrency smoke test
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          OUTWAY_STRESS_CONNECTIONS=1000 OUTWAY_STRESS_ROUNDS=5 \
+            go test -count=1 -run '^TestSOCKS5ConcurrentTunnelsStress$' ./internal/server/socks
+          OUTWAY_STRESS_CONNECTIONS=1000 OUTWAY_STRESS_ROUNDS=5 \
+            go test -count=1 -run '^TestHTTPConnectConcurrentTunnelsStress$' ./internal/server/http
+          OUTWAY_STRESS_AUTO_CONNECTIONS=1000 OUTWAY_STRESS_ROUNDS=5 \
+            go test -count=1 -run '^TestAutoHTTPConnectConcurrentTunnelsStress$' ./internal/server
+          OUTWAY_STRESS_UDP_ASSOCIATIONS=32 OUTWAY_STRESS_UDP_PACKETS=100 \
+            go test -count=1 -run '^TestSOCKS5UDPAssociationsStress$' ./internal/server/socks
+
   build:
     name: Build ${{ matrix.target.goos }}/${{ matrix.target.goarch }}
     runs-on: ubuntu-latest

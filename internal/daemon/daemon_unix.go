@@ -53,6 +53,31 @@ func startDetached(runArgs []string, stdout, stderr *os.File) (int, error) {
 	return pid, nil
 }
 
+// waitForStartup verifies that the detached child survives long enough to
+// complete route, resource-limit, TLS, and listener initialization. Startup
+// errors are written to the daemon stderr file by main.
+func (d *Daemon) waitForStartup(pid int) error {
+	deadline := time.Now().Add(750 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			message := ""
+			if data, err := os.ReadFile(d.stderrFile); err == nil {
+				const maxMessage = 4096
+				if len(data) > maxMessage {
+					data = data[len(data)-maxMessage:]
+				}
+				message = strings.TrimSpace(string(data))
+			}
+			if message != "" {
+				return fmt.Errorf("daemon exited during startup: %s", message)
+			}
+			return fmt.Errorf("daemon exited during startup")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return nil
+}
+
 // stopProcess sends SIGINT to the process up to 360 times (once per second)
 // until it exits.
 func stopProcess(pid int) {

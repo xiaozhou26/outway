@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	binName          = "outway"
-	defaultPIDPath   = "/var/run/outway.pid"
+	binName           = "outway"
+	defaultPIDPath    = "/var/run/outway.pid"
 	defaultStdoutPath = "/var/run/outway.out"
 	defaultStderrPath = "/var/run/outway.err"
 )
@@ -64,6 +64,10 @@ func (d *Daemon) Start(runArgs []string) error {
 
 	if err := os.WriteFile(d.pidFile, []byte(fmt.Sprintf("%d", pid)), 0o755); err != nil {
 		return fmt.Errorf("write pid file: %w", err)
+	}
+	if err := d.waitForStartup(pid); err != nil {
+		_ = os.Remove(d.pidFile)
+		return err
 	}
 
 	fmt.Printf("%s started with pid: %d\n", binName, pid)

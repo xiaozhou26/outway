@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"net/netip"
 	"strings"
 )
@@ -71,13 +72,43 @@ type BootArgs struct {
 	Proxy          ProxyConfig
 }
 
+// Validate checks cross-field constraints that cannot be expressed by the CLI
+// flag types alone.
+func (a BootArgs) Validate() error {
+	if a.Concurrent == 0 {
+		return fmt.Errorf("concurrent connection limit must be greater than zero")
+	}
+	if a.ConnectTimeout == 0 {
+		return fmt.Errorf("connect timeout must be greater than zero")
+	}
+	if a.Workers < 0 {
+		return fmt.Errorf("workers must not be negative")
+	}
+	if (a.Proxy.Auth.Username == "") != (a.Proxy.Auth.Password == "") {
+		return fmt.Errorf("username and password must be configured together")
+	}
+	if (a.Proxy.TLSCert == "") != (a.Proxy.TLSKey == "") {
+		return fmt.Errorf("TLS certificate and key must be configured together")
+	}
+	if a.CIDRRange != nil {
+		if a.CIDR == nil {
+			return fmt.Errorf("CIDR range requires a CIDR")
+		}
+		rangeBits := int(*a.CIDRRange)
+		if rangeBits < a.CIDR.Bits() || rangeBits > a.CIDR.Addr().BitLen() {
+			return fmt.Errorf("CIDR range must be between %d and %d for %s", a.CIDR.Bits(), a.CIDR.Addr().BitLen(), a.CIDR)
+		}
+	}
+	return nil
+}
+
 // DefaultBootArgs returns boot arguments with the same defaults as the CLI.
 func DefaultBootArgs() BootArgs {
 	reuse := true
 	return BootArgs{
 		LogLevel:       "info",
 		Bind:           netip.MustParseAddrPort("127.0.0.1:1080"),
-		Concurrent:     1024,
+		Concurrent:     8192,
 		ConnectTimeout: 10,
 		ReuseAddr:      &reuse,
 	}

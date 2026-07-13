@@ -1,7 +1,9 @@
-﻿package connect
+package connect
 
 import (
+	"context"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/xiaozhou26/outway/internal/ext"
@@ -13,6 +15,18 @@ func TestIPv4ToUint32RoundTrip(t *testing.T) {
 	got := uint32ToIPv4(v)
 	if got != addr {
 		t.Errorf("round trip failed: %s -> %d -> %s", addr, v, got)
+	}
+}
+
+func TestIPv6CIDRRejectsIPv4TargetWithoutFallback(t *testing.T) {
+	cidr := netip.MustParsePrefix("2604:2dc0:20e:4700::/56")
+	connector := New(&cidr, nil, nil, 1, nil, nil)
+	_, err := connector.TCP(ext.None).connectAddr(
+		context.Background(),
+		netip.MustParseAddrPort("192.0.2.1:443"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "configure a fallback") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -126,6 +140,29 @@ func TestAssignRandIPv6(t *testing.T) {
 	got := assignRandIPv6(cidr)
 	if !cidr.Contains(got) {
 		t.Errorf("assignRandIPv6: %s not in %s", got, cidr)
+	}
+}
+
+func TestAssignRandIPv6ProductionPrefix(t *testing.T) {
+	cidr := netip.MustParsePrefix("2604:2dc0:20e:4700::/56")
+	seen := make(map[netip.Addr]struct{}, 1024)
+	for range 1024 {
+		address := assignRandIPv6(cidr)
+		if !cidr.Contains(address) {
+			t.Fatalf("assigned address %s is outside %s", address, cidr)
+		}
+		seen[address] = struct{}{}
+	}
+	if len(seen) < 1000 {
+		t.Fatalf("only generated %d distinct source addresses from 1024 assignments", len(seen))
+	}
+}
+
+func BenchmarkAssignRandIPv6ProductionPrefix(b *testing.B) {
+	cidr := netip.MustParsePrefix("2604:2dc0:20e:4700::/56")
+	b.ReportAllocs()
+	for range b.N {
+		_ = assignRandIPv6(cidr)
 	}
 }
 

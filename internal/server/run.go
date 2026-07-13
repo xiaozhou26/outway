@@ -1,6 +1,7 @@
-﻿package server
+package server
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -18,6 +19,10 @@ import (
 // Run starts the proxy server with the provided boot arguments and blocks
 // until the server shuts down (via error or Ctrl-C).
 func Run(args config.BootArgs) error {
+	if err := args.Validate(); err != nil {
+		return err
+	}
+
 	// Initialize the logger.
 	level := parseSlogLevel(args.LogLevel)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
@@ -28,16 +33,25 @@ func Run(args config.BootArgs) error {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
+	runtime.GOMAXPROCS(workers)
 
 	slog.Info(fmt.Sprintf("OS: %s", runtime.GOOS))
 	slog.Info(fmt.Sprintf("Arch: %s", runtime.GOARCH))
 	slog.Info(fmt.Sprintf("Concurrent: %d", args.Concurrent))
 	slog.Info(fmt.Sprintf("Worker threads: %d", workers))
 	slog.Info(fmt.Sprintf("Connect timeout: %ds", args.ConnectTimeout))
+	if err := prepareResourceLimits(args.Concurrent); err != nil {
+		return err
+	}
 
 	// On Linux, configure routes and sysctls for the CIDR.
 	if cidr := args.CIDR; cidr != nil {
-		configureRoutes(*cidr)
+		if err := configureRoutes(*cidr); err != nil {
+			return fmt.Errorf("configure source CIDR %s: %w", cidr, err)
+		}
+		if err := validateSourceCIDR(*cidr); err != nil {
+			return fmt.Errorf("validate source CIDR %s: %w", cidr, err)
+		}
 	}
 
 	// Build the connector.
@@ -59,13 +73,19 @@ func Run(args config.BootArgs) error {
 		Connector:      connector,
 	}
 
+	srv, err := newProxyServer(args.Proxy, ctx)
+	if err != nil {
+		return err
+	}
+
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- startProxy(args.Proxy, ctx)
+		errCh <- srv.Start()
 	}()
 
 	select {
@@ -73,42 +93,40 @@ func Run(args config.BootArgs) error {
 		return err
 	case sig := <-sigCh:
 		slog.Info(fmt.Sprintf("Shutdown signal received (%v), shutting down gracefully...", sig))
-		return nil
+		closeErr := srv.Close()
+		serveErr := <-errCh
+		return errors.Join(closeErr, serveErr)
 	}
 }
 
-// startProxy starts the appropriate proxy server based on the proxy config.
-func startProxy(proxy config.ProxyConfig, ctx Context) error {
+type proxyServer interface {
+	Start() error
+	Close() error
+}
+
+// newProxyServer constructs the appropriate proxy server based on the proxy
+// config. Construction happens before the serve goroutine so Run retains a
+// handle that can be closed during shutdown.
+func newProxyServer(proxy config.ProxyConfig, ctx Context) (proxyServer, error) {
 	switch proxy.Kind {
 	case config.ProxyHTTP:
-		srv, err := httpsvr.NewServer(ctx)
-		if err != nil {
-			return err
-		}
-		return srv.Start()
+		return httpsvr.NewServer(ctx)
 	case config.ProxyHTTPS:
 		srv, err := httpsvr.NewServer(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := srv.WithHTTPS(proxy.TLSCert, proxy.TLSKey); err != nil {
-			return err
+			_ = srv.Close()
+			return nil, err
 		}
-		return srv.Start()
+		return srv, nil
 	case config.ProxySocks5:
-		srv, err := socks.NewServer(ctx)
-		if err != nil {
-			return err
-		}
-		return srv.Start()
+		return socks.NewServer(ctx)
 	case config.ProxyAuto:
-		srv, err := NewAutoDetectServer(ctx, proxy.TLSCert, proxy.TLSKey)
-		if err != nil {
-			return err
-		}
-		return srv.Start()
+		return NewAutoDetectServer(ctx, proxy.TLSCert, proxy.TLSKey)
 	default:
-		return fmt.Errorf("unknown proxy kind: %d", proxy.Kind)
+		return nil, fmt.Errorf("unknown proxy kind: %d", proxy.Kind)
 	}
 }
 
@@ -130,4 +148,10 @@ func parseSlogLevel(s string) slog.Level {
 
 // configureRoutes is implemented in route_linux.go / route_other.go.
 // It receives the CIDR prefix to configure.
-var configureRoutes = func(cidr netip.Prefix) {}
+var configureRoutes = func(cidr netip.Prefix) error { return nil }
+
+// validateSourceCIDR is implemented on Linux and is a no-op elsewhere.
+var validateSourceCIDR = func(cidr netip.Prefix) error { return nil }
+
+// prepareResourceLimits is implemented on Unix and is a no-op elsewhere.
+var prepareResourceLimits = func(concurrent uint32) error { return nil }

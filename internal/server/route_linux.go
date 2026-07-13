@@ -21,29 +21,67 @@ const routePriority = 1024
 
 func init() {
 	configureRoutes = configureRoutesLinux
+	validateSourceCIDR = validateSourceCIDRLinux
+}
+
+func validateSourceCIDRLinux(cidr netip.Prefix) error {
+	address := cidr.Masked().Addr()
+	if next := address.Next(); next.IsValid() && cidr.Contains(next) {
+		address = next
+	}
+	ip := net.IP(address.AsSlice())
+
+	tcpNetwork := "tcp4"
+	udpNetwork := "udp4"
+	if address.Is6() {
+		tcpNetwork = "tcp6"
+		udpNetwork = "udp6"
+	}
+	tcpListener, err := net.ListenTCP(tcpNetwork, &net.TCPAddr{IP: ip, Port: 0})
+	if err != nil {
+		return fmt.Errorf("bind TCP source address %s: %w", address, err)
+	}
+	if err := tcpListener.Close(); err != nil {
+		return fmt.Errorf("close TCP source-address probe: %w", err)
+	}
+
+	udpListener, err := net.ListenUDP(udpNetwork, &net.UDPAddr{IP: ip, Port: 0})
+	if err != nil {
+		return fmt.Errorf("bind UDP source address %s: %w", address, err)
+	}
+	if err := udpListener.Close(); err != nil {
+		return fmt.Errorf("close UDP source-address probe: %w", err)
+	}
+	slog.Info("Validated source CIDR binding", "cidr", cidr, "address", address)
+	return nil
 }
 
 // configureRoutesLinux configures sysctls and routes for the given CIDR on
 // Linux: enables IPv6 non-local bind, enables IPv6 globally, and adds a local
 // route for the CIDR to the loopback interface.
-func configureRoutesLinux(cidr netip.Prefix) {
+func configureRoutesLinux(cidr netip.Prefix) error {
 	if cidr.Addr().Is6() {
-		sysctlSet("net.ipv6.ip_nonlocal_bind", "1")
-		sysctlSet("net.ipv6.conf.all.disable_ipv6", "0")
+		if err := sysctlSet("net.ipv6.ip_nonlocal_bind", "1"); err != nil {
+			return err
+		}
+		if err := sysctlSet("net.ipv6.conf.all.disable_ipv6", "0"); err != nil {
+			return err
+		}
 	}
 	if err := addRouteToLoopback(cidr); err != nil {
-		slog.Debug(fmt.Sprintf("Failed to apply route: %v", err))
+		return err
 	}
+	return nil
 }
 
 // sysctlSet writes a value to a sysctl key via /proc/sys.
-func sysctlSet(key, value string) {
+func sysctlSet(key, value string) error {
 	path := "/proc/sys/" + keyToPath(key)
 	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
-		slog.Debug(fmt.Sprintf("Failed to set sysctl %s=%s: %v", key, value, err))
-		return
+		return fmt.Errorf("set sysctl %s=%s: %w", key, value, err)
 	}
-	slog.Debug(fmt.Sprintf("Sysctl %s=%s", key, value))
+	slog.Debug("Configured sysctl", "key", key, "value", value)
+	return nil
 }
 
 // keyToPath converts a dotted sysctl key to a /proc/sys path.
