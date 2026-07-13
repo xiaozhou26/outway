@@ -54,12 +54,15 @@ const (
 // UDPConfig controls SOCKS5 UDP relay resource usage. SendWorkers set to zero
 // selects an automatic value derived from GOMAXPROCS. MetricsIntervalSecs and
 // AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
+// SocketBufferBytes set to zero keeps the operating system default socket
+// buffer sizes.
 type UDPConfig struct {
 	MaxPacketSize              int
 	BatchSize                  int
 	BatchBufferBudget          int
 	SendQueueSize              int
 	SendWorkers                int
+	SocketBufferBytes          int
 	MaxAssociations            uint32
 	MetricsIntervalSecs        uint64
 	AssociationIdleTimeoutSecs uint64
@@ -121,6 +124,9 @@ func (a BootArgs) Validate() error {
 	}
 	if a.UDP.SendWorkers < 0 || a.UDP.SendWorkers > 4096 {
 		return fmt.Errorf("UDP send workers must be between 0 and 4096")
+	}
+	if a.UDP.SocketBufferBytes != 0 && (a.UDP.SocketBufferBytes < 4096 || a.UDP.SocketBufferBytes > 1<<30) {
+		return fmt.Errorf("UDP socket buffer must be 0 (system default) or between 4096 and %d bytes", 1<<30)
 	}
 	if a.UDP.MaxAssociations > a.Concurrent {
 		return fmt.Errorf("UDP association limit must not exceed concurrent connection limit")

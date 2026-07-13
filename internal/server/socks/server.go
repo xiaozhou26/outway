@@ -354,6 +354,7 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		_ = client.Close()
 		return err
 	}
+	connect.TuneUDPBuffers(inbound, runtime.config.SocketBufferBytes)
 	listenAddr, _ := netip.ParseAddrPort(inbound.LocalAddr().String())
 	slog.Debug("SOCKS5 UDP association listening", "address", listenAddr)
 
@@ -369,6 +370,8 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		_ = client.Close()
 		return err
 	}
+	connect.TuneUDPBuffers(preferredOutbound, runtime.config.SocketBufferBytes)
+	connect.TuneUDPBuffers(fallbackOutbound, runtime.config.SocketBufferBytes)
 
 	// Determine the authorized source IP for UDP packets. If the client did not
 	// specify a non-wildcard IP in the association request, default to the TCP
