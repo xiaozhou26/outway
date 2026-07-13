@@ -7,6 +7,7 @@ A high-performance HTTP/HTTPS/SOCKS5 proxy server written in Go, with per-connec
 - **Multiple protocols** — HTTP, HTTPS, and SOCKS5 proxying.
 - **Auto-detection** — a single port can serve SOCKS5, HTTP, and HTTPS simultaneously, dispatching each connection by inspecting its first byte.
 - **CIDR-based source selection** — bind outbound connections to addresses chosen from a configured CIDR block, selected deterministically per session/TTL/range via username extensions.
+- **High-concurrency SOCKS5 UDP relay** — batched `recvmmsg`/`sendmmsg` I/O on Linux, a bounded buffer pool, per-association source-IP authorization, and tunable socket buffers for large UDP proxy pools.
 - **Authentication** — optional username/password (Basic auth for HTTP, username/password auth for SOCKS5).
 - **Daemon management** — start, stop, restart, status, and log commands (Unix).
 - **Self-update** — download and install the latest release directly from GitHub.
@@ -57,6 +58,36 @@ An IPv6-only source CIDR can connect only to IPv6 destinations. Configure
 `--fallback` with a local address or interface when IPv4 destination support is
 required.
 
+### Tuning the SOCKS5 UDP relay under load
+
+For a busy UDP proxy pool (many simultaneous UDP associations, e.g. QUIC/HTTP-3
+or DNS), the kernel socket buffers are usually the first thing to overflow when
+traffic arrives in bursts. Enlarge them with `--udp-socket-buffer`:
+
+```bash
+sudo ./outway run socks5 -i 2604:2dc0:20e:4700::/56 -b 0.0.0.0:9299 \
+  --udp-socket-buffer 8388608 -u user -p password
+```
+
+On Linux, outway sets the buffers with `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, which
+bypass the `net.core.rmem_max` / `net.core.wmem_max` sysctl ceilings but require
+`CAP_NET_ADMIN` (i.e. run as root or grant the capability). Without that
+capability the request is silently clamped to `rmem_max`/`wmem_max`, so raise
+those sysctls first if you cannot grant it. On other platforms the size is
+always subject to the OS limits.
+
+Other knobs that matter at high concurrency:
+
+- `--udp-batch-size` — on Linux, packets are received and sent in batches via
+  `recvmmsg`/`sendmmsg`; a larger batch amortizes syscall overhead.
+- `--udp-batch-buffer-budget` — caps the extra pooled buffers held by concurrent
+  batches, bounding memory under a large association count.
+- `--udp-send-queue` / `--udp-send-workers` — size the outbound send pipeline.
+- `--udp-associations` — hard cap on active associations; excess UDP ASSOCIATE
+  requests are rejected rather than exhausting descriptors.
+- `--udp-metrics-interval` — logs structured counters (in/out packets, queue
+  depth, drops by cause) to observe where packets are lost under load.
+
 ### Daemon (Unix)
 
 ```
@@ -93,6 +124,7 @@ outway self uninstall   # Remove the installed binary
 | `--udp-batch-buffer-budget` | | `1024` | Process-wide extra buffer budget for concurrent Linux UDP batches; `0` uses scalar reads |
 | `--udp-send-queue` | | `4096` | Global outbound UDP send queue capacity |
 | `--udp-send-workers` | | auto | Outbound UDP worker count |
+| `--udp-socket-buffer` | | `0` | `SO_RCVBUF`/`SO_SNDBUF` for UDP relay sockets in bytes; `0` keeps the system default |
 | `--udp-associations` | | `--concurrent` | Maximum active UDP associations |
 | `--udp-association-idle-timeout` | | disabled | Optional idle association timeout in seconds |
 | `--udp-metrics-interval` | | `30` | Structured UDP metrics log interval in seconds; `0` disables it |

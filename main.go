@@ -35,6 +35,7 @@ var (
 	flagUDPBatchBufferBudget   int
 	flagUDPSendQueueSize       int
 	flagUDPSendWorkers         int
+	flagUDPSocketBuffer        int
 	flagUDPMaxAssociations     uint32
 	flagUDPMetricsInterval     uint64
 	flagUDPAssociationIdleTime uint64
@@ -155,6 +156,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.IntVar(&flagUDPBatchBufferBudget, "udp-batch-buffer-budget", config.DefaultUDPBatchBufferBudget, "Maximum extra pooled buffers held by concurrent Linux UDP batches (0: scalar reads)")
 	pf.IntVar(&flagUDPSendQueueSize, "udp-send-queue", config.DefaultUDPSendQueueSize, "Global queued UDP packets awaiting outbound send")
 	pf.IntVar(&flagUDPSendWorkers, "udp-send-workers", 0, "UDP outbound send workers (0: automatic)")
+	pf.IntVar(&flagUDPSocketBuffer, "udp-socket-buffer", 0, "SO_RCVBUF/SO_SNDBUF for UDP relay sockets in bytes (0: system default)")
 	pf.Uint32Var(&flagUDPMaxAssociations, "udp-associations", 0, "Maximum active UDP associations (0: inherit --concurrent)")
 	pf.Uint64Var(&flagUDPMetricsInterval, "udp-metrics-interval", config.DefaultUDPMetricsIntervalSecs, "UDP metrics log interval in seconds (0: disabled)")
 	pf.Uint64Var(&flagUDPAssociationIdleTime, "udp-association-idle-timeout", 0, "Close idle UDP associations after this many seconds (0: disabled)")
@@ -196,6 +198,7 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 			BatchBufferBudget:          flagUDPBatchBufferBudget,
 			SendQueueSize:              flagUDPSendQueueSize,
 			SendWorkers:                flagUDPSendWorkers,
+			SocketBufferBytes:          flagUDPSocketBuffer,
 			MaxAssociations:            flagUDPMaxAssociations,
 			MetricsIntervalSecs:        flagUDPMetricsInterval,
 			AssociationIdleTimeoutSecs: flagUDPAssociationIdleTime,

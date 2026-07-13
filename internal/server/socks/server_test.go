@@ -416,19 +416,31 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 		}
 	}
 
-	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer echo.Close()
-	go func() {
-		buffer := make([]byte, MaxUDPRelayPacketSize)
-		for {
-			n, remote, err := echo.ReadFromUDP(buffer)
-			if err != nil {
-				return
+	// One echo socket per association: a single shared echo socket's kernel
+	// receive buffer (net.core.rmem_default) silently drops packets when
+	// hundreds of associations burst at once, which would measure the host
+	// sysctl instead of the relay.
+	echoSockets := make([]*net.UDPConn, associationCount)
+	for index := range associationCount {
+		echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		echoSockets[index] = echo
+		go func() {
+			buffer := make([]byte, 2048)
+			for {
+				n, remote, err := echo.ReadFromUDP(buffer)
+				if err != nil {
+					return
+				}
+				_, _ = echo.WriteToUDP(buffer[:n], remote)
 			}
-			_, _ = echo.WriteToUDP(buffer[:n], remote)
+		}()
+	}
+	defer func() {
+		for _, echo := range echoSockets {
+			_ = echo.Close()
 		}
 	}()
 
@@ -463,19 +475,21 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 		}
 	}()
 
-	target := echo.LocalAddr().(*net.UDPAddr).AddrPort()
 	var wg sync.WaitGroup
 	errorsCh := make(chan error, associationCount)
 	for associationIndex, association := range associations {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := association.client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-				errorsCh <- err
-				return
-			}
-			responseBuffer := make([]byte, MaxUDPRelayPacketSize)
+			target := echoSockets[associationIndex].LocalAddr().(*net.UDPAddr).AddrPort()
+			responseBuffer := make([]byte, 2048)
 			for packetIndex := range packetsPerAssociation {
+				// The deadline bounds one round trip, not the association
+				// lifetime: the test asserts zero loss, not aggregate latency.
+				if err := association.client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+					errorsCh <- err
+					return
+				}
 				var payload [8]byte
 				binary.BigEndian.PutUint32(payload[:4], uint32(associationIndex))
 				binary.BigEndian.PutUint32(payload[4:], uint32(packetIndex))

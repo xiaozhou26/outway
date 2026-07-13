@@ -46,6 +46,7 @@ func Run(args config.BootArgs) error {
 		"batch_buffer_budget", args.UDP.BatchBufferBudget,
 		"send_queue", args.UDP.SendQueueSize,
 		"send_workers", args.UDP.SendWorkers,
+		"socket_buffer_bytes", args.UDP.SocketBufferBytes,
 		"max_associations", args.UDP.MaxAssociations,
 		"idle_timeout_seconds", args.UDP.AssociationIdleTimeoutSecs,
 	)

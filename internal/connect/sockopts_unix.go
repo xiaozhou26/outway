@@ -1,9 +1,13 @@
-//go:build !unix && !windows
+//go:build unix && !linux
 
 package connect
 
-// setReuseAddr is a no-op on platforms without a socket-option API.
-func setReuseAddr(fd uintptr) error { return nil }
+import "syscall"
+
+// setReuseAddr enables SO_REUSEADDR on the socket.
+func setReuseAddr(fd uintptr) error {
+	return syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+}
 
 // setTCPUserTimeout is a no-op on non-Linux platforms.
 func setTCPUserTimeout(fd, ms int) error { return nil }

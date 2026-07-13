@@ -43,10 +43,17 @@ func prepareResourceLimitsUnix(args config.BootArgs) error {
 	if softLimit >= required {
 		return nil
 	}
-	limit.Cur = required
+	setRlimitCur(&limit.Cur, required)
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
 		return fmt.Errorf("raise file descriptor limit from %d to %d: %w", softLimit, required, err)
 	}
 	slog.Info("Raised file descriptor limit", "from", softLimit, "to", required, "hard_limit", hardLimit)
 	return nil
+}
+
+// setRlimitCur assigns the requirement to an rlimit field whose integer type
+// varies across Unix platforms (int64 on FreeBSD and DragonFly BSD, uint64
+// elsewhere).
+func setRlimitCur[T ~int64 | ~uint64](field *T, value uint64) {
+	*field = T(value)
 }

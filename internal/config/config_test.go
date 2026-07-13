@@ -39,6 +39,10 @@ func TestDefaultBootArgsUDPResources(t *testing.T) {
 	if err := args.Validate(); err != nil {
 		t.Fatalf("default UDP resources should validate: %v", err)
 	}
+	args.UDP.SocketBufferBytes = 4 << 20
+	if err := args.Validate(); err != nil {
+		t.Fatalf("explicit UDP socket buffer should validate: %v", err)
+	}
 }
 
 func TestBootArgsValidateRejectsInvalidUDPResources(t *testing.T) {
@@ -51,6 +55,9 @@ func TestBootArgsValidateRejectsInvalidUDPResources(t *testing.T) {
 		{name: "negative batch budget", edit: func(args *BootArgs) { args.UDP.BatchBufferBudget = -1 }},
 		{name: "empty queue", edit: func(args *BootArgs) { args.UDP.SendQueueSize = 0 }},
 		{name: "negative workers", edit: func(args *BootArgs) { args.UDP.SendWorkers = -1 }},
+		{name: "small socket buffer", edit: func(args *BootArgs) { args.UDP.SocketBufferBytes = 4095 }},
+		{name: "negative socket buffer", edit: func(args *BootArgs) { args.UDP.SocketBufferBytes = -1 }},
+		{name: "huge socket buffer", edit: func(args *BootArgs) { args.UDP.SocketBufferBytes = 1<<30 + 1 }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
