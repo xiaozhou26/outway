@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/xiaozhou26/outway/internal/config"
 	"golang.org/x/sys/unix"
 )
 
@@ -13,15 +14,22 @@ func init() {
 	prepareResourceLimits = prepareResourceLimitsUnix
 }
 
-func prepareResourceLimitsUnix(concurrent uint32) error {
+func prepareResourceLimitsUnix(args config.BootArgs) error {
 	var limit unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
 		return fmt.Errorf("read file descriptor limit: %w", err)
 	}
-	// A TCP tunnel consumes two descriptors. SOCKS5 UDP associations can use a
-	// TCP control connection plus inbound, preferred, and fallback UDP sockets,
-	// so reserve four descriptors per configured client plus process headroom.
-	required := uint64(concurrent)*4 + 4096
+	// Every active connection may consume two descriptors. A UDP association
+	// can consume two additional UDP descriptors (inbound plus dual-stack
+	// outbound), so add that budget only for protocols which support SOCKS5.
+	required := uint64(args.Concurrent)*2 + 4096
+	if args.Proxy.Kind == config.ProxySocks5 || args.Proxy.Kind == config.ProxyAuto {
+		associations := args.UDP.MaxAssociations
+		if associations == 0 {
+			associations = args.Concurrent
+		}
+		required += uint64(associations) * 2
+	}
 	hardLimit := uint64(limit.Max)
 	softLimit := uint64(limit.Cur)
 	if hardLimit < required {
@@ -29,16 +37,16 @@ func prepareResourceLimitsUnix(concurrent uint32) error {
 			"file descriptor hard limit %d is below the %d required for %d concurrent connections",
 			hardLimit,
 			required,
-			concurrent,
+			args.Concurrent,
 		)
 	}
 	if softLimit >= required {
 		return nil
 	}
-	limit.Cur = limit.Max
+	limit.Cur = required
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
-		return fmt.Errorf("raise file descriptor limit from %d to %d: %w", softLimit, hardLimit, err)
+		return fmt.Errorf("raise file descriptor limit from %d to %d: %w", softLimit, required, err)
 	}
-	slog.Info("Raised file descriptor limit", "from", softLimit, "to", hardLimit)
+	slog.Info("Raised file descriptor limit", "from", softLimit, "to", required, "hard_limit", hardLimit)
 	return nil
 }

@@ -20,16 +20,24 @@ import (
 
 // Flag variables shared across run/start/restart commands.
 var (
-	flagLogLevel       string
-	flagBind           string
-	flagConcurrent     uint32
-	flagWorkers        int
-	flagCIDR           string
-	flagCIDRRange      uint8
-	flagFallback       string
-	flagConnectTimeout uint64
-	flagTCPUserTimeout uint64
-	flagReuseAddr      bool
+	flagLogLevel               string
+	flagBind                   string
+	flagConcurrent             uint32
+	flagWorkers                int
+	flagCIDR                   string
+	flagCIDRRange              uint8
+	flagFallback               string
+	flagConnectTimeout         uint64
+	flagTCPUserTimeout         uint64
+	flagReuseAddr              bool
+	flagUDPMaxPacketSize       int
+	flagUDPBatchSize           int
+	flagUDPBatchBufferBudget   int
+	flagUDPSendQueueSize       int
+	flagUDPSendWorkers         int
+	flagUDPMaxAssociations     uint32
+	flagUDPMetricsInterval     uint64
+	flagUDPAssociationIdleTime uint64
 
 	// Auth flags (per proxy subcommand).
 	flagUsername string
@@ -142,6 +150,14 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.StringVarP(&flagFallback, "fallback", "f", "", "Fallback local source address or interface name")
 	pf.Uint64VarP(&flagConnectTimeout, "connect-timeout", "t", 10, "Outbound connection timeout (seconds)")
 	pf.BoolVar(&flagReuseAddr, "reuseaddr", true, "Outbound SO_REUSEADDR for TCP sockets")
+	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
+	pf.IntVar(&flagUDPBatchSize, "udp-batch-size", config.DefaultUDPBatchSize, "UDP packets per receive/send batch (Linux uses recvmmsg/sendmmsg)")
+	pf.IntVar(&flagUDPBatchBufferBudget, "udp-batch-buffer-budget", config.DefaultUDPBatchBufferBudget, "Maximum extra pooled buffers held by concurrent Linux UDP batches (0: scalar reads)")
+	pf.IntVar(&flagUDPSendQueueSize, "udp-send-queue", config.DefaultUDPSendQueueSize, "Global queued UDP packets awaiting outbound send")
+	pf.IntVar(&flagUDPSendWorkers, "udp-send-workers", 0, "UDP outbound send workers (0: automatic)")
+	pf.Uint32Var(&flagUDPMaxAssociations, "udp-associations", 0, "Maximum active UDP associations (0: inherit --concurrent)")
+	pf.Uint64Var(&flagUDPMetricsInterval, "udp-metrics-interval", config.DefaultUDPMetricsIntervalSecs, "UDP metrics log interval in seconds (0: disabled)")
+	pf.Uint64Var(&flagUDPAssociationIdleTime, "udp-association-idle-timeout", 0, "Close idle UDP associations after this many seconds (0: disabled)")
 	if runtime.GOOS == "linux" {
 		pf.Uint64Var(&flagTCPUserTimeout, "tcp-user-timeout", 30, "Outbound TCP sockets user timeout (seconds, Linux only)")
 	}
@@ -174,6 +190,16 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 		Workers:        flagWorkers,
 		ConnectTimeout: flagConnectTimeout,
 		ReuseAddr:      &flagReuseAddr,
+		UDP: config.UDPConfig{
+			MaxPacketSize:              flagUDPMaxPacketSize,
+			BatchSize:                  flagUDPBatchSize,
+			BatchBufferBudget:          flagUDPBatchBufferBudget,
+			SendQueueSize:              flagUDPSendQueueSize,
+			SendWorkers:                flagUDPSendWorkers,
+			MaxAssociations:            flagUDPMaxAssociations,
+			MetricsIntervalSecs:        flagUDPMetricsInterval,
+			AssociationIdleTimeoutSecs: flagUDPAssociationIdleTime,
+		},
 		Proxy: config.ProxyConfig{
 			Auth: config.AuthMode{
 				Username: flagUsername,

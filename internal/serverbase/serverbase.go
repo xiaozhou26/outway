@@ -39,6 +39,7 @@ type Context struct {
 	ConnectTimeout uint64
 	Auth           config.AuthMode
 	Connector      *connect.Connector
+	UDP            config.UDPConfig
 }
 
 // TuneTCPConnection applies low-latency and dead-peer detection settings to an

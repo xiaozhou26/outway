@@ -147,6 +147,9 @@ func (s *AutoDetectServer) Close() error {
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
 			waitErr = errors.New("auto-detect handlers did not stop before shutdown timeout")
 		}
+		if !s.socksAcc.WaitUDPWorkers(serverbase.DefaultShutdownWait) {
+			waitErr = errors.Join(waitErr, errors.New("SOCKS5 UDP workers did not stop before shutdown timeout"))
+		}
 		s.closeErr = errors.Join(connectionErr, listenerErr, waitErr)
 	})
 	return s.closeErr

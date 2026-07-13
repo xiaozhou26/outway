@@ -2,6 +2,7 @@ package socks
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -13,10 +14,159 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/connect"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto"
 	"github.com/xiaozhou26/outway/internal/serverbase"
 )
+
+func TestUDPBatchReaderDetectsConfiguredOversize(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	runtime := newUDPRuntime(config.UDPConfig{
+		MaxPacketSize: 512,
+		BatchSize:     1,
+		SendQueueSize: 1,
+	}, 1, context.Background())
+	reader := newUDPBatchReader(conn, runtime, 0, 64)
+	target := conn.LocalAddr().(*net.UDPAddr)
+
+	for _, test := range []struct {
+		name      string
+		size      int
+		truncated bool
+	}{
+		{name: "exact limit", size: 64, truncated: false},
+		{name: "over limit", size: 65, truncated: true},
+		{name: "larger than probe buffer", size: 66, truncated: true},
+		{name: "reader continues after truncation", size: 32, truncated: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := sender.WriteToUDP(bytes.Repeat([]byte{0x5a}, test.size), target); err != nil {
+				t.Fatal(err)
+			}
+			packets, err := reader.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(packets) != 1 || packets[0].truncated != test.truncated {
+				t.Fatalf("size %d: got %+v", test.size, packets)
+			}
+			runtime.releaseReadPacket(packets[0])
+		})
+	}
+}
+
+func TestUDPRuntimeAssociationLimit(t *testing.T) {
+	runtime := newUDPRuntime(config.UDPConfig{
+		MaxPacketSize:   512,
+		BatchSize:       1,
+		SendQueueSize:   1,
+		MaxAssociations: 1,
+	}, 8, context.Background())
+	if _, ok := runtime.beginAssociation(); !ok {
+		t.Fatal("first association should be admitted")
+	}
+	if _, ok := runtime.beginAssociation(); ok {
+		t.Fatal("second association should be rejected")
+	}
+	runtime.endAssociation()
+	if _, ok := runtime.beginAssociation(); !ok {
+		t.Fatal("slot should be reusable after association closes")
+	}
+	runtime.endAssociation()
+	if got := runtime.metrics.associationDrops.Load(); got != 1 {
+		t.Fatalf("association limit drops = %d, want 1", got)
+	}
+}
+
+func TestUDPRuntimeBatchBufferBudget(t *testing.T) {
+	runtime := newUDPRuntime(config.UDPConfig{
+		MaxPacketSize:     512,
+		BatchSize:         8,
+		BatchBufferBudget: 1,
+		SendQueueSize:     1,
+	}, 1, context.Background())
+	if !runtime.tryAcquireBatchBuffer() {
+		t.Fatal("first batch buffer should fit within budget")
+	}
+	if runtime.tryAcquireBatchBuffer() {
+		t.Fatal("second batch buffer should exceed budget")
+	}
+	runtime.releaseBuffer(runtime.getBuffer(), true)
+	if !runtime.tryAcquireBatchBuffer() {
+		t.Fatal("released batch budget should be reusable")
+	}
+	runtime.releaseBuffer(runtime.getBuffer(), true)
+}
+
+func TestSOCKS5UDPLargeDatagram(t *testing.T) {
+	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		buffer := make([]byte, 65535)
+		n, remote, err := echo.ReadFromUDP(buffer)
+		if err == nil {
+			_, _ = echo.WriteToUDP(buffer[:n], remote)
+		}
+	}()
+
+	proxy, err := NewServer(serverbase.Context{
+		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
+		Concurrent:     8,
+		ConnectTimeout: 5,
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil),
+		UDP:            config.DefaultBootArgs().UDP,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	go func() { _ = proxy.Start() }()
+
+	association, err := openSOCKS5UDPAssociation(proxy.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer association.control.Close()
+	defer association.client.Close()
+	if err := association.client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := make([]byte, 32*1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	packet := proto.BuildUdpPacket(0, proto.SocketAddress(echo.LocalAddr().(*net.UDPAddr).AddrPort()), payload)
+	if _, err := association.client.WriteToUDP(packet, association.relay); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, len(packet)+32)
+	n, _, err := association.client.ReadFromUDP(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, headerLength, err := proto.ReadUdpHeader(bytes.NewReader(response[:n]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response[headerLength:n], payload) {
+		t.Fatalf("large UDP payload mismatch: got %d bytes, want %d", n-headerLength, len(payload))
+	}
+}
 
 type udpStressAssociation struct {
 	control *net.TCPConn

@@ -88,6 +88,14 @@ outway self uninstall   # Remove the installed binary
 | `--connect-timeout` | `-t` | `10` | Outbound connection timeout (seconds) |
 | `--reuseaddr` | | `true` | Outbound `SO_REUSEADDR` for TCP sockets |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
+| `--udp-max-packet-size` | | `65507` | Maximum complete SOCKS5 UDP relay datagram; larger packets are dropped instead of truncated |
+| `--udp-batch-size` | | `32` | Receive/send batch size (`recvmmsg`/`sendmmsg` on Linux) |
+| `--udp-batch-buffer-budget` | | `1024` | Process-wide extra buffer budget for concurrent Linux UDP batches; `0` uses scalar reads |
+| `--udp-send-queue` | | `4096` | Global outbound UDP send queue capacity |
+| `--udp-send-workers` | | auto | Outbound UDP worker count |
+| `--udp-associations` | | `--concurrent` | Maximum active UDP associations |
+| `--udp-association-idle-timeout` | | disabled | Optional idle association timeout in seconds |
+| `--udp-metrics-interval` | | `30` | Structured UDP metrics log interval in seconds; `0` disables it |
 | `--username` | `-u` | | Authentication username |
 | `--password` | `-p` | | Authentication password |
 | `--tls-cert` | | | TLS certificate file (https/auto) |

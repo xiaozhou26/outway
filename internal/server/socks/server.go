@@ -12,32 +12,21 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/connect"
-	"github.com/xiaozhou26/outway/internal/ext"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto"
 	"github.com/xiaozhou26/outway/internal/serverbase"
 )
 
-// MaxUDPRelayPacketSize is the maximum size of a SOCKS5 UDP relay packet.
-const MaxUDPRelayPacketSize = 1500
+// MaxUDPRelayPacketSize is retained as the default for callers and tests. The
+// running server uses the configurable value in config.UDPConfig.
+const MaxUDPRelayPacketSize = config.DefaultUDPMaxPacketSize
 
-const udpGlobalSendQueueSize = 4096
-
-var udpPacketBufferPool = sync.Pool{
-	New: func() any { return make([]byte, MaxUDPRelayPacketSize+proto.UdpHeaderMaxLen) },
-}
-
-var (
-	udpDispatcherOnce      sync.Once
-	udpSendShards          []chan udpSendJob
-	udpDroppedPackets      atomic.Uint64
-	udpAssociationSequence atomic.Uint64
-)
+const maxUDPResponseHeaderLen = 3 + 1 + 16 + 2
 
 // Socks5Acceptor handles a single accepted SOCKS5 connection.
 type Socks5Acceptor struct {
@@ -45,6 +34,7 @@ type Socks5Acceptor struct {
 	connector *connect.Connector
 	timeout   time.Duration
 	ctx       context.Context
+	udp       *udpRuntime
 }
 
 // NewAcceptor builds a Socks5Acceptor from a server Context.
@@ -60,13 +50,20 @@ func NewAcceptor(ctx serverbase.Context, lifetime context.Context) Socks5Accepto
 		connector: ctx.Connector,
 		timeout:   time.Duration(ctx.ConnectTimeout) * time.Second,
 		ctx:       lifetime,
+		udp:       newUDPRuntime(ctx.UDP, ctx.Concurrent, lifetime),
 	}
+}
+
+// WaitUDPWorkers waits for the server-scoped UDP send workers to stop after
+// the acceptor lifetime is canceled.
+func (a Socks5Acceptor) WaitUDPWorkers(timeout time.Duration) bool {
+	return a.udp.wait(timeout)
 }
 
 // Accept drives a single SOCKS5 connection to completion.
 func (a Socks5Acceptor) Accept(stream net.Conn, socketAddr netip.AddrPort) {
 	defer stream.Close()
-	if err := handle(a.ctx, NewIncomingConnection(stream, a.auth), socketAddr, a.connector, a.timeout); err != nil {
+	if err := handle(a.ctx, NewIncomingConnection(stream, a.auth), socketAddr, a.connector, a.timeout, a.udp); err != nil {
 		slog.Debug("SOCKS5 connection failed", "error", err)
 	}
 }
@@ -171,6 +168,9 @@ func (s *Socks5Server) Close() error {
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
 			waitErr = errors.New("SOCKS5 handlers did not stop before shutdown timeout")
 		}
+		if !s.acceptor.WaitUDPWorkers(serverbase.DefaultShutdownWait) {
+			waitErr = errors.Join(waitErr, errors.New("SOCKS5 UDP workers did not stop before shutdown timeout"))
+		}
 		s.closeErr = errors.Join(connectionErr, listenerErr, waitErr)
 	})
 	return s.closeErr
@@ -178,7 +178,7 @@ func (s *Socks5Server) Close() error {
 
 // handle authenticates the incoming connection, reads its request, and
 // dispatches to the appropriate command handler.
-func handle(ctx context.Context, conn IncomingConnection, socketAddr netip.AddrPort, connector *connect.Connector, timeout time.Duration) error {
+func handle(ctx context.Context, conn IncomingConnection, socketAddr netip.AddrPort, connector *connect.Connector, timeout time.Duration, udp *udpRuntime) error {
 	_ = conn.stream.SetDeadline(time.Now().Add(timeout))
 	stream, extension, err := conn.Authenticate()
 	if err != nil {
@@ -202,7 +202,7 @@ func handle(ctx context.Context, conn IncomingConnection, socketAddr netip.AddrP
 
 	switch req.Command {
 	case proto.CmdUDPAssociate:
-		return handleUDP(ctx, stream, req.Address, connector.UDP(extension))
+		return handleUDP(ctx, stream, req.Address, connector.UDP(extension), udp)
 	case proto.CmdConnect:
 		return handleConnect(ctx, stream, req.Address, connector.TCP(extension))
 	case proto.CmdBind:
@@ -332,9 +332,13 @@ func handleBind(ctx context.Context, client net.Conn, _ proto.Address, connector
 
 // handleUDP implements the SOCKS5 UDP ASSOCIATE command: relay UDP packets
 // between the client and remote targets, with source-IP authorization.
-func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address, connector *connect.UdpConnector) error {
-	const bufSize = MaxUDPRelayPacketSize - proto.UdpHeaderMaxLen
-	_ = bufSize
+func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address, connector *connect.UdpConnector, runtime *udpRuntime) error {
+	associationID, opened := runtime.beginAssociation()
+	if !opened {
+		_ = proto.NewResponse(proto.ReplyConnectionNotAllowed, proto.Unspecified()).MarshalTo(client)
+		return errors.New("SOCKS5 UDP association limit reached")
+	}
+	defer runtime.endAssociation()
 
 	// Bind the inbound UDP socket on the same IP family as the TCP control
 	// connection's local address.
@@ -350,24 +354,20 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		_ = client.Close()
 		return err
 	}
-	defer inbound.Close()
-
 	listenAddr, _ := netip.ParseAddrPort(inbound.LocalAddr().String())
 	slog.Debug("SOCKS5 UDP association listening", "address", listenAddr)
 
 	if err := proto.NewResponse(proto.ReplySucceeded, proto.SocketAddress(listenAddr)).MarshalTo(client); err != nil {
+		_ = inbound.Close()
 		_ = client.Close()
 		return err
 	}
 
 	preferredOutbound, fallbackOutbound, err := connector.CreateSocketDualStack()
 	if err != nil {
+		_ = inbound.Close()
 		_ = client.Close()
 		return err
-	}
-	defer preferredOutbound.Close()
-	if fallbackOutbound != nil {
-		defer fallbackOutbound.Close()
 	}
 
 	// Determine the authorized source IP for UDP packets. If the client did not
@@ -386,124 +386,145 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	var srcPort atomic.Uint32
 
 	ctx, cancel := context.WithCancel(parentCtx)
-	defer cancel()
-	associationID := udpAssociationSequence.Add(1)
-
 	errCh := make(chan error, 4)
+	activityCh := make(chan struct{}, 1)
+	inboundPkt := make(chan inboundPacket, 1)
+	var readers sync.WaitGroup
+	defer func() {
+		cancel()
+		_ = client.Close()
+		_ = inbound.Close()
+		_ = preferredOutbound.Close()
+		if fallbackOutbound != nil {
+			_ = fallbackOutbound.Close()
+		}
+		readers.Wait()
+		for {
+			select {
+			case packet := <-inboundPkt:
+				runtime.releaseInboundPacket(packet)
+			default:
+				return
+			}
+		}
+	}()
 
 	// Inbound reader: reads SOCKS5 UDP relay packets from the client.
-	inboundPkt := make(chan inboundPacket, 1)
+	readers.Add(1)
 	go func() {
+		defer readers.Done()
+		reader := newUDPBatchReader(inbound, runtime, 0, runtime.config.MaxPacketSize)
 		for {
-			buf := udpPacketBufferPool.Get().([]byte)
-			n, srcAddr, rerr := inbound.ReadFromUDP(buf[:MaxUDPRelayPacketSize])
+			packets, rerr := reader.Read()
 			if rerr != nil {
-				udpPacketBufferPool.Put(buf)
-				reportUDPError(errCh, rerr)
-				return
-			}
-			hdr, hlen, herr := proto.ReadUdpHeader(bytes.NewReader(buf[:n]))
-			if herr != nil {
-				udpPacketBufferPool.Put(buf)
-				reportUDPError(errCh, herr)
-				continue
-			}
-			pkt := inboundPacket{
-				payload: buf[hlen:n],
-				buffer:  buf,
-				frag:    hdr.Frag,
-				dst:     hdr.Address,
-				src:     srcAddr,
-			}
-			select {
-			case inboundPkt <- pkt:
-			case <-ctx.Done():
-				udpPacketBufferPool.Put(buf)
-				return
-			}
-		}
-	}()
-
-	// Preferred outbound reader.
-	prefPkt := make(chan outboundPacket, 1)
-	go func() {
-		for {
-			buf := udpPacketBufferPool.Get().([]byte)
-			n, remote, rerr := preferredOutbound.ReadFromUDP(buf[proto.UdpHeaderMaxLen:])
-			if rerr != nil {
-				udpPacketBufferPool.Put(buf)
-				reportUDPError(errCh, rerr)
-				return
-			}
-			pkt := outboundPacket{
-				payload: buf[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+n],
-				buffer:  buf,
-				remote:  remote,
-			}
-			select {
-			case prefPkt <- pkt:
-			case <-ctx.Done():
-				udpPacketBufferPool.Put(buf)
-				return
-			}
-		}
-	}()
-
-	// Fallback outbound reader (may be nil).
-	var fbPkt chan outboundPacket
-	if fallbackOutbound != nil {
-		fbPkt = make(chan outboundPacket, 1)
-		go func() {
-			for {
-				buf := udpPacketBufferPool.Get().([]byte)
-				n, remote, rerr := fallbackOutbound.ReadFromUDP(buf[proto.UdpHeaderMaxLen:])
-				if rerr != nil {
-					udpPacketBufferPool.Put(buf)
-					reportUDPError(errCh, rerr)
+				if ctx.Err() != nil || errors.Is(rerr, net.ErrClosed) {
 					return
 				}
-				pkt := outboundPacket{
-					payload: buf[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+n],
-					buffer:  buf,
-					remote:  remote,
+				runtime.metrics.errors.Add(1)
+				reportUDPError(errCh, rerr)
+				return
+			}
+			for packetIndex, packet := range packets {
+				if packet.truncated {
+					runtime.metrics.truncatedDrops.Add(1)
+					runtime.releaseReadPacket(packet)
+					continue
+				}
+				hdr, hlen, herr := proto.ReadUdpHeader(bytes.NewReader(packet.buffer[:packet.n]))
+				if herr != nil {
+					runtime.metrics.malformedDrops.Add(1)
+					runtime.releaseReadPacket(packet)
+					continue
+				}
+				pkt := inboundPacket{
+					payload:   packet.buffer[hlen:packet.n],
+					buffer:    packet.buffer,
+					frag:      hdr.Frag,
+					dst:       hdr.Address,
+					src:       packet.addr,
+					batchSlot: packet.batchSlot,
 				}
 				select {
-				case fbPkt <- pkt:
+				case inboundPkt <- pkt:
 				case <-ctx.Done():
-					udpPacketBufferPool.Put(buf)
+					runtime.releaseReadPacket(packet)
+					for _, unprocessed := range packets[packetIndex+1:] {
+						runtime.releaseReadPacket(unprocessed)
+					}
 					return
 				}
 			}
+		}
+	}()
+
+	// Outbound readers relay complete batches directly to the client. This
+	// avoids per-association response channels and lets Linux use sendmmsg.
+	startOutboundReader := func(outbound *net.UDPConn) {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			relayUDPResponses(ctx, inbound, outbound, srcIP, &srcPort, runtime, errCh, activityCh)
 		}()
+	}
+	startOutboundReader(preferredOutbound)
+	if fallbackOutbound != nil {
+		startOutboundReader(fallbackOutbound)
 	}
 
 	// TCP control-connection closer: signals when the client closes the TCP
 	// connection, which terminates the UDP association.
 	closedCh := make(chan struct{})
+	readers.Add(1)
 	go func() {
-		buf := make([]byte, 1)
+		defer readers.Done()
+		defer close(closedCh)
+		var byteBuffer [1]byte
 		for {
-			if _, err := client.Read(buf); err != nil {
-				close(closedCh)
+			if _, err := client.Read(byteBuffer[:]); err != nil {
 				return
 			}
 		}
 	}()
+
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if seconds := runtime.config.AssociationIdleTimeoutSecs; seconds > 0 {
+		idleTimer = time.NewTimer(time.Duration(seconds) * time.Second)
+		idleC = idleTimer.C
+		defer idleTimer.Stop()
+	}
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(time.Duration(runtime.config.AssociationIdleTimeoutSecs) * time.Second)
+	}
 
 	for {
 		select {
 		case pkt := <-inboundPkt:
 			if pkt.frag != 0 {
 				slog.Debug("[SOCKS5][UDP] packet fragment is not supported")
-				udpPacketBufferPool.Put(pkt.buffer)
+				runtime.metrics.fragmentDrops.Add(1)
+				runtime.releaseInboundPacket(pkt)
 				continue
 			}
-			if !isAuthorized(pkt.src.AddrPort(), srcIP) {
+			if !isAuthorized(pkt.src, srcIP) {
 				slog.Debug("SOCKS5 UDP packet from unauthorized IP", "source", pkt.src, "expected", srcIP)
-				udpPacketBufferPool.Put(pkt.buffer)
+				runtime.metrics.unauthorizedDrops.Add(1)
+				runtime.releaseInboundPacket(pkt)
 				continue
 			}
-			srcPort.Store(uint32(pkt.src.Port))
+			resetIdle()
+			srcPort.Store(uint32(pkt.src.Port()))
+			runtime.metrics.inPackets.Add(1)
+			runtime.metrics.inBytes.Add(uint64(len(pkt.payload)))
 
 			var target connect.TargetAddr
 			if pkt.dst.Socket != nil {
@@ -511,7 +532,7 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 			} else {
 				target = connect.FromHost(pkt.dst.Domain, pkt.dst.Port)
 			}
-			if !dispatchUDPSend(udpSendJob{
+			if !runtime.dispatch(udpSendJob{
 				associationID: associationID,
 				ctx:           ctx,
 				connector:     connector,
@@ -521,34 +542,108 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 				fallback:      fallbackOutbound,
 				errCh:         errCh,
 			}) {
-				udpPacketBufferPool.Put(pkt.buffer)
-				udpDroppedPackets.Add(1)
+				runtime.releaseInboundPacket(pkt)
 			}
-
-		case pkt := <-prefPkt:
-			port := uint16(srcPort.Load())
-			srcAddr := netip.AddrPortFrom(srcIP, port)
-			_ = writeUDPResponse(inbound, srcAddr, pkt)
-			udpPacketBufferPool.Put(pkt.buffer)
-
-		case pkt := <-fbPkt:
-			port := uint16(srcPort.Load())
-			srcAddr := netip.AddrPortFrom(srcIP, port)
-			_ = writeUDPResponse(inbound, srcAddr, pkt)
-			udpPacketBufferPool.Put(pkt.buffer)
 
 		case err := <-errCh:
 			slog.Debug("SOCKS5 UDP proxy error", "error", err)
 
+		case <-activityCh:
+			resetIdle()
+
 		case <-closedCh:
 			slog.Debug("SOCKS5 UDP association closed", "address", listenAddr)
-			_ = client.Close()
 			return nil
+
+		case <-idleC:
+			slog.Debug("SOCKS5 UDP association idle timeout", "address", listenAddr)
+			return nil
+
+		case <-parentCtx.Done():
+			return parentCtx.Err()
+		}
+	}
+}
+
+func relayUDPResponses(
+	ctx context.Context,
+	inbound, outbound *net.UDPConn,
+	clientIP netip.Addr,
+	clientPort *atomic.Uint32,
+	runtime *udpRuntime,
+	errCh chan<- error,
+	activityCh chan<- struct{},
+) {
+	reader := newUDPBatchReader(
+		outbound,
+		runtime,
+		proto.UdpHeaderMaxLen,
+		runtime.config.MaxPacketSize-maxUDPResponseHeaderLen,
+	)
+	writer := newUDPBatchWriter(inbound, runtime.config.BatchSize)
+	for {
+		packets, err := reader.Read()
+		if err != nil {
+			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				runtime.metrics.errors.Add(1)
+				reportUDPError(errCh, err)
+			}
+			return
+		}
+		clientAddr := netip.AddrPortFrom(clientIP, uint16(clientPort.Load()))
+		writes := make([]udpWritePacket, 0, len(packets))
+		payloadBytes := make([]int, 0, len(packets))
+		for _, packet := range packets {
+			if packet.truncated {
+				runtime.metrics.truncatedDrops.Add(1)
+				runtime.releaseReadPacket(packet)
+				continue
+			}
+			if clientAddr.Port() == 0 {
+				runtime.releaseReadPacket(packet)
+				continue
+			}
+			payload := packet.buffer[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+packet.n]
+			response := prepareUDPResponse(outboundPacket{
+				payload: payload,
+				buffer:  packet.buffer,
+				remote:  net.UDPAddrFromAddrPort(packet.addr),
+			})
+			writes = append(writes, udpWritePacket{buffer: response, owner: packet.buffer, addr: clientAddr, batchSlot: packet.batchSlot})
+			payloadBytes = append(payloadBytes, packet.n)
+		}
+		written, writeErr := writer.Write(writes)
+		for i, write := range writes {
+			if i < written {
+				runtime.metrics.outPackets.Add(1)
+				runtime.metrics.outBytes.Add(uint64(payloadBytes[i]))
+			}
+			// Every response is backed by one independently pooled buffer.
+			runtime.releaseBuffer(write.owner, write.batchSlot)
+		}
+		if writeErr != nil || written != len(writes) {
+			runtime.metrics.errors.Add(1)
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+			reportUDPError(errCh, writeErr)
+		}
+		if written > 0 {
+			select {
+			case activityCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
 
 func writeUDPResponse(inbound *net.UDPConn, clientAddr netip.AddrPort, pkt outboundPacket) error {
+	packet := prepareUDPResponse(pkt)
+	_, err := inbound.WriteToUDP(packet, net.UDPAddrFromAddrPort(clientAddr))
+	return err
+}
+
+func prepareUDPResponse(pkt outboundPacket) []byte {
 	if len(pkt.buffer) >= proto.UdpHeaderMaxLen+len(pkt.payload) {
 		remote := pkt.remote.AddrPort()
 		remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
@@ -570,24 +665,19 @@ func writeUDPResponse(inbound *net.UDPConn, clientAddr netip.AddrPort, pkt outbo
 			copy(header[4:20], ip[:])
 			binary.BigEndian.PutUint16(header[20:22], remote.Port())
 		}
-		_, err := inbound.WriteToUDP(
-			pkt.buffer[start:proto.UdpHeaderMaxLen+len(pkt.payload)],
-			net.UDPAddrFromAddrPort(clientAddr),
-		)
-		return err
+		return pkt.buffer[start : proto.UdpHeaderMaxLen+len(pkt.payload)]
 	}
-	packet := proto.BuildUdpPacket(0, proto.SocketAddress(pkt.remote.AddrPort()), pkt.payload)
-	_, err := inbound.WriteToUDP(packet, net.UDPAddrFromAddrPort(clientAddr))
-	return err
+	return proto.BuildUdpPacket(0, proto.SocketAddress(pkt.remote.AddrPort()), pkt.payload)
 }
 
 // inboundPacket is a parsed SOCKS5 UDP relay packet from the client.
 type inboundPacket struct {
-	payload []byte
-	buffer  []byte
-	frag    uint8
-	dst     proto.Address
-	src     *net.UDPAddr
+	payload   []byte
+	buffer    []byte
+	frag      uint8
+	dst       proto.Address
+	src       netip.AddrPort
+	batchSlot bool
 }
 
 type udpSendJob struct {
@@ -599,52 +689,6 @@ type udpSendJob struct {
 	preferred     *net.UDPConn
 	fallback      *net.UDPConn
 	errCh         chan<- error
-}
-
-func dispatchUDPSend(job udpSendJob) bool {
-	udpDispatcherOnce.Do(startUDPDispatcher)
-	shard := udpSendShards[job.associationID%uint64(len(udpSendShards))]
-	select {
-	case shard <- job:
-		return true
-	default:
-		return false
-	}
-}
-
-func startUDPDispatcher() {
-	workers := runtime.GOMAXPROCS(0) * 2
-	if workers < 4 {
-		workers = 4
-	}
-	if workers > 64 {
-		workers = 64
-	}
-	queuePerShard := (udpGlobalSendQueueSize + workers - 1) / workers
-	udpSendShards = make([]chan udpSendJob, workers)
-	for index := range workers {
-		jobs := make(chan udpSendJob, queuePerShard)
-		udpSendShards[index] = jobs
-		go func() {
-			for job := range jobs {
-				if job.ctx.Err() == nil {
-					if _, err := job.connector.SendPacket(job.ctx, job.packet.payload, job.target, job.preferred, job.fallback); err != nil {
-						reportUDPError(job.errCh, err)
-					}
-				}
-				udpPacketBufferPool.Put(job.packet.buffer)
-			}
-		}()
-	}
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if dropped := udpDroppedPackets.Swap(0); dropped > 0 {
-				slog.Warn("SOCKS5 UDP packets dropped because send shards were full", "packets", dropped)
-			}
-		}
-	}()
 }
 
 // outboundPacket is a UDP packet received from a remote target.
@@ -699,7 +743,3 @@ func isClosed(err error) bool {
 	}
 	return false
 }
-
-// Ensure imports are used.
-var _ = io.EOF
-var _ = ext.None

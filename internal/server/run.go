@@ -40,7 +40,16 @@ func Run(args config.BootArgs) error {
 	slog.Info(fmt.Sprintf("Concurrent: %d", args.Concurrent))
 	slog.Info(fmt.Sprintf("Worker threads: %d", workers))
 	slog.Info(fmt.Sprintf("Connect timeout: %ds", args.ConnectTimeout))
-	if err := prepareResourceLimits(args.Concurrent); err != nil {
+	slog.Info("UDP relay resources",
+		"max_packet_size", args.UDP.MaxPacketSize,
+		"batch_size", args.UDP.BatchSize,
+		"batch_buffer_budget", args.UDP.BatchBufferBudget,
+		"send_queue", args.UDP.SendQueueSize,
+		"send_workers", args.UDP.SendWorkers,
+		"max_associations", args.UDP.MaxAssociations,
+		"idle_timeout_seconds", args.UDP.AssociationIdleTimeoutSecs,
+	)
+	if err := prepareResourceLimits(args); err != nil {
 		return err
 	}
 
@@ -71,6 +80,7 @@ func Run(args config.BootArgs) error {
 		ConnectTimeout: args.ConnectTimeout,
 		Auth:           args.Proxy.Auth,
 		Connector:      connector,
+		UDP:            args.UDP,
 	}
 
 	srv, err := newProxyServer(args.Proxy, ctx)
@@ -154,4 +164,4 @@ var configureRoutes = func(cidr netip.Prefix) error { return nil }
 var validateSourceCIDR = func(cidr netip.Prefix) error { return nil }
 
 // prepareResourceLimits is implemented on Unix and is a no-op elsewhere.
-var prepareResourceLimits = func(concurrent uint32) error { return nil }
+var prepareResourceLimits = func(args config.BootArgs) error { return nil }

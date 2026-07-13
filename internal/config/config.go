@@ -43,6 +43,28 @@ type Fallback struct {
 	Interface string
 }
 
+const (
+	DefaultUDPMaxPacketSize       = 65507
+	DefaultUDPBatchSize           = 32
+	DefaultUDPBatchBufferBudget   = 1024
+	DefaultUDPSendQueueSize       = 4096
+	DefaultUDPMetricsIntervalSecs = 30
+)
+
+// UDPConfig controls SOCKS5 UDP relay resource usage. SendWorkers set to zero
+// selects an automatic value derived from GOMAXPROCS. MetricsIntervalSecs and
+// AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
+type UDPConfig struct {
+	MaxPacketSize              int
+	BatchSize                  int
+	BatchBufferBudget          int
+	SendQueueSize              int
+	SendWorkers                int
+	MaxAssociations            uint32
+	MetricsIntervalSecs        uint64
+	AssociationIdleTimeoutSecs uint64
+}
+
 // IsInterface reports whether the fallback references a network interface.
 func (f Fallback) IsInterface() bool {
 	return f.Interface != ""
@@ -69,6 +91,7 @@ type BootArgs struct {
 	ConnectTimeout uint64
 	TCPUserTimeout *uint64 // Linux only
 	ReuseAddr      *bool
+	UDP            UDPConfig
 	Proxy          ProxyConfig
 }
 
@@ -83,6 +106,24 @@ func (a BootArgs) Validate() error {
 	}
 	if a.Workers < 0 {
 		return fmt.Errorf("workers must not be negative")
+	}
+	if a.UDP.MaxPacketSize < 512 || a.UDP.MaxPacketSize > 65535 {
+		return fmt.Errorf("UDP maximum packet size must be between 512 and 65535")
+	}
+	if a.UDP.BatchSize < 1 || a.UDP.BatchSize > 1024 {
+		return fmt.Errorf("UDP batch size must be between 1 and 1024")
+	}
+	if a.UDP.BatchBufferBudget < 0 {
+		return fmt.Errorf("UDP batch buffer budget must not be negative")
+	}
+	if a.UDP.SendQueueSize < 1 {
+		return fmt.Errorf("UDP send queue size must be greater than zero")
+	}
+	if a.UDP.SendWorkers < 0 || a.UDP.SendWorkers > 4096 {
+		return fmt.Errorf("UDP send workers must be between 0 and 4096")
+	}
+	if a.UDP.MaxAssociations > a.Concurrent {
+		return fmt.Errorf("UDP association limit must not exceed concurrent connection limit")
 	}
 	if (a.Proxy.Auth.Username == "") != (a.Proxy.Auth.Password == "") {
 		return fmt.Errorf("username and password must be configured together")
@@ -111,6 +152,13 @@ func DefaultBootArgs() BootArgs {
 		Concurrent:     8192,
 		ConnectTimeout: 10,
 		ReuseAddr:      &reuse,
+		UDP: UDPConfig{
+			MaxPacketSize:       DefaultUDPMaxPacketSize,
+			BatchSize:           DefaultUDPBatchSize,
+			BatchBufferBudget:   DefaultUDPBatchBufferBudget,
+			SendQueueSize:       DefaultUDPSendQueueSize,
+			MetricsIntervalSecs: DefaultUDPMetricsIntervalSecs,
+		},
 	}
 }
 
