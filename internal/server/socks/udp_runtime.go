@@ -37,8 +37,6 @@ type udpRuntime struct {
 	shards           []chan udpSendJob
 	sequence         atomic.Uint64
 	lifetime         context.Context
-	dispatchMu       sync.RWMutex
-	closed           bool
 	associationSlots chan struct{}
 	workerWG         sync.WaitGroup
 	batchSlots       chan struct{}
@@ -137,16 +135,16 @@ func (r *udpRuntime) endAssociation() {
 	r.metrics.activeAssociations.Add(-1)
 }
 
+// dispatch enqueues a send job onto the shard owning the association. It reads
+// r.shards without a lock: startOnce establishes a happens-before edge, and the
+// shards slice is written once and never mutated afterward. Shard channels are
+// never closed (workers exit via the lifetime context), so a send can never
+// race a close.
 func (r *udpRuntime) dispatch(job udpSendJob) bool {
 	if r.lifetime.Err() != nil {
 		return false
 	}
 	r.startOnce.Do(r.startDispatcher)
-	r.dispatchMu.RLock()
-	defer r.dispatchMu.RUnlock()
-	if r.closed {
-		return false
-	}
 	shard := r.shards[job.associationID%uint64(len(r.shards))]
 	select {
 	case shard <- job:
@@ -185,28 +183,40 @@ func (r *udpRuntime) startDispatcher() {
 		r.workerWG.Add(1)
 		go func() {
 			defer r.workerWG.Done()
-			for job := range jobs {
-				r.metrics.queueDepth.Add(-1)
-				if job.ctx.Err() == nil {
-					_, err := job.connector.SendPacket(job.ctx, job.packet.payload, job.target, job.preferred, job.fallback)
-					if err != nil {
-						r.metrics.errors.Add(1)
-						reportUDPError(job.errCh, err)
+			for {
+				select {
+				case job := <-jobs:
+					r.runSendJob(job)
+				case <-r.lifetime.Done():
+					// Release buffers still queued so the pool is not left holding
+					// references, then exit. In-flight sends are abandoned, which is
+					// safe for UDP during shutdown.
+					for {
+						select {
+						case job := <-jobs:
+							r.metrics.queueDepth.Add(-1)
+							r.releaseInboundPacket(job.packet)
+						default:
+							return
+						}
 					}
 				}
-				r.releaseInboundPacket(job.packet)
 			}
 		}()
 	}
-	go func() {
-		<-r.lifetime.Done()
-		r.dispatchMu.Lock()
-		r.closed = true
-		for _, jobs := range r.shards {
-			close(jobs)
+}
+
+// runSendJob performs one outbound send and releases the packet buffer.
+func (r *udpRuntime) runSendJob(job udpSendJob) {
+	r.metrics.queueDepth.Add(-1)
+	if job.ctx.Err() == nil {
+		_, err := job.connector.SendPacket(job.ctx, job.packet.payload, job.target, job.preferred, job.fallback)
+		if err != nil {
+			r.metrics.errors.Add(1)
+			reportUDPError(job.errCh, err)
 		}
-		r.dispatchMu.Unlock()
-	}()
+	}
+	r.releaseInboundPacket(job.packet)
 }
 
 func (r *udpRuntime) wait(timeout time.Duration) bool {
