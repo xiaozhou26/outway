@@ -146,7 +146,12 @@ func TestSOCKS5UDPLargeDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	payload := make([]byte, 32*1024)
+	// A single datagram larger than a normal MTU, but within the smallest
+	// default per-datagram send limit across platforms (macOS caps UDP
+	// datagrams at net.inet.udp.maxdgram = 9216 bytes by default, whereas
+	// Linux allows up to 64 KiB). 8 KiB keeps the test portable while still
+	// exercising the large-datagram relay path.
+	payload := make([]byte, 8*1024)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
