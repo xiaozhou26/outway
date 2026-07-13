@@ -48,6 +48,21 @@ func ReadUdpHeader(r io.Reader) (UdpHeader, int, error) {
 	return h, h.Len(), nil
 }
 
+// ParseUdpHeader parses a SOCKS5 UDP header from the front of buf, returning the
+// header and the number of header bytes consumed. It reads straight from the
+// slice, avoiding the io.Reader allocation that ReadUdpHeader incurs on the
+// per-packet relay hot path.
+func ParseUdpHeader(buf []byte) (UdpHeader, int, error) {
+	if len(buf) < 3 {
+		return UdpHeader{}, 0, io.ErrUnexpectedEOF
+	}
+	addr, addrLen, err := ParseAddress(buf[3:])
+	if err != nil {
+		return UdpHeader{}, 0, err
+	}
+	return UdpHeader{Frag: buf[2], Address: addr}, 3 + addrLen, nil
+}
+
 // BuildUdpPacket assembles a SOCKS5 UDP relay packet (header + payload).
 func BuildUdpPacket(frag uint8, from Address, payload []byte) []byte {
 	h := UdpHeader{Frag: frag, Address: from}

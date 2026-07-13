@@ -95,6 +95,45 @@ func (a Address) MarshalTo(w io.Writer) error {
 	return writeAll(w, b)
 }
 
+// ParseAddress parses a SOCKS5 address from the front of buf, returning the
+// address and the number of bytes consumed. It is the allocation-light,
+// io.Reader-free counterpart to ReadAddress used on the packet hot path.
+func ParseAddress(buf []byte) (Address, int, error) {
+	if len(buf) < 1 {
+		return Address{}, 0, io.ErrUnexpectedEOF
+	}
+	switch AddressType(buf[0]) {
+	case AddrIPv4:
+		if len(buf) < 1+4+2 {
+			return Address{}, 0, io.ErrUnexpectedEOF
+		}
+		addr := netip.AddrFrom4([4]byte{buf[1], buf[2], buf[3], buf[4]})
+		ap := netip.AddrPortFrom(addr, binary.BigEndian.Uint16(buf[5:7]))
+		return Address{Socket: &ap}, 1 + 4 + 2, nil
+	case AddrIPv6:
+		if len(buf) < 1+16+2 {
+			return Address{}, 0, io.ErrUnexpectedEOF
+		}
+		var addr16 [16]byte
+		copy(addr16[:], buf[1:17])
+		ap := netip.AddrPortFrom(netip.AddrFrom16(addr16), binary.BigEndian.Uint16(buf[17:19]))
+		return Address{Socket: &ap}, 1 + 16 + 2, nil
+	case AddrDomain:
+		if len(buf) < 2 {
+			return Address{}, 0, io.ErrUnexpectedEOF
+		}
+		length := int(buf[1])
+		if len(buf) < 2+length+2 {
+			return Address{}, 0, io.ErrUnexpectedEOF
+		}
+		domain := string(buf[2 : 2+length])
+		port := binary.BigEndian.Uint16(buf[2+length : 2+length+2])
+		return Address{Domain: domain, Port: port}, 2 + length + 2, nil
+	default:
+		return Address{}, 0, fmt.Errorf("unsupported address type %#x", buf[0])
+	}
+}
+
 // ReadAddress reads a SOCKS5 address from r.
 func ReadAddress(r io.Reader) (Address, error) {
 	atyp, err := readU8(r)

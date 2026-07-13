@@ -3,7 +3,6 @@
 package socks
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -435,7 +434,7 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 					runtime.releaseReadPacket(packet)
 					continue
 				}
-				hdr, hlen, herr := proto.ReadUdpHeader(bytes.NewReader(packet.buffer[:packet.n]))
+				hdr, hlen, herr := proto.ParseUdpHeader(packet.buffer[:packet.n])
 				if herr != nil {
 					runtime.metrics.malformedDrops.Add(1)
 					runtime.releaseReadPacket(packet)

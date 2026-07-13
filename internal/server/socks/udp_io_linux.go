@@ -203,10 +203,14 @@ type linuxUDPBatchWriter struct {
 	v6     *ipv6.PacketConn
 	v4msgs []ipv4.Message
 	v6msgs []ipv6.Message
+	addrs  []*net.UDPAddr
 }
 
 func newUDPBatchWriter(conn *net.UDPConn, batchSize int) udpBatchWriter {
-	w := &linuxUDPBatchWriter{}
+	w := &linuxUDPBatchWriter{addrs: make([]*net.UDPAddr, batchSize)}
+	for i := range w.addrs {
+		w.addrs[i] = newReusableUDPAddr()
+	}
 	if conn.LocalAddr().(*net.UDPAddr).IP.To4() != nil {
 		w.v4 = ipv4.NewPacketConn(conn)
 		w.v4msgs = make([]ipv4.Message, batchSize)
@@ -231,14 +235,16 @@ func (w *linuxUDPBatchWriter) Write(packets []udpWritePacket) (int, error) {
 		messages := w.v4msgs[:len(packets)]
 		for i, packet := range packets {
 			messages[i].Buffers[0] = packet.buffer
-			messages[i].Addr = net.UDPAddrFromAddrPort(packet.addr)
+			setUDPAddr(w.addrs[i], packet.addr)
+			messages[i].Addr = w.addrs[i]
 		}
 		return writeIPv4Messages(w.v4, messages)
 	}
 	messages := w.v6msgs[:len(packets)]
 	for i, packet := range packets {
 		messages[i].Buffers[0] = packet.buffer
-		messages[i].Addr = net.UDPAddrFromAddrPort(packet.addr)
+		setUDPAddr(w.addrs[i], packet.addr)
+		messages[i].Addr = w.addrs[i]
 	}
 	return writeIPv6Messages(w.v6, messages)
 }

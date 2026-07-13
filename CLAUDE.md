@@ -59,6 +59,19 @@ The peeked byte must not be lost, so connections are wrapped in `bufferedConn` (
 
 `internal/connect` establishes all outbound connections and owns source-address selection policy. The notable feature: outbound source IPs can be chosen per-connection from a CIDR block based on "extensions" parsed out of the proxy username (`internal/ext`). A username like `user-session-abc` or `user-ttl-60` is parsed (`ext.TryFrom`) into an `Extension`, which is hashed (FxHash64, matching the Rust implementation's hash exactly) to deterministically pick a source address within the configured CIDR. Authenticators (`http/auth.go`, `socks/auth.go`) return the parsed `Extension`, which flows into `connector.TCP(extension)` / `.UDP(extension)`. This is why auth and connection establishment are coupled — the username carries routing information, not just credentials.
 
+### SOCKS5 UDP relay
+
+`internal/server/socks` contains a high-concurrency UDP ASSOCIATE relay tuned for large proxy pools. The moving parts:
+
+- **`udpRuntime` (`udp_runtime.go`)** — one per acceptor, shared across all associations. Owns the pooled packet buffers (`sync.Pool`, sized `MaxPacketSize + header`), the association-count limiter, structured metrics, and a sharded pool of outbound **send workers**. `dispatch()` is lock-free: shard channels are never closed and workers exit via the lifetime context.
+- **Per-association goroutines (`handleUDP` in `server.go`)** — an inbound reader (client→proxy), one or two outbound response readers (target→proxy, dual-stack), and a TCP-control-connection watcher. The main loop drains inbound packets, authorizes by source IP, and sends.
+- **Two send directions.** Client→target: literal-IP targets are grouped by address family and flushed with one `sendmmsg` per outbound socket directly on the association goroutine; **domain** targets go through the shared send-worker pool so a cold DNS lookup never blocks the loop. Target→client (`relayUDPResponses`): batched reads, SOCKS5-header framing, batched writes.
+- **Batch I/O (`udp_io_linux.go`)** — on Linux the reader uses `recvmmsg` and the writer `sendmmsg`; other platforms fall back to scalar `ReadMsgUDP`/`WriteToUDP` (`udp_io_other.go`). `udp_io.go` holds the shared `udpReadPacket`/`udpWritePacket` types and interfaces.
+- **Optional offloads (Linux, opt-in, off by default).** `--udp-gso` (`udp_gso_linux.go`) coalesces a same-target uniform-size batch into one `UDP_SEGMENT` send; `--udp-gro` (`udp_gro_linux.go`) enables `UDP_GRO` so a coalesced read is split back into individual packets. Both have `_other.go`/build-tag stubs and probe kernel support once.
+- **Buffer lifecycle invariant** — exactly one pooled buffer per in-flight datagram, released once (via `releaseInboundPacket`/`releaseReadPacket`/`releaseBuffer`). GRO preserves this by copying split segments into their own pooled buffers rather than sharing one. Any change to the read/send path must keep the release count matched to the acquire count, or the pool corrupts.
+
+The `config.UDPConfig` fields map 1:1 to the `--udp-*` flags; `MaxPacketSize` also bounds per-buffer memory, so small-packet pools (DNS/QUIC) can lower it to save RAM.
+
 ### Platform-specific files
 
 Several concerns split by build constraint (`_linux.go` / `_unix.go` / `_windows.go` / `_other.go`):

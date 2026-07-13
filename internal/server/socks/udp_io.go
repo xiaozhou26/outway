@@ -35,3 +35,28 @@ func udpAddrPort(addr net.Addr) (netip.AddrPort, bool) {
 	}
 	return udpAddr.AddrPort(), true
 }
+
+// newReusableUDPAddr returns a *net.UDPAddr whose IP slice has 16 bytes of
+// capacity so setUDPAddr can rewrite it in place for either address family
+// without reallocating.
+func newReusableUDPAddr() *net.UDPAddr {
+	return &net.UDPAddr{IP: make(net.IP, 16)}
+}
+
+// setUDPAddr rewrites dst to match ap in place, reusing dst.IP's backing array.
+// It lets the batch writers avoid a *net.UDPAddr (and IP slice) allocation per
+// packet that net.UDPAddrFromAddrPort would incur.
+func setUDPAddr(dst *net.UDPAddr, ap netip.AddrPort) {
+	addr := ap.Addr()
+	if addr.Is4() {
+		v4 := addr.As4()
+		dst.IP = dst.IP[:4]
+		copy(dst.IP, v4[:])
+	} else {
+		v16 := addr.As16()
+		dst.IP = dst.IP[:16]
+		copy(dst.IP, v16[:])
+	}
+	dst.Port = int(ap.Port())
+	dst.Zone = ""
+}
