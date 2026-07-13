@@ -49,6 +49,7 @@ func Run(args config.BootArgs) error {
 		"socket_buffer_bytes", args.UDP.SocketBufferBytes,
 		"max_associations", args.UDP.MaxAssociations,
 		"idle_timeout_seconds", args.UDP.AssociationIdleTimeoutSecs,
+		"gso", args.UDP.GSO,
 	)
 	warnIfUDPBufferClamped(args)
 	if err := prepareResourceLimits(args); err != nil {
