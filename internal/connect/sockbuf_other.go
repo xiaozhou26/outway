@@ -14,3 +14,7 @@ func TuneUDPBuffers(conn *net.UDPConn, bytes int) {
 	_ = conn.SetReadBuffer(bytes)
 	_ = conn.SetWriteBuffer(bytes)
 }
+
+// currentUDPRecvBuffer cannot portably read the effective buffer size outside
+// Linux, so it reports that the size is unknown.
+func currentUDPRecvBuffer(conn *net.UDPConn) (int, bool) { return 0, false }

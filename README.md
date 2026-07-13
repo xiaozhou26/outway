@@ -88,6 +88,29 @@ Other knobs that matter at high concurrency:
 - `--udp-metrics-interval` — logs structured counters (in/out packets, queue
   depth, drops by cause) to observe where packets are lost under load.
 
+#### Recommended sysctls (Linux)
+
+For a large UDP pool, tune the kernel alongside the flags. `outway` warns at
+startup if `--udp-socket-buffer` is clamped, which usually means these need
+raising:
+
+```bash
+# Allow larger UDP socket buffers (needed unless outway runs with CAP_NET_ADMIN,
+# which uses SO_RCVBUFFORCE to bypass these ceilings).
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+
+# Absorb bursts between the NIC and the socket queues.
+sysctl -w net.core.netdev_max_backlog=250000
+
+# More ephemeral ports for many simultaneous outbound sockets.
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+# If netfilter/conntrack is in the path, a busy UDP pool can exhaust the table
+# and silently drop packets; size it for the expected flow count.
+sysctl -w net.netfilter.nf_conntrack_max=1048576
+```
+
 ### Daemon (Unix)
 
 ```
