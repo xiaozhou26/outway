@@ -37,6 +37,7 @@ var (
 	flagUDPSendWorkers         int
 	flagUDPSocketBuffer        int
 	flagUDPGSO                 bool
+	flagUDPGRO                 bool
 	flagUDPMaxAssociations     uint32
 	flagUDPMetricsInterval     uint64
 	flagUDPAssociationIdleTime uint64
@@ -159,6 +160,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.IntVar(&flagUDPSendWorkers, "udp-send-workers", 0, "UDP outbound send workers (0: automatic)")
 	pf.IntVar(&flagUDPSocketBuffer, "udp-socket-buffer", 0, "SO_RCVBUF/SO_SNDBUF for UDP relay sockets in bytes (0: system default)")
 	pf.BoolVar(&flagUDPGSO, "udp-gso", false, "Enable Linux UDP_SEGMENT (GSO) batching for same-target uniform-size sends")
+	pf.BoolVar(&flagUDPGRO, "udp-gro", false, "Enable Linux UDP_GRO coalescing of received datagrams on the relay sockets")
 	pf.Uint32Var(&flagUDPMaxAssociations, "udp-associations", 0, "Maximum active UDP associations (0: inherit --concurrent)")
 	pf.Uint64Var(&flagUDPMetricsInterval, "udp-metrics-interval", config.DefaultUDPMetricsIntervalSecs, "UDP metrics log interval in seconds (0: disabled)")
 	pf.Uint64Var(&flagUDPAssociationIdleTime, "udp-association-idle-timeout", 0, "Close idle UDP associations after this many seconds (0: disabled)")
@@ -205,6 +207,7 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 			MetricsIntervalSecs:        flagUDPMetricsInterval,
 			AssociationIdleTimeoutSecs: flagUDPAssociationIdleTime,
 			GSO:                        flagUDPGSO,
+			GRO:                        flagUDPGRO,
 		},
 		Proxy: config.ProxyConfig{
 			Auth: config.AuthMode{

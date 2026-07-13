@@ -27,6 +27,8 @@ type udpMetrics struct {
 	errors             atomic.Uint64
 	queueDepth         atomic.Int64
 	batchFallbacks     atomic.Uint64
+	groCoalescedReads  atomic.Uint64
+	groTruncatedReads  atomic.Uint64
 }
 
 type udpRuntime struct {
@@ -255,6 +257,8 @@ func (r *udpRuntime) logMetrics(ctx context.Context, interval time.Duration) {
 				"unauthorized_drops", r.metrics.unauthorizedDrops.Load(),
 				"association_limit_drops", r.metrics.associationDrops.Load(),
 				"batch_fallbacks", r.metrics.batchFallbacks.Load(),
+				"gro_coalesced_reads", r.metrics.groCoalescedReads.Load(),
+				"gro_truncated_reads", r.metrics.groTruncatedReads.Load(),
 				"batch_buffers_in_use", len(r.batchSlots),
 				"batch_buffer_budget", cap(r.batchSlots),
 				"errors", r.metrics.errors.Load(),

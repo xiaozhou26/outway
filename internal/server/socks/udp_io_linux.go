@@ -23,6 +23,9 @@ type linuxUDPBatchReader struct {
 	bufs          [][]byte
 	packets       []udpReadPacket
 	batchDisabled bool
+	gro           bool
+	groPackets    []udpReadPacket
+	groOOB        []byte
 }
 
 func newUDPBatchReader(conn *net.UDPConn, runtime *udpRuntime, offset, limit int) udpBatchReader {
@@ -33,6 +36,12 @@ func newUDPBatchReader(conn *net.UDPConn, runtime *udpRuntime, offset, limit int
 		limit:   limit,
 		bufs:    make([][]byte, runtime.config.BatchSize),
 		packets: make([]udpReadPacket, runtime.config.BatchSize),
+	}
+	if runtime.config.GRO && udpGROSupported() && enableUDPGRO(conn) == nil {
+		r.gro = true
+		r.groPackets = make([]udpReadPacket, groMaxSegments)
+		r.groOOB = make([]byte, 128)
+		return r
 	}
 	if conn.LocalAddr().(*net.UDPAddr).IP.To4() != nil {
 		r.v4 = ipv4.NewPacketConn(conn)
@@ -51,6 +60,68 @@ func newUDPBatchReader(conn *net.UDPConn, runtime *udpRuntime, offset, limit int
 }
 
 func (r *linuxUDPBatchReader) Read() ([]udpReadPacket, error) {
+	if r.gro {
+		return r.readGRO()
+	}
+	return r.readBatch()
+}
+
+// readGRO performs one blocking read on a UDP_GRO socket. When the kernel
+// coalesced several same-flow, same-size datagrams into the buffer it splits
+// them back into individual packets: the first reuses the read buffer, the rest
+// are copied into their own pooled buffers so the downstream one-buffer-per-
+// packet lifecycle is preserved. A larger recvmmsg drain is unnecessary because
+// GRO already coalesces the flow into this single read.
+func (r *linuxUDPBatchReader) readGRO() ([]udpReadPacket, error) {
+	buffer := r.runtime.getBuffer()
+	// GRO coalesces several datagrams into one read, so use the whole pooled
+	// buffer (bounded by MaxPacketSize+header) rather than a single-datagram
+	// slice; the per-segment size is validated against the limit below.
+	n, oobn, flags, addr, err := r.conn.ReadMsgUDP(buffer[r.offset:], r.groOOB)
+	if err != nil {
+		r.runtime.putBuffer(buffer)
+		return nil, err
+	}
+	src := addr.AddrPort()
+	if flags&unix.MSG_TRUNC != 0 {
+		r.groPackets[0] = udpReadPacket{buffer: buffer, n: n, addr: src, truncated: true}
+		return r.groPackets[:1], nil
+	}
+
+	segmentSize := parseGROSize(r.groOOB[:oobn])
+	if segmentSize <= 0 || segmentSize > r.limit || n <= segmentSize {
+		r.groPackets[0] = udpReadPacket{buffer: buffer, n: n, addr: src, truncated: n > r.limit}
+		return r.groPackets[:1], nil
+	}
+
+	fullSegments := n / segmentSize
+	remainder := n % segmentSize
+	segments := fullSegments
+	if remainder > 0 {
+		segments++
+	}
+	if segments > groMaxSegments {
+		segments = groMaxSegments
+		r.runtime.metrics.groTruncatedReads.Add(1)
+	}
+	r.runtime.metrics.groCoalescedReads.Add(1)
+
+	// The first segment already sits at the read offset.
+	r.groPackets[0] = udpReadPacket{buffer: buffer, n: segmentSize, addr: src}
+	for i := 1; i < segments; i++ {
+		segmentLen := segmentSize
+		if i == fullSegments {
+			segmentLen = remainder
+		}
+		copied := r.runtime.getBuffer()
+		start := r.offset + i*segmentSize
+		copy(copied[r.offset:r.offset+segmentLen], buffer[start:start+segmentLen])
+		r.groPackets[i] = udpReadPacket{buffer: copied, n: segmentLen, addr: src}
+	}
+	return r.groPackets[:segments], nil
+}
+
+func (r *linuxUDPBatchReader) readBatch() ([]udpReadPacket, error) {
 	// Block with a single buffer so idle associations do not pin an entire
 	// batch. Once one datagram arrives, opportunistically drain the socket with
 	// non-blocking recvmmsg into the remaining batch slots.
