@@ -78,6 +78,9 @@ always subject to the OS limits.
 
 Other knobs that matter at high concurrency:
 
+- `--udp-max-packet-size` — the per-datagram ceiling also sizes each pooled
+  relay buffer, so a pool that only carries small datagrams (DNS, QUIC) can lower
+  it well below the 65507 default to cut memory per in-flight packet.
 - `--udp-batch-size` — on Linux, packets are received and sent in batches via
   `recvmmsg`/`sendmmsg`; a larger batch amortizes syscall overhead.
 - `--udp-batch-buffer-budget` — caps the extra pooled buffers held by concurrent

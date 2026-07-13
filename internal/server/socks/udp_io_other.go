@@ -40,15 +40,19 @@ func (r *genericUDPBatchReader) Read() ([]udpReadPacket, error) {
 	return r.packet[:], nil
 }
 
-type genericUDPBatchWriter struct{ conn *net.UDPConn }
+type genericUDPBatchWriter struct {
+	conn *net.UDPConn
+	addr *net.UDPAddr
+}
 
 func newUDPBatchWriter(conn *net.UDPConn, _ int) udpBatchWriter {
-	return &genericUDPBatchWriter{conn: conn}
+	return &genericUDPBatchWriter{conn: conn, addr: newReusableUDPAddr()}
 }
 
 func (w *genericUDPBatchWriter) Write(packets []udpWritePacket) (int, error) {
 	for index, packet := range packets {
-		if _, err := w.conn.WriteToUDP(packet.buffer, net.UDPAddrFromAddrPort(packet.addr)); err != nil {
+		setUDPAddr(w.addr, packet.addr)
+		if _, err := w.conn.WriteToUDP(packet.buffer, w.addr); err != nil {
 			return index, err
 		}
 	}
