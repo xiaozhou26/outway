@@ -39,3 +39,21 @@ func TuneUDPBuffers(conn *net.UDPConn, bytes int) {
 		}
 	}
 }
+
+// currentUDPRecvBuffer reads the socket's effective SO_RCVBUF. The Linux kernel
+// reports twice the value passed to setsockopt (bookkeeping overhead), so a
+// request that fully succeeds reads back as at least the requested size.
+func currentUDPRecvBuffer(conn *net.UDPConn) (int, bool) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	var value int
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) {
+		value, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+	}); err != nil || sockErr != nil {
+		return 0, false
+	}
+	return value, true
+}

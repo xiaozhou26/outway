@@ -391,7 +391,9 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	ctx, cancel := context.WithCancel(parentCtx)
 	errCh := make(chan error, 4)
 	activityCh := make(chan struct{}, 1)
-	inboundPkt := make(chan inboundPacket, 1)
+	// Sized to the batch so a Linux recvmmsg batch drains without a per-packet
+	// scheduler round-trip between the inbound reader and this handler.
+	inboundPkt := make(chan inboundPacket, runtime.config.BatchSize)
 	var readers sync.WaitGroup
 	defer func() {
 		cancel()
@@ -584,6 +586,10 @@ func relayUDPResponses(
 		runtime.config.MaxPacketSize-maxUDPResponseHeaderLen,
 	)
 	writer := newUDPBatchWriter(inbound, runtime.config.BatchSize)
+	// Reused across iterations to keep the response hot path allocation-free;
+	// bounded by the batch reader's per-Read packet count.
+	writes := make([]udpWritePacket, 0, runtime.config.BatchSize)
+	payloadBytes := make([]int, 0, runtime.config.BatchSize)
 	for {
 		packets, err := reader.Read()
 		if err != nil {
@@ -594,8 +600,8 @@ func relayUDPResponses(
 			return
 		}
 		clientAddr := netip.AddrPortFrom(clientIP, uint16(clientPort.Load()))
-		writes := make([]udpWritePacket, 0, len(packets))
-		payloadBytes := make([]int, 0, len(packets))
+		writes = writes[:0]
+		payloadBytes = payloadBytes[:0]
 		for _, packet := range packets {
 			if packet.truncated {
 				runtime.metrics.truncatedDrops.Add(1)

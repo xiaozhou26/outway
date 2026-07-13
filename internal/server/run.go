@@ -50,6 +50,7 @@ func Run(args config.BootArgs) error {
 		"max_associations", args.UDP.MaxAssociations,
 		"idle_timeout_seconds", args.UDP.AssociationIdleTimeoutSecs,
 	)
+	warnIfUDPBufferClamped(args)
 	if err := prepareResourceLimits(args); err != nil {
 		return err
 	}
@@ -166,3 +167,22 @@ var validateSourceCIDR = func(cidr netip.Prefix) error { return nil }
 
 // prepareResourceLimits is implemented on Unix and is a no-op elsewhere.
 var prepareResourceLimits = func(args config.BootArgs) error { return nil }
+
+// warnIfUDPBufferClamped probes whether the requested UDP socket buffer can be
+// honored and warns once at startup if the kernel clamps it. The buffer is only
+// used by the SOCKS5 UDP relay, so the check is skipped for HTTP-only proxies.
+func warnIfUDPBufferClamped(args config.BootArgs) {
+	if args.UDP.SocketBufferBytes <= 0 {
+		return
+	}
+	if args.Proxy.Kind != config.ProxySocks5 && args.Proxy.Kind != config.ProxyAuto {
+		return
+	}
+	applied, clamped, ok := connect.VerifyUDPBufferTuning(args.UDP.SocketBufferBytes)
+	if ok && clamped {
+		slog.Warn("Requested UDP socket buffer was clamped by the kernel; raise net.core.rmem_max and net.core.wmem_max, or run with CAP_NET_ADMIN",
+			"requested_bytes", args.UDP.SocketBufferBytes,
+			"granted_bytes", applied,
+		)
+	}
+}
