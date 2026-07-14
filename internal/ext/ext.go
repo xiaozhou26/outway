@@ -4,8 +4,10 @@
 package ext
 
 import (
+	"hash/fnv"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,9 +35,9 @@ type Extension struct {
 var None = Extension{Type: ExtNone}
 
 const (
-	extTTL    = "-ttl-"
+	extTTL     = "-ttl-"
 	extSession = "-session-"
-	extRange  = "-range-"
+	extRange   = "-range-"
 )
 
 // fxHash64 implements the FxHash64 algorithm (constant 0x517cc1b727220a95,
@@ -73,6 +75,28 @@ func rotl64(x uint64, r uint) uint64 {
 	return (x << r) | (x >> (64 - r))
 }
 
+// strongHash selects a better-distributed hash for extension values.
+var strongHash atomic.Bool
+
+// UseStrongHash opts into a stronger, better-distributed hash for session / ttl
+// / range → address selection. It is off by default so the default mapping
+// matches the upstream FxHash implementation exactly; FxHash true-collides on
+// short, similar session keys, so a large pool sees fewer distinct sources than
+// sessions. Set once at startup before serving.
+func UseStrongHash(enabled bool) { strongHash.Store(enabled) }
+
+// hashValue maps an extension key to a 64-bit value. The default is FxHash64
+// (upstream parity); the opt-in strong mode uses FNV-1a, which yields a distinct
+// value for every distinct key so a session pool spreads evenly.
+func hashValue(data []byte) uint64 {
+	if strongHash.Load() {
+		h := fnv.New64a()
+		_, _ = h.Write(data)
+		return h.Sum64()
+	}
+	return fxHash64(data)
+}
+
 // TryFrom parses an extension from a full username given the configured
 // username prefix. It mirrors the Rust Extension::try_from.
 func TryFrom(prefix, full string) Extension {
@@ -83,7 +107,7 @@ func TryFrom(prefix, full string) Extension {
 
 	// Session: hash the entire full username string.
 	if strings.Contains(full, extSession) {
-		return Extension{Type: ExtSession, Value: fxHash64([]byte(full))}
+		return Extension{Type: ExtSession, Value: hashValue([]byte(full))}
 	}
 
 	// TTL: strip the configured prefix and the "-ttl-" marker, parse remainder.
@@ -95,7 +119,7 @@ func TryFrom(prefix, full string) Extension {
 	// Range: strip the configured prefix and the "-range-" marker, hash remainder.
 	if strings.Contains(extracted, extRange) {
 		rest := strings.TrimPrefix(extracted, extRange)
-		return Extension{Type: ExtRange, Value: fxHash64([]byte(rest))}
+		return Extension{Type: ExtRange, Value: hashValue([]byte(rest))}
 	}
 
 	return None
@@ -113,5 +137,5 @@ func parseTTL(s string) Extension {
 	for i := 0; i < 8; i++ {
 		buf[i] = byte(window >> (8 * (7 - i)))
 	}
-	return Extension{Type: ExtTTL, Value: fxHash64(buf[:])}
+	return Extension{Type: ExtTTL, Value: hashValue(buf[:])}
 }

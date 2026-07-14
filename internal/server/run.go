@@ -12,6 +12,7 @@ import (
 
 	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/connect"
+	"github.com/xiaozhou26/outway/internal/ext"
 	httpsvr "github.com/xiaozhou26/outway/internal/server/http"
 	"github.com/xiaozhou26/outway/internal/server/socks"
 )
@@ -28,6 +29,9 @@ func Run(args config.BootArgs) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 	connect.SetLogger(logger)
+
+	// Select the source-address selection hash before any connection is served.
+	ext.UseStrongHash(args.StrongSessionHash)
 
 	workers := args.Workers
 	if workers <= 0 {

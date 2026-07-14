@@ -157,6 +157,7 @@ outway self uninstall   # Remove the installed binary
 | `--fallback` | `-f` | | Fallback local source address or interface name |
 | `--connect-timeout` | `-t` | `10` | Outbound connection timeout (seconds) |
 | `--reuseaddr` | | `true` | Outbound `SO_REUSEADDR` for TCP sockets |
+| `--strong-session-hash` | | `false` | Use FNV-1a instead of FxHash for session/ttl/range source selection; changes the address mapping and drops upstream parity |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
 | `--udp-max-packet-size` | | `65507` | Maximum complete SOCKS5 UDP relay datagram; larger packets are dropped instead of truncated |
 | `--udp-batch-size` | | `32` | Receive/send batch size (`recvmmsg`/`sendmmsg` on Linux) |

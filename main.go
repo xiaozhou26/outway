@@ -30,6 +30,7 @@ var (
 	flagConnectTimeout         uint64
 	flagTCPUserTimeout         uint64
 	flagReuseAddr              bool
+	flagStrongSessionHash      bool
 	flagUDPMaxPacketSize       int
 	flagUDPBatchSize           int
 	flagUDPBatchBufferBudget   int
@@ -153,6 +154,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.StringVarP(&flagFallback, "fallback", "f", "", "Fallback local source address or interface name")
 	pf.Uint64VarP(&flagConnectTimeout, "connect-timeout", "t", 10, "Outbound connection timeout (seconds)")
 	pf.BoolVar(&flagReuseAddr, "reuseaddr", true, "Outbound SO_REUSEADDR for TCP sockets")
+	pf.BoolVar(&flagStrongSessionHash, "strong-session-hash", false, "Use a stronger hash for session/ttl/range source selection (better pool spread; changes the default address mapping)")
 	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
 	pf.IntVar(&flagUDPBatchSize, "udp-batch-size", config.DefaultUDPBatchSize, "UDP packets per receive/send batch (Linux uses recvmmsg/sendmmsg)")
 	pf.IntVar(&flagUDPBatchBufferBudget, "udp-batch-buffer-budget", config.DefaultUDPBatchBufferBudget, "Maximum extra pooled buffers held by concurrent Linux UDP batches (0: scalar reads)")
@@ -190,12 +192,13 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 	}
 
 	args := config.BootArgs{
-		LogLevel:       config.ParseLogLevel(flagLogLevel),
-		Bind:           bind,
-		Concurrent:     flagConcurrent,
-		Workers:        flagWorkers,
-		ConnectTimeout: flagConnectTimeout,
-		ReuseAddr:      &flagReuseAddr,
+		LogLevel:          config.ParseLogLevel(flagLogLevel),
+		Bind:              bind,
+		Concurrent:        flagConcurrent,
+		Workers:           flagWorkers,
+		ConnectTimeout:    flagConnectTimeout,
+		ReuseAddr:         &flagReuseAddr,
+		StrongSessionHash: flagStrongSessionHash,
 		UDP: config.UDPConfig{
 			MaxPacketSize:              flagUDPMaxPacketSize,
 			BatchSize:                  flagUDPBatchSize,

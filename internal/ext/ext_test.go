@@ -91,3 +91,70 @@ func TestTryFromPlainPrefix(t *testing.T) {
 		t.Errorf("TryFrom plain: type = %v, want ExtNone", got.Type)
 	}
 }
+
+func TestDefaultHashIsFxHashParity(t *testing.T) {
+	t.Cleanup(func() { UseStrongHash(false) })
+	UseStrongHash(false)
+	const full = "user-session-abc123"
+	got := TryFrom("user", full)
+	if got.Type != ExtSession {
+		t.Fatalf("expected session extension, got %v", got.Type)
+	}
+	if got.Value != fxHash64([]byte(full)) {
+		t.Fatalf("default hash is not FxHash (upstream parity broken): %d", got.Value)
+	}
+	// Deterministic across calls.
+	if again := TryFrom("user", full); again.Value != got.Value {
+		t.Fatal("hash is not deterministic")
+	}
+}
+
+func TestStrongSessionHashDistribution(t *testing.T) {
+	t.Cleanup(func() { UseStrongHash(false) })
+	const n = 512
+	distinct := func() int {
+		seen := make(map[uint64]struct{}, n)
+		for i := 0; i < n; i++ {
+			e := TryFrom("user", "user-session-"+strconvI(i))
+			seen[e.Value] = struct{}{}
+		}
+		return len(seen)
+	}
+
+	UseStrongHash(false)
+	weak := distinct()
+	UseStrongHash(true)
+	strong := distinct()
+
+	// Both hashes must map distinct session keys to distinct values, and the
+	// strong hash must be no worse. For plain sequential keys FxHash already
+	// distributes fully, so this guards behavior parity rather than proving an
+	// improvement.
+	if strong != n {
+		t.Errorf("strong hash: %d distinct of %d sessions, want all distinct", strong, n)
+	}
+	if strong < weak {
+		t.Fatalf("strong distribution %d is worse than default %d", strong, weak)
+	}
+	t.Logf("distinct source values for %d sessions: default(fxhash)=%d strong(fnv)=%d", n, weak, strong)
+
+	UseStrongHash(true)
+	a := TryFrom("user", "user-session-abc")
+	if b := TryFrom("user", "user-session-abc"); a.Value != b.Value {
+		t.Fatal("strong hash is not deterministic")
+	}
+}
+
+func strconvI(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(buf[pos:])
+}

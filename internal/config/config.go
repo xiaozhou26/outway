@@ -87,18 +87,19 @@ func ParseFallback(s string) (Fallback, error) {
 
 // BootArgs holds all server boot configuration.
 type BootArgs struct {
-	LogLevel       string
-	Bind           netip.AddrPort
-	Concurrent     uint32
-	Workers        int
-	CIDR           *netip.Prefix
-	CIDRRange      *uint8
-	Fallback       *Fallback
-	ConnectTimeout uint64
-	TCPUserTimeout *uint64 // Linux only
-	ReuseAddr      *bool
-	UDP            UDPConfig
-	Proxy          ProxyConfig
+	LogLevel          string
+	Bind              netip.AddrPort
+	Concurrent        uint32
+	Workers           int
+	CIDR              *netip.Prefix
+	CIDRRange         *uint8
+	Fallback          *Fallback
+	ConnectTimeout    uint64
+	TCPUserTimeout    *uint64 // Linux only
+	ReuseAddr         *bool
+	StrongSessionHash bool
+	UDP               UDPConfig
+	Proxy             ProxyConfig
 }
 
 // Validate checks cross-field constraints that cannot be expressed by the CLI
