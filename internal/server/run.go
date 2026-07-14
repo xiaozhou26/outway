@@ -86,6 +86,7 @@ func Run(args config.BootArgs) error {
 		Auth:           args.Proxy.Auth,
 		Connector:      connector,
 		UDP:            args.UDP,
+		ReusePort:      args.ReusePort,
 	}
 
 	srv, err := newProxyServer(args.Proxy, ctx)

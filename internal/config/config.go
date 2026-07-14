@@ -104,6 +104,7 @@ type BootArgs struct {
 	TCPUserTimeout  *uint64 // Linux only
 	ReuseAddr       *bool
 	MaxPendingDials int
+	ReusePort       bool
 	UDP             UDPConfig
 	Proxy           ProxyConfig
 }

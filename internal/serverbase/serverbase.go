@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/xiaozhou26/outway/internal/config"
@@ -40,6 +41,24 @@ type Context struct {
 	Auth           config.AuthMode
 	Connector      *connect.Connector
 	UDP            config.UDPConfig
+	ReusePort      bool
+}
+
+// AcceptShards returns how many SO_REUSEPORT listeners/accept loops to run.
+// It is one unless reuse-port is enabled and supported, in which case it scales
+// with the CPU count (capped) to spread accept across cores.
+func AcceptShards(reusePort bool) int {
+	if !reusePort || !reusePortSupported {
+		return 1
+	}
+	shards := runtime.GOMAXPROCS(0)
+	if shards < 1 {
+		return 1
+	}
+	if shards > 16 {
+		return 16
+	}
+	return shards
 }
 
 // TuneTCPConnection applies low-latency and dead-peer detection settings to an
@@ -51,6 +70,50 @@ func TuneTCPConnection(conn net.Conn) {
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(60 * time.Second)
 	}
+}
+
+// ListenTCPShards binds one or more TCP listeners for addr. When shards > 1 and
+// the platform supports it, each listener sets SO_REUSEPORT so the kernel
+// spreads incoming connections across them and a separate accept goroutine can
+// run per shard. It falls back to a single listener when sharding is off or
+// unsupported. A tcp6 network retries as tcp to allow dual-stack binds.
+func ListenTCPShards(ctx context.Context, network, addr string, shards int) ([]net.Listener, error) {
+	sharded := shards > 1 && reusePortSupported
+	var control func(string, string, syscall.RawConn) error
+	if sharded {
+		control = controlReusePort
+	}
+	lc := net.ListenConfig{Control: control}
+
+	first, err := lc.Listen(ctx, network, addr)
+	if err != nil {
+		if network == "tcp6" {
+			first, err = lc.Listen(ctx, "tcp", addr)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	listeners := []net.Listener{first}
+	if !sharded {
+		return listeners, nil
+	}
+
+	// Bind the remaining shards on the concrete address the first listener
+	// resolved, so SO_REUSEPORT shares one port instead of each shard taking a
+	// fresh ephemeral port.
+	resolved := first.Addr().String()
+	for range shards - 1 {
+		ln, err := lc.Listen(ctx, first.Addr().Network(), resolved)
+		if err != nil {
+			for _, existing := range listeners {
+				_ = existing.Close()
+			}
+			return nil, err
+		}
+		listeners = append(listeners, ln)
+	}
+	return listeners, nil
 }
 
 // AcquireBufferedReader obtains a reusable default-sized buffered reader.
