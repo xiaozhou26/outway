@@ -20,9 +20,17 @@ type udpReactor struct {
 	epfd     int
 	eventfd  int
 	mu       sync.RWMutex
-	handlers map[int32]func()
+	regs     map[int32]*reactorReg
 	wg       sync.WaitGroup
 	closed   atomic.Bool
+}
+
+// reactorReg couples an fd's ready handler with a lock that serializes it
+// against deregistration, so a socket is never closed while its handler runs.
+type reactorReg struct {
+	handler func()
+	mu      sync.Mutex
+	dead    bool
 }
 
 // newUDPReactor creates a reactor with the given number of worker goroutines and
@@ -49,7 +57,7 @@ func newUDPReactor(workers int) (*udpReactor, error) {
 	if workers < 1 {
 		workers = 1
 	}
-	r := &udpReactor{epfd: epfd, eventfd: eventfd, handlers: make(map[int32]func())}
+	r := &udpReactor{epfd: epfd, eventfd: eventfd, regs: make(map[int32]*reactorReg)}
 	for range workers {
 		r.wg.Add(1)
 		go r.loop()
@@ -61,13 +69,14 @@ func newUDPReactor(workers int) (*udpReactor, error) {
 // on a worker goroutine when fd becomes readable; it must drain the socket and
 // call rearm(fd) to receive further readiness notifications.
 func (r *udpReactor) register(fd int, handler func()) error {
+	reg := &reactorReg{handler: handler}
 	r.mu.Lock()
-	r.handlers[int32(fd)] = handler
+	r.regs[int32(fd)] = reg
 	r.mu.Unlock()
 	event := unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLONESHOT, Fd: int32(fd)}
 	if err := unix.EpollCtl(r.epfd, unix.EPOLL_CTL_ADD, fd, &event); err != nil {
 		r.mu.Lock()
-		delete(r.handlers, int32(fd))
+		delete(r.regs, int32(fd))
 		r.mu.Unlock()
 		return err
 	}
@@ -80,14 +89,21 @@ func (r *udpReactor) rearm(fd int) error {
 	return unix.EpollCtl(r.epfd, unix.EPOLL_CTL_MOD, fd, &event)
 }
 
-// deregister removes fd from the reactor. The caller must ensure no handler for
-// fd is still running before closing the underlying socket, to avoid an fd-reuse
-// hazard.
+// deregister removes fd from the reactor and blocks until any in-flight handler
+// for it has returned, so the caller can then safely close the underlying
+// socket without an fd-reuse hazard.
 func (r *udpReactor) deregister(fd int) {
-	_ = unix.EpollCtl(r.epfd, unix.EPOLL_CTL_DEL, fd, nil)
 	r.mu.Lock()
-	delete(r.handlers, int32(fd))
+	reg := r.regs[int32(fd)]
+	delete(r.regs, int32(fd))
 	r.mu.Unlock()
+	_ = unix.EpollCtl(r.epfd, unix.EPOLL_CTL_DEL, fd, nil)
+	if reg != nil {
+		// Wait for any running handler, then keep it from running again.
+		reg.mu.Lock()
+		reg.dead = true
+		reg.mu.Unlock()
+	}
 }
 
 func (r *udpReactor) loop() {
@@ -110,11 +126,16 @@ func (r *udpReactor) loop() {
 				continue
 			}
 			r.mu.RLock()
-			handler := r.handlers[fd]
+			reg := r.regs[fd]
 			r.mu.RUnlock()
-			if handler != nil {
-				handler()
+			if reg == nil {
+				continue
 			}
+			reg.mu.Lock()
+			if !reg.dead {
+				reg.handler()
+			}
+			reg.mu.Unlock()
 		}
 	}
 }

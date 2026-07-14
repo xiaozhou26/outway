@@ -393,9 +393,17 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	// Sized to the batch so a Linux recvmmsg batch drains without a per-packet
 	// scheduler round-trip between the inbound reader and this handler.
 	inboundPkt := make(chan inboundPacket, runtime.config.BatchSize)
+	// Outbound response sockets are serviced by the shared epoll reactor when
+	// available, so they cost no per-association goroutine; reactorFds records
+	// the registrations to tear down before their sockets are closed.
+	reactor, useReactor := runtime.sharedReactor()
+	var reactorFds []int
 	var readers sync.WaitGroup
 	defer func() {
 		cancel()
+		for _, fd := range reactorFds {
+			reactor.deregister(fd)
+		}
 		_ = client.Close()
 		_ = inbound.Close()
 		_ = preferredOutbound.Close()
@@ -461,13 +469,28 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		}
 	}()
 
-	// Outbound readers relay complete batches directly to the client. This
-	// avoids per-association response channels and lets Linux use sendmmsg.
+	// Outbound readers relay complete batches directly to the client. On Linux
+	// they are driven one readable event at a time by the shared reactor (no
+	// per-association goroutine); otherwise a blocking goroutine per socket.
 	startOutboundReader := func(outbound *net.UDPConn) {
+		responder := newUDPResponder(ctx, inbound, outbound, srcIP, &srcPort, runtime, errCh, activityCh)
+		if useReactor {
+			if fd, ok := udpConnFd(outbound); ok {
+				handler := func() {
+					if responder.pumpOnce() {
+						_ = reactor.rearm(fd)
+					}
+				}
+				if reactor.register(fd, handler) == nil {
+					reactorFds = append(reactorFds, fd)
+					return
+				}
+			}
+		}
 		readers.Add(1)
 		go func() {
 			defer readers.Done()
-			relayUDPResponses(ctx, inbound, outbound, srcIP, &srcPort, runtime, errCh, activityCh)
+			responder.serveBlocking()
 		}()
 	}
 	startOutboundReader(preferredOutbound)
@@ -653,6 +676,112 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	}
 }
 
+// udpResponder relays target responses on one outbound socket back to the
+// client. It can be driven either by a dedicated blocking goroutine
+// (serveBlocking) or, on Linux, one readable event at a time from the shared
+// reactor (pumpOnce), so associations need not each hold a read goroutine.
+type udpResponder struct {
+	ctx          context.Context
+	clientIP     netip.Addr
+	clientPort   *atomic.Uint32
+	runtime      *udpRuntime
+	errCh        chan<- error
+	activityCh   chan<- struct{}
+	reader       udpBatchReader
+	writer       udpBatchWriter
+	writes       []udpWritePacket
+	payloadBytes []int
+}
+
+func newUDPResponder(
+	ctx context.Context,
+	inbound, outbound *net.UDPConn,
+	clientIP netip.Addr,
+	clientPort *atomic.Uint32,
+	runtime *udpRuntime,
+	errCh chan<- error,
+	activityCh chan<- struct{},
+) *udpResponder {
+	return &udpResponder{
+		ctx:          ctx,
+		clientIP:     clientIP,
+		clientPort:   clientPort,
+		runtime:      runtime,
+		errCh:        errCh,
+		activityCh:   activityCh,
+		reader:       newUDPBatchReader(outbound, runtime, proto.UdpHeaderMaxLen, runtime.config.MaxPacketSize-maxUDPResponseHeaderLen),
+		writer:       newUDPBatchWriter(inbound, runtime.config.BatchSize),
+		writes:       make([]udpWritePacket, 0, runtime.config.BatchSize),
+		payloadBytes: make([]int, 0, runtime.config.BatchSize),
+	}
+}
+
+// pumpOnce reads one batch of target responses and forwards them to the client.
+// It returns false when the outbound socket is closed or errors, so the caller
+// stops driving it. The slices are reused to keep the hot path allocation-free.
+func (p *udpResponder) pumpOnce() bool {
+	packets, err := p.reader.Read()
+	if err != nil {
+		if p.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+			p.runtime.metrics.errors.Add(1)
+			reportUDPError(p.errCh, err)
+		}
+		return false
+	}
+	clientAddr := netip.AddrPortFrom(p.clientIP, uint16(p.clientPort.Load()))
+	p.writes = p.writes[:0]
+	p.payloadBytes = p.payloadBytes[:0]
+	for _, packet := range packets {
+		if packet.truncated {
+			p.runtime.metrics.truncatedDrops.Add(1)
+			p.runtime.releaseReadPacket(packet)
+			continue
+		}
+		if clientAddr.Port() == 0 {
+			p.runtime.releaseReadPacket(packet)
+			continue
+		}
+		payload := packet.buffer[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+packet.n]
+		response := prepareUDPResponse(outboundPacket{
+			payload: payload,
+			buffer:  packet.buffer,
+			remote:  net.UDPAddrFromAddrPort(packet.addr),
+		})
+		p.writes = append(p.writes, udpWritePacket{buffer: response, owner: packet.buffer, addr: clientAddr, batchSlot: packet.batchSlot})
+		p.payloadBytes = append(p.payloadBytes, packet.n)
+	}
+	written, writeErr := p.writer.Write(p.writes)
+	for i, write := range p.writes {
+		if i < written {
+			p.runtime.metrics.outPackets.Add(1)
+			p.runtime.metrics.outBytes.Add(uint64(p.payloadBytes[i]))
+		}
+		// Every response is backed by one independently pooled buffer.
+		p.runtime.releaseBuffer(write.owner, write.batchSlot)
+	}
+	if writeErr != nil || written != len(p.writes) {
+		p.runtime.metrics.errors.Add(1)
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		reportUDPError(p.errCh, writeErr)
+	}
+	if written > 0 {
+		select {
+		case p.activityCh <- struct{}{}:
+		default:
+		}
+	}
+	return true
+}
+
+// serveBlocking pumps responses in a loop on a dedicated goroutine (the
+// non-reactor fallback and non-Linux path).
+func (p *udpResponder) serveBlocking() {
+	for p.pumpOnce() {
+	}
+}
+
 func relayUDPResponses(
 	ctx context.Context,
 	inbound, outbound *net.UDPConn,
@@ -662,71 +791,7 @@ func relayUDPResponses(
 	errCh chan<- error,
 	activityCh chan<- struct{},
 ) {
-	reader := newUDPBatchReader(
-		outbound,
-		runtime,
-		proto.UdpHeaderMaxLen,
-		runtime.config.MaxPacketSize-maxUDPResponseHeaderLen,
-	)
-	writer := newUDPBatchWriter(inbound, runtime.config.BatchSize)
-	// Reused across iterations to keep the response hot path allocation-free;
-	// bounded by the batch reader's per-Read packet count.
-	writes := make([]udpWritePacket, 0, runtime.config.BatchSize)
-	payloadBytes := make([]int, 0, runtime.config.BatchSize)
-	for {
-		packets, err := reader.Read()
-		if err != nil {
-			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-				runtime.metrics.errors.Add(1)
-				reportUDPError(errCh, err)
-			}
-			return
-		}
-		clientAddr := netip.AddrPortFrom(clientIP, uint16(clientPort.Load()))
-		writes = writes[:0]
-		payloadBytes = payloadBytes[:0]
-		for _, packet := range packets {
-			if packet.truncated {
-				runtime.metrics.truncatedDrops.Add(1)
-				runtime.releaseReadPacket(packet)
-				continue
-			}
-			if clientAddr.Port() == 0 {
-				runtime.releaseReadPacket(packet)
-				continue
-			}
-			payload := packet.buffer[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+packet.n]
-			response := prepareUDPResponse(outboundPacket{
-				payload: payload,
-				buffer:  packet.buffer,
-				remote:  net.UDPAddrFromAddrPort(packet.addr),
-			})
-			writes = append(writes, udpWritePacket{buffer: response, owner: packet.buffer, addr: clientAddr, batchSlot: packet.batchSlot})
-			payloadBytes = append(payloadBytes, packet.n)
-		}
-		written, writeErr := writer.Write(writes)
-		for i, write := range writes {
-			if i < written {
-				runtime.metrics.outPackets.Add(1)
-				runtime.metrics.outBytes.Add(uint64(payloadBytes[i]))
-			}
-			// Every response is backed by one independently pooled buffer.
-			runtime.releaseBuffer(write.owner, write.batchSlot)
-		}
-		if writeErr != nil || written != len(writes) {
-			runtime.metrics.errors.Add(1)
-			if writeErr == nil {
-				writeErr = io.ErrShortWrite
-			}
-			reportUDPError(errCh, writeErr)
-		}
-		if written > 0 {
-			select {
-			case activityCh <- struct{}{}:
-			default:
-			}
-		}
-	}
+	newUDPResponder(ctx, inbound, outbound, clientIP, clientPort, runtime, errCh, activityCh).serveBlocking()
 }
 
 func writeUDPResponse(inbound *net.UDPConn, clientAddr netip.AddrPort, pkt outboundPacket) error {
