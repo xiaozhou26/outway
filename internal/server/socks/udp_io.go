@@ -43,6 +43,21 @@ func newReusableUDPAddr() *net.UDPAddr {
 	return &net.UDPAddr{IP: make(net.IP, 16)}
 }
 
+// udpConnFd returns the raw file descriptor backing a UDP socket, so it can be
+// registered with the epoll reactor. ok is false if the descriptor cannot be
+// obtained.
+func udpConnFd(conn *net.UDPConn) (int, bool) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	var fd int
+	if err := raw.Control(func(handle uintptr) { fd = int(handle) }); err != nil {
+		return 0, false
+	}
+	return fd, true
+}
+
 // setUDPAddr rewrites dst to match ap in place, reusing dst.IP's backing array.
 // It lets the batch writers avoid a *net.UDPAddr (and IP slice) allocation per
 // packet that net.UDPAddrFromAddrPort would incur.

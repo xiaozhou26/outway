@@ -42,6 +42,39 @@ type udpRuntime struct {
 	associationSlots chan struct{}
 	workerWG         sync.WaitGroup
 	batchSlots       chan struct{}
+	reactor          *udpReactor
+	reactorOnce      sync.Once
+	reactorReady     atomic.Bool
+}
+
+// sharedReactor lazily creates the process-wide UDP read reactor and returns it.
+// ok is false when a reactor is unavailable (non-Linux, or epoll setup failed),
+// in which case callers fall back to a blocking read goroutine per socket. The
+// reactor is closed when the runtime lifetime ends.
+func (r *udpRuntime) sharedReactor() (*udpReactor, bool) {
+	r.reactorOnce.Do(func() {
+		workers := runtime.GOMAXPROCS(0)
+		if workers < 2 {
+			workers = 2
+		}
+		if workers > 16 {
+			workers = 16
+		}
+		reactor, err := newUDPReactor(workers)
+		if err != nil {
+			return
+		}
+		r.reactor = reactor
+		r.reactorReady.Store(true)
+		go func() {
+			<-r.lifetime.Done()
+			reactor.close()
+		}()
+	})
+	if r.reactorReady.Load() {
+		return r.reactor, true
+	}
+	return nil, false
 }
 
 func newUDPRuntime(cfg config.UDPConfig, concurrent uint32, lifetime context.Context) *udpRuntime {
