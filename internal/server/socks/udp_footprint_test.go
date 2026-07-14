@@ -46,7 +46,7 @@ func TestUDPAssociationFootprint(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     4096,
 		ConnectTimeout: 10,
-		Connector:      connect.New(nil, nil, nil, 10, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 10, nil, nil, 0),
 		UDP:            config.DefaultBootArgs().UDP,
 	})
 	if err != nil {
