@@ -38,7 +38,7 @@ func newIdleTimeoutProxy(t *testing.T, idleSecs uint64) (*Socks5Server, netip.Ad
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     8,
 		ConnectTimeout: 5,
-		Connector:      connect.New(nil, nil, nil, 5, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
 		UDP:            udpConfig,
 	})
 	if err != nil {
