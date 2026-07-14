@@ -471,6 +471,13 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		*batch = (*batch)[:0]
 	}
 
+	// batchInPackets/batchInBytes accumulate the inbound counts for one
+	// inboundPump batch; the loop flushes them with a single atomic add per batch
+	// instead of one per datagram, cutting shared cache-line contention on the hot
+	// path. The totals are identical, just flushed per batch. Drop counters
+	// (fragment/unauthorized/etc.) stay per-event since they are rare.
+	var batchInPackets, batchInBytes uint64
+
 	// processInbound applies the fragment/authorization checks and metrics to one
 	// client packet, then either queues a literal-IP target into its family batch
 	// or dispatches a domain target to a send worker. It returns true when the
@@ -489,8 +496,8 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 			return false
 		}
 		srcPort.Store(uint32(pkt.src.Port()))
-		runtime.metrics.inPackets.Add(1)
-		runtime.metrics.inBytes.Add(uint64(len(pkt.payload)))
+		batchInPackets++
+		batchInBytes += uint64(len(pkt.payload))
 
 		// Resolve the outbound target. Literal IPs and already-cached domains take
 		// the fast batch path; an uncached domain is handed to a send worker that
@@ -547,6 +554,7 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 			return false
 		}
 		active := false
+		batchInPackets, batchInBytes = 0, 0
 		for _, packet := range packets {
 			if packet.truncated {
 				runtime.metrics.truncatedDrops.Add(1)
@@ -569,6 +577,10 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 			}) {
 				active = true
 			}
+		}
+		if batchInPackets > 0 {
+			runtime.metrics.inPackets.Add(batchInPackets)
+			runtime.metrics.inBytes.Add(batchInBytes)
 		}
 		flushBatch(preferredWriter, preferredOutbound, &preferredBatch)
 		if fallbackWriter != nil {
@@ -724,13 +736,19 @@ func (p *udpResponder) pumpOnce() bool {
 		p.payloadBytes = append(p.payloadBytes, packet.n)
 	}
 	written, writeErr := p.writer.Write(p.writes)
+	var outPackets, outBytes uint64
 	for i, write := range p.writes {
 		if i < written {
-			p.runtime.metrics.outPackets.Add(1)
-			p.runtime.metrics.outBytes.Add(uint64(p.payloadBytes[i]))
+			outPackets++
+			outBytes += uint64(p.payloadBytes[i])
 		}
 		// Every response is backed by one independently pooled buffer.
 		p.runtime.releaseBuffer(write.owner, write.batchSlot)
+	}
+	// One atomic add per batch instead of one per datagram (identical totals).
+	if outPackets > 0 {
+		p.runtime.metrics.outPackets.Add(outPackets)
+		p.runtime.metrics.outBytes.Add(outBytes)
 	}
 	if writeErr != nil || written != len(p.writes) {
 		p.runtime.metrics.errors.Add(1)
