@@ -17,12 +17,12 @@ import (
 // runs a given fd's handler at a time; the handler drains the socket and re-arms
 // the fd. This is the piece that lets N associations share M ≪ N goroutines.
 type udpReactor struct {
-	epfd     int
-	eventfd  int
-	mu       sync.RWMutex
-	regs     map[int32]*reactorReg
-	wg       sync.WaitGroup
-	closed   atomic.Bool
+	epfd    int
+	eventfd int
+	mu      sync.RWMutex
+	regs    map[int32]*reactorReg
+	wg      sync.WaitGroup
+	closed  atomic.Bool
 }
 
 // reactorReg couples an fd's ready handler with a lock that serializes it
