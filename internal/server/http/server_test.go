@@ -76,7 +76,7 @@ func TestHTTPSConnectConcurrentTunnelsStress(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     uint32(count + 128),
 		ConnectTimeout: 10,
-		Connector:      connect.New(nil, nil, nil, 10, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 10, nil, nil, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func TestHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     uint32(count + 128),
 		ConnectTimeout: 10,
-		Connector:      connect.New(nil, nil, nil, 10, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 10, nil, nil, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -366,7 +366,7 @@ func TestForwardRequestReusesOutboundConnection(t *testing.T) {
 
 	handler := NewHandler(serverbase.Context{
 		ConnectTimeout: 1,
-		Connector:      connect.New(nil, nil, nil, 1, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 1, nil, nil, 0),
 	})
 	defer handler.CloseIdleConnections()
 
@@ -391,7 +391,7 @@ func TestServerCloseStopsAcceptLoop(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     1,
 		ConnectTimeout: 1,
-		Connector:      connect.New(nil, nil, nil, 1, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 1, nil, nil, 0),
 	}
 	srv, err := NewServer(ctx)
 	if err != nil {

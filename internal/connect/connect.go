@@ -50,17 +50,18 @@ type Connector struct {
 	dialSlots      chan struct{}
 }
 
-const defaultMaxPendingDials = 512
-
-// New creates a Connector from boot configuration.
-func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connectTimeoutSec uint64, tcpUserTimeout *uint64, reuseaddr *bool) *Connector {
+// New creates a Connector from boot configuration. maxPendingDials caps
+// concurrent outbound TCP dials; zero or negative leaves dialing unbounded.
+func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connectTimeoutSec uint64, tcpUserTimeout *uint64, reuseaddr *bool, maxPendingDials int) *Connector {
 	c := &Connector{
 		CIDR:           cidr,
 		CIDRRange:      cidrRange,
 		Fallback:       fallback,
 		ConnectTimeout: time.Duration(connectTimeoutSec) * time.Second,
 		ReuseAddr:      reuseaddr,
-		dialSlots:      make(chan struct{}, defaultMaxPendingDials),
+	}
+	if maxPendingDials > 0 {
+		c.dialSlots = make(chan struct{}, maxPendingDials)
 	}
 	if tcpUserTimeout != nil {
 		d := time.Duration(*tcpUserTimeout) * time.Second
@@ -223,11 +224,13 @@ func (t *TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (
 // dialContext builds a net.Dialer with the configured source address and socket
 // options, then dials the target.
 func (t *TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindInterface string, target netip.AddrPort) (*net.TCPConn, error) {
-	select {
-	case t.inner.dialSlots <- struct{}{}:
-		defer func() { <-t.inner.dialSlots }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if t.inner.dialSlots != nil {
+		select {
+		case t.inner.dialSlots <- struct{}{}:
+			defer func() { <-t.inner.dialSlots }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	dialer := &net.Dialer{
@@ -468,6 +471,17 @@ func (u *UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr 
 
 func (u *UdpConnector) trySendTo(pkt []byte, addr netip.AddrPort, s *net.UDPConn) (int, error) {
 	return s.WriteToUDP(pkt, net.UDPAddrFromAddrPort(addr))
+}
+
+// LookupCachedHost returns resolved addresses for host from the DNS cache
+// without triggering a lookup, so a caller on a latency-sensitive path can take
+// a fast route for already-resolved hosts and defer cold lookups elsewhere. An
+// IP literal resolves to itself. ok is false on a cache miss.
+func LookupCachedHost(host string) ([]netip.Addr, bool) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip}, true
+	}
+	return defaultDNSCache.LookupCached(host)
 }
 
 // resolveHost resolves a host:port to a list of socket addresses.

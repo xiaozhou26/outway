@@ -76,6 +76,21 @@ var defaultDNSCache = newDNSCache(
 	},
 )
 
+// LookupCached returns cached, still-valid addresses for host without ever
+// triggering a resolution. ok is false on a cache miss or a cached failure, so
+// the caller can fall back to a resolving path.
+func (c *dnsCache) LookupCached(host string) ([]netip.Addr, bool) {
+	key := normalizeDNSName(host)
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || entry.err != nil || len(entry.addrs) == 0 || !now.Before(entry.expiresAt) {
+		return nil, false
+	}
+	return entry.addrs, true
+}
+
 // Lookup returns immutable cached addresses or resolves the host. Callers must
 // not modify the returned slice.
 func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {

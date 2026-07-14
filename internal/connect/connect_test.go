@@ -20,7 +20,7 @@ func TestIPv4ToUint32RoundTrip(t *testing.T) {
 
 func TestIPv6CIDRRejectsIPv4TargetWithoutFallback(t *testing.T) {
 	cidr := netip.MustParsePrefix("2604:2dc0:20e:4700::/56")
-	connector := New(&cidr, nil, nil, 1, nil, nil)
+	connector := New(&cidr, nil, nil, 1, nil, nil, 0)
 	_, err := connector.TCP(ext.None).connectAddr(
 		context.Background(),
 		netip.MustParseAddrPort("192.0.2.1:443"),

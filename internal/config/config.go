@@ -51,6 +51,12 @@ const (
 	DefaultUDPMetricsIntervalSecs = 30
 )
 
+// DefaultMaxPendingDials bounds concurrent outbound TCP dials by default. It
+// keeps a burst of new connections from opening an unbounded number of sockets
+// at once; raise it for CONNECT-heavy pools whose targets dial slowly, or set
+// zero to leave dialing unbounded.
+const DefaultMaxPendingDials = 512
+
 // UDPConfig controls SOCKS5 UDP relay resource usage. SendWorkers set to zero
 // selects an automatic value derived from GOMAXPROCS. MetricsIntervalSecs and
 // AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
@@ -87,18 +93,19 @@ func ParseFallback(s string) (Fallback, error) {
 
 // BootArgs holds all server boot configuration.
 type BootArgs struct {
-	LogLevel       string
-	Bind           netip.AddrPort
-	Concurrent     uint32
-	Workers        int
-	CIDR           *netip.Prefix
-	CIDRRange      *uint8
-	Fallback       *Fallback
-	ConnectTimeout uint64
-	TCPUserTimeout *uint64 // Linux only
-	ReuseAddr      *bool
-	UDP            UDPConfig
-	Proxy          ProxyConfig
+	LogLevel        string
+	Bind            netip.AddrPort
+	Concurrent      uint32
+	Workers         int
+	CIDR            *netip.Prefix
+	CIDRRange       *uint8
+	Fallback        *Fallback
+	ConnectTimeout  uint64
+	TCPUserTimeout  *uint64 // Linux only
+	ReuseAddr       *bool
+	MaxPendingDials int
+	UDP             UDPConfig
+	Proxy           ProxyConfig
 }
 
 // Validate checks cross-field constraints that cannot be expressed by the CLI
@@ -156,11 +163,12 @@ func (a BootArgs) Validate() error {
 func DefaultBootArgs() BootArgs {
 	reuse := true
 	return BootArgs{
-		LogLevel:       "info",
-		Bind:           netip.MustParseAddrPort("127.0.0.1:1080"),
-		Concurrent:     8192,
-		ConnectTimeout: 10,
-		ReuseAddr:      &reuse,
+		LogLevel:        "info",
+		Bind:            netip.MustParseAddrPort("127.0.0.1:1080"),
+		Concurrent:      8192,
+		ConnectTimeout:  10,
+		ReuseAddr:       &reuse,
+		MaxPendingDials: DefaultMaxPendingDials,
 		UDP: UDPConfig{
 			MaxPacketSize:       DefaultUDPMaxPacketSize,
 			BatchSize:           DefaultUDPBatchSize,
