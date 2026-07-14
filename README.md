@@ -158,6 +158,7 @@ outway self uninstall   # Remove the installed binary
 | `--connect-timeout` | `-t` | `10` | Outbound connection timeout (seconds) |
 | `--reuseaddr` | | `true` | Outbound `SO_REUSEADDR` for TCP sockets |
 | `--max-pending-dials` | | `512` | Maximum concurrent outbound TCP dials; `0` is unlimited |
+| `--reuse-port` | | `false` | Shard the listener with `SO_REUSEPORT` across accept loops (Linux/BSD) |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
 | `--udp-max-packet-size` | | `65507` | Maximum complete SOCKS5 UDP relay datagram; larger packets are dropped instead of truncated |
 | `--udp-batch-size` | | `32` | Receive/send batch size (`recvmmsg`/`sendmmsg` on Linux) |

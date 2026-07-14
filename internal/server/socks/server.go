@@ -69,52 +69,58 @@ func (a Socks5Acceptor) Accept(stream net.Conn, socketAddr netip.AddrPort) {
 
 // Socks5Server listens for SOCKS5 connections and dispatches them to acceptors.
 type Socks5Server struct {
-	listener  net.Listener
-	acceptor  Socks5Acceptor
-	gate      *serverbase.ConnectionGate
-	conns     *serverbase.ConnectionSet
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	launchMu  sync.Mutex
-	closeOnce sync.Once
-	closeErr  error
+	listener       net.Listener
+	extraListeners []net.Listener
+	acceptor       Socks5Acceptor
+	gate           *serverbase.ConnectionGate
+	conns          *serverbase.ConnectionSet
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	launchMu       sync.Mutex
+	closeOnce      sync.Once
+	closeErr       error
 }
 
-// NewServer binds a TCP listener and returns a Socks5Server.
+// NewServer binds one or more TCP listeners (SO_REUSEPORT shards when enabled)
+// and returns a Socks5Server.
 func NewServer(ctx serverbase.Context) (*Socks5Server, error) {
 	network := "tcp4"
 	if ctx.Bind.Addr().Is6() {
 		network = "tcp6"
 	}
-	ln, err := net.Listen(network, ctx.Bind.String())
-	if err != nil {
-		if network == "tcp6" {
-			if ln2, err2 := net.Listen("tcp", ctx.Bind.String()); err2 == nil {
-				ln = ln2
-				err = nil
-			}
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
 	lifetime, cancel := context.WithCancel(context.Background())
+	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	return &Socks5Server{
-		listener: ln,
-		acceptor: NewAcceptor(ctx, lifetime),
-		gate:     serverbase.NewConnectionGate(ctx.Concurrent),
-		conns:    serverbase.NewConnectionSet(),
-		cancel:   cancel,
+		listener:       listeners[0],
+		extraListeners: listeners[1:],
+		acceptor:       NewAcceptor(ctx, lifetime),
+		gate:           serverbase.NewConnectionGate(ctx.Concurrent),
+		conns:          serverbase.NewConnectionSet(),
+		cancel:         cancel,
 	}, nil
 }
 
-// Start runs the accept loop until the server is shut down.
+// Start runs the accept loops until the server is shut down.
 func (s *Socks5Server) Start() error {
-	addr := s.listener.Addr()
-	slog.Info(fmt.Sprintf("Socks5 proxy server listening on %s", addr))
+	slog.Info(fmt.Sprintf("Socks5 proxy server listening on %s", s.listener.Addr()))
+	for _, ln := range s.extraListeners {
+		listener := ln
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			_ = s.acceptLoop(listener)
+		}()
+	}
+	return s.acceptLoop(s.listener)
+}
 
+func (s *Socks5Server) acceptLoop(ln net.Listener) error {
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if isClosed(err) {
 				return nil
@@ -152,7 +158,7 @@ func (s *Socks5Server) Start() error {
 	}
 }
 
-// Close stops the listener.
+// Close stops the listeners.
 func (s *Socks5Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
@@ -160,6 +166,11 @@ func (s *Socks5Server) Close() error {
 		listenerErr := s.listener.Close()
 		if errors.Is(listenerErr, net.ErrClosed) {
 			listenerErr = nil
+		}
+		for _, ln := range s.extraListeners {
+			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				listenerErr = errors.Join(listenerErr, err)
+			}
 		}
 		s.launchMu.Lock()
 		s.launchMu.Unlock()

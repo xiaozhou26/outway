@@ -23,19 +23,20 @@ import (
 // HttpServer listens for HTTP/HTTPS proxy connections and dispatches them to
 // the handler.
 type HttpServer struct {
-	listener  net.Listener
-	handler   Handler
-	tlsConfig *tls.Config
-	timeout   time.Duration
-	gate      *serverbase.ConnectionGate
-	tlsGate   *serverbase.ConnectionGate
-	conns     *serverbase.ConnectionSet
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	launchMu  sync.Mutex
-	closeOnce sync.Once
-	closeErr  error
+	listener       net.Listener
+	extraListeners []net.Listener
+	handler        Handler
+	tlsConfig      *tls.Config
+	timeout        time.Duration
+	gate           *serverbase.ConnectionGate
+	tlsGate        *serverbase.ConnectionGate
+	conns          *serverbase.ConnectionSet
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	launchMu       sync.Mutex
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 // Handler holds the authenticator and outbound connector for HTTP proxying.
@@ -75,34 +76,29 @@ func NewHandler(ctx serverbase.Context) Handler {
 	}
 }
 
-// NewServer binds a TCP listener and returns an HTTP server.
+// NewServer binds one or more TCP listeners (SO_REUSEPORT shards when enabled)
+// and returns an HTTP server.
 func NewServer(ctx serverbase.Context) (*HttpServer, error) {
 	network := "tcp4"
 	if ctx.Bind.Addr().Is6() {
 		network = "tcp6"
 	}
-	ln, err := net.Listen(network, ctx.Bind.String())
-	if err != nil {
-		if network == "tcp6" {
-			if ln2, err2 := net.Listen("tcp", ctx.Bind.String()); err2 == nil {
-				ln = ln2
-				err = nil
-			}
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
 	lifetime, cancel := context.WithCancel(context.Background())
+	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	return &HttpServer{
-		listener: ln,
-		handler:  NewHandler(ctx),
-		timeout:  time.Duration(ctx.ConnectTimeout) * time.Second,
-		gate:     serverbase.NewConnectionGate(ctx.Concurrent),
-		tlsGate:  serverbase.NewTLSHandshakeGate(ctx.Concurrent),
-		conns:    serverbase.NewConnectionSet(),
-		ctx:      lifetime,
-		cancel:   cancel,
+		listener:       listeners[0],
+		extraListeners: listeners[1:],
+		handler:        NewHandler(ctx),
+		timeout:        time.Duration(ctx.ConnectTimeout) * time.Second,
+		gate:           serverbase.NewConnectionGate(ctx.Concurrent),
+		tlsGate:        serverbase.NewTLSHandshakeGate(ctx.Concurrent),
+		conns:          serverbase.NewConnectionSet(),
+		ctx:            lifetime,
+		cancel:         cancel,
 	}, nil
 }
 
@@ -137,8 +133,20 @@ func (s *HttpServer) Start() error {
 	}
 	slog.Info(fmt.Sprintf("%s proxy server listening on %s", scheme, s.listener.Addr()))
 
+	for _, ln := range s.extraListeners {
+		listener := ln
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			_ = s.acceptLoop(listener)
+		}()
+	}
+	return s.acceptLoop(s.listener)
+}
+
+func (s *HttpServer) acceptLoop(ln net.Listener) error {
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if isClosed(err) {
 				return nil
@@ -170,7 +178,7 @@ func (s *HttpServer) Start() error {
 	}
 }
 
-// Close stops the listener.
+// Close stops the listeners.
 func (s *HttpServer) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
@@ -178,6 +186,11 @@ func (s *HttpServer) Close() error {
 		listenerErr := s.listener.Close()
 		if errors.Is(listenerErr, net.ErrClosed) {
 			listenerErr = nil
+		}
+		for _, ln := range s.extraListeners {
+			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				listenerErr = errors.Join(listenerErr, err)
+			}
 		}
 		s.launchMu.Lock()
 		s.launchMu.Unlock()
