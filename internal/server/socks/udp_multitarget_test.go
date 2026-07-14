@@ -56,7 +56,7 @@ func TestSOCKS5UDPMultiTargetBatch(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     8,
 		ConnectTimeout: 5,
-		Connector:      connect.New(nil, nil, nil, 5, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
 		UDP:            config.DefaultBootArgs().UDP,
 	})
 	if err != nil {

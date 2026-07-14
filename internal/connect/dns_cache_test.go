@@ -108,6 +108,37 @@ func TestDNSCacheBoundsConcurrentLookups(t *testing.T) {
 	}
 }
 
+func TestDNSCacheLookupCached(t *testing.T) {
+	cache := newDNSCache(time.Minute, time.Second, 16, 4, func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.9")}, nil
+	})
+	// Miss before any resolution; LookupCached never resolves.
+	if _, ok := cache.LookupCached("example.com"); ok {
+		t.Fatal("expected a miss before the first resolve")
+	}
+	if _, err := cache.Lookup(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	// Now a hit, including via the normalized (upper-case, trailing dot) key.
+	addrs, ok := cache.LookupCached("EXAMPLE.COM.")
+	if !ok || len(addrs) != 1 || addrs[0] != netip.MustParseAddr("192.0.2.9") {
+		t.Fatalf("expected cached hit, got %v ok=%v", addrs, ok)
+	}
+}
+
+func TestLookupCachedHostLiteral(t *testing.T) {
+	got, ok := LookupCachedHost("192.0.2.7")
+	if !ok || len(got) != 1 || got[0] != netip.MustParseAddr("192.0.2.7") {
+		t.Fatalf("IPv4 literal: got %v ok=%v", got, ok)
+	}
+	if got, ok := LookupCachedHost("2001:db8::5"); !ok || len(got) != 1 || got[0] != netip.MustParseAddr("2001:db8::5") {
+		t.Fatalf("IPv6 literal: got %v ok=%v", got, ok)
+	}
+	if _, ok := LookupCachedHost("uncached.example.invalid."); ok {
+		t.Fatal("uncached domain should report a miss")
+	}
+}
+
 func BenchmarkDNSCacheHit(b *testing.B) {
 	cache := newDNSCache(time.Minute, time.Second, 16, 4, func(context.Context, string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("2001:db8::1")}, nil

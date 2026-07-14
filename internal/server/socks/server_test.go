@@ -127,7 +127,7 @@ func TestSOCKS5UDPLargeDatagram(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     8,
 		ConnectTimeout: 5,
-		Connector:      connect.New(nil, nil, nil, 5, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
 		UDP:            config.DefaultBootArgs().UDP,
 	})
 	if err != nil {
@@ -225,7 +225,7 @@ func TestServerCloseCancelsPendingBind(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     1,
 		ConnectTimeout: 30,
-		Connector:      connect.New(nil, nil, nil, 30, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 30, nil, nil, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +309,7 @@ func TestSOCKS5ConcurrentTunnelsStress(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     uint32(count + 128),
 		ConnectTimeout: 10,
-		Connector:      connect.New(nil, nil, nil, 10, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 10, nil, nil, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -453,7 +453,7 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     uint32(associationCount + 128),
 		ConnectTimeout: 10,
-		Connector:      connect.New(nil, nil, nil, 10, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 10, nil, nil, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -591,7 +591,7 @@ func BenchmarkSOCKS5TunnelRoundTripParallel(b *testing.B) {
 		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
 		Concurrent:     10000,
 		ConnectTimeout: 5,
-		Connector:      connect.New(nil, nil, nil, 5, nil, nil),
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
 	}
 	proxy, err := NewServer(ctx)
 	if err != nil {

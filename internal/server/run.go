@@ -75,6 +75,7 @@ func Run(args config.BootArgs) error {
 		args.ConnectTimeout,
 		args.TCPUserTimeout,
 		args.ReuseAddr,
+		args.MaxPendingDials,
 	)
 
 	// Build the context.

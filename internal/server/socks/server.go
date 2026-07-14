@@ -576,34 +576,43 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		runtime.metrics.inPackets.Add(1)
 		runtime.metrics.inBytes.Add(uint64(len(pkt.payload)))
 
-		if pkt.dst.Socket != nil {
-			target := netip.AddrPortFrom(pkt.dst.Socket.Addr().Unmap(), pkt.dst.Socket.Port())
-			batch := &preferredBatch
-			if preferredV4 != target.Addr().Is4() && fallbackWriter != nil && fallbackV4 == target.Addr().Is4() {
-				batch = &fallbackBatch
+		// Resolve the outbound target. Literal IPs and already-cached domains take
+		// the fast batch path; an uncached domain is handed to a send worker that
+		// resolves it off this loop, so a cold DNS lookup never stalls the batch.
+		var target netip.AddrPort
+		switch {
+		case pkt.dst.Socket != nil:
+			target = netip.AddrPortFrom(pkt.dst.Socket.Addr().Unmap(), pkt.dst.Socket.Port())
+		default:
+			resolved, ok := cachedTargetForFamily(pkt.dst.Domain, pkt.dst.Port, preferredV4, fallbackWriter != nil, fallbackV4)
+			if !ok {
+				if !runtime.dispatch(udpSendJob{
+					associationID: associationID,
+					ctx:           ctx,
+					connector:     connector,
+					packet:        pkt,
+					target:        connect.FromHost(pkt.dst.Domain, pkt.dst.Port),
+					preferred:     preferredOutbound,
+					fallback:      fallbackOutbound,
+					errCh:         errCh,
+				}) {
+					runtime.releaseInboundPacket(pkt)
+				}
+				return true
 			}
-			*batch = append(*batch, udpWritePacket{
-				buffer:    pkt.payload,
-				owner:     pkt.buffer,
-				addr:      target,
-				batchSlot: pkt.batchSlot,
-			})
-			return true
+			target = resolved
 		}
 
-		target := connect.FromHost(pkt.dst.Domain, pkt.dst.Port)
-		if !runtime.dispatch(udpSendJob{
-			associationID: associationID,
-			ctx:           ctx,
-			connector:     connector,
-			packet:        pkt,
-			target:        target,
-			preferred:     preferredOutbound,
-			fallback:      fallbackOutbound,
-			errCh:         errCh,
-		}) {
-			runtime.releaseInboundPacket(pkt)
+		batch := &preferredBatch
+		if preferredV4 != target.Addr().Is4() && fallbackWriter != nil && fallbackV4 == target.Addr().Is4() {
+			batch = &fallbackBatch
 		}
+		*batch = append(*batch, udpWritePacket{
+			buffer:    pkt.payload,
+			owner:     pkt.buffer,
+			addr:      target,
+			batchSlot: pkt.batchSlot,
+		})
 		return true
 	}
 
@@ -820,6 +829,24 @@ func isAuthorized(src netip.AddrPort, expected netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+// cachedTargetForFamily returns a resolved target for a domain from the DNS
+// cache, choosing a resolved address whose family has an outbound socket. ok is
+// false on a cache miss or when no resolved address matches an available
+// family, so the caller falls back to the resolving worker path.
+func cachedTargetForFamily(domain string, port uint16, preferredV4, hasFallback, fallbackV4 bool) (netip.AddrPort, bool) {
+	addrs, ok := connect.LookupCachedHost(domain)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	for _, addr := range addrs {
+		unmapped := addr.Unmap()
+		if preferredV4 == unmapped.Is4() || (hasFallback && fallbackV4 == unmapped.Is4()) {
+			return netip.AddrPortFrom(unmapped, port), true
+		}
+	}
+	return netip.AddrPort{}, false
 }
 
 // udpSocketIsV4 reports whether the UDP socket is bound to an IPv4 address,
