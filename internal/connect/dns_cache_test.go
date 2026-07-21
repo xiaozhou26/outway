@@ -154,3 +154,30 @@ func BenchmarkDNSCacheHit(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkDNSCacheHitParallel measures the concurrent cache-hit path, which is
+// the contended case for the single process-wide defaultDNSCache: many goroutines
+// resolving already-cached domains at once.
+func BenchmarkDNSCacheHitParallel(b *testing.B) {
+	cache := newDNSCache(time.Minute, time.Second, 4096, 128, func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("2001:db8::1")}, nil
+	})
+	hosts := []string{"a.example", "b.example", "c.example", "d.example", "e.example", "f.example", "g.example", "h.example"}
+	for _, h := range hosts {
+		if _, err := cache.Lookup(context.Background(), h); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if _, err := cache.Lookup(ctx, hosts[i%len(hosts)]); err != nil {
+				b.Fatal(err)
+			}
+			i++
+		}
+	})
+}
