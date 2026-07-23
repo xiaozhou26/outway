@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"sync"
 	"syscall"
@@ -69,6 +70,28 @@ func TuneTCPConnection(conn net.Conn) {
 		_ = tcpConn.SetNoDelay(true)
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(60 * time.Second)
+	}
+}
+
+// AddrPortOf returns the netip.AddrPort for a connection address without the
+// net.Addr.String() -> netip.ParseAddrPort round-trip, which allocates a string
+// and reparses it on every accepted connection. The result is unmapped so an
+// IPv4-in-IPv6 address matches what parsing the string would have produced; a
+// nil or unrecognized address yields the zero (invalid) AddrPort.
+func AddrPortOf(a net.Addr) netip.AddrPort {
+	switch v := a.(type) {
+	case *net.TCPAddr:
+		ap := v.AddrPort()
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	case *net.UDPAddr:
+		ap := v.AddrPort()
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	default:
+		if a == nil {
+			return netip.AddrPort{}
+		}
+		ap, _ := netip.ParseAddrPort(a.String())
+		return ap
 	}
 }
 
@@ -150,58 +173,92 @@ type ConnectionGate struct {
 	tokens chan struct{}
 }
 
-// ConnectionSet tracks accepted client connections so a server can close all
-// of them during shutdown.
+// connSetShardBits selects the number of lock shards (1<<bits) in a
+// ConnectionSet. Connections register on every open and deregister on every
+// close, so sharding that registry keeps high connection churn off a single
+// process-wide mutex.
+const (
+	connSetShardBits = 5
+	connSetShards    = 1 << connSetShardBits
+)
+
+// ConnectionSet tracks accepted client connections so a server can close all of
+// them during shutdown. It is sharded by connection identity so concurrent
+// opens and closes rarely contend on the same lock.
 type ConnectionSet struct {
+	done      chan struct{}
+	closeOnce sync.Once
+	shards    [connSetShards]connSetShard
+}
+
+type connSetShard struct {
 	mu     sync.Mutex
 	closed bool
 	conns  map[net.Conn]struct{}
-	done   chan struct{}
+	// Pad to a cache line so hot shard mutexes on different cores don't
+	// false-share.
+	_ [40]byte
 }
 
 // NewConnectionSet creates an empty connection registry.
 func NewConnectionSet() *ConnectionSet {
-	return &ConnectionSet{
-		conns: make(map[net.Conn]struct{}),
-		done:  make(chan struct{}),
+	s := &ConnectionSet{done: make(chan struct{})}
+	for i := range s.shards {
+		s.shards[i].conns = make(map[net.Conn]struct{})
 	}
+	return s
+}
+
+// shardFor maps a connection to its lock shard. It Fibonacci-hashes the
+// connection's identity pointer and takes the high bits so that pointer
+// alignment does not cluster connections into a handful of shards.
+func (s *ConnectionSet) shardFor(conn net.Conn) *connSetShard {
+	h := uint64(reflect.ValueOf(conn).Pointer()) * 0x9e3779b97f4a7c15
+	return &s.shards[h>>(64-connSetShardBits)]
 }
 
 // Add registers a connection. It returns false after shutdown has started.
 func (s *ConnectionSet) Add(conn net.Conn) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	shard := s.shardFor(conn)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if shard.closed {
 		return false
 	}
-	s.conns[conn] = struct{}{}
+	shard.conns[conn] = struct{}{}
 	return true
 }
 
 // Remove unregisters a connection.
 func (s *ConnectionSet) Remove(conn net.Conn) {
-	s.mu.Lock()
-	delete(s.conns, conn)
-	s.mu.Unlock()
+	shard := s.shardFor(conn)
+	shard.mu.Lock()
+	delete(shard.conns, conn)
+	shard.mu.Unlock()
 }
 
 // CloseAll prevents new registrations and closes all tracked connections.
 func (s *ConnectionSet) CloseAll() error {
-	s.mu.Lock()
-	if !s.closed {
-		s.closed = true
-		close(s.done)
-	}
-	conns := make([]net.Conn, 0, len(s.conns))
-	for conn := range s.conns {
-		conns = append(conns, conn)
-	}
-	s.mu.Unlock()
+	s.closeOnce.Do(func() { close(s.done) })
 
 	var errs []error
-	for _, conn := range conns {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			errs = append(errs, err)
+	for i := range s.shards {
+		shard := &s.shards[i]
+		shard.mu.Lock()
+		shard.closed = true
+		conns := make([]net.Conn, 0, len(shard.conns))
+		for conn := range shard.conns {
+			conns = append(conns, conn)
+		}
+		shard.conns = nil
+		shard.mu.Unlock()
+
+		// Close outside the shard lock: a slow Close must not block Add/Remove
+		// on other connections in the same shard.
+		for _, conn := range conns {
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
