@@ -3,6 +3,7 @@
 package socks
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -62,7 +63,7 @@ func (a Socks5Acceptor) WaitUDPWorkers(timeout time.Duration) bool {
 // Accept drives a single SOCKS5 connection to completion.
 func (a Socks5Acceptor) Accept(stream net.Conn, socketAddr netip.AddrPort) {
 	defer stream.Close()
-	if err := handle(a.ctx, NewIncomingConnection(stream, a.auth), socketAddr, a.connector, a.timeout, a.udp); err != nil {
+	if err := handle(a.ctx, stream, a.auth, socketAddr, a.connector, a.timeout, a.udp); err != nil {
 		slog.Debug("SOCKS5 connection failed", "error", err)
 	}
 }
@@ -135,17 +136,20 @@ func (s *Socks5Server) acceptLoop(ln net.Listener) error {
 			peer = ra
 		}
 		acceptor := s.acceptor
+		// Acquire a connection slot before taking launchMu: a saturated gate must
+		// apply backpressure to this accept loop without holding the mutex, which
+		// would otherwise serialize every SO_REUSEPORT accept shard (and Close's
+		// launch barrier) behind a single blocked waiter.
+		if !s.gate.AcquireUntil(s.conns.Done()) {
+			_ = conn.Close()
+			return nil
+		}
 		s.launchMu.Lock()
 		if !s.conns.Add(conn) {
 			s.launchMu.Unlock()
+			s.gate.Release()
 			_ = conn.Close()
 			continue
-		}
-		if !s.gate.AcquireUntil(s.conns.Done()) {
-			s.conns.Remove(conn)
-			s.launchMu.Unlock()
-			_ = conn.Close()
-			return nil
 		}
 		s.wg.Add(1)
 		go func() {
@@ -188,22 +192,30 @@ func (s *Socks5Server) Close() error {
 
 // handle authenticates the incoming connection, reads its request, and
 // dispatches to the appropriate command handler.
-func handle(ctx context.Context, conn IncomingConnection, socketAddr netip.AddrPort, connector *connect.Connector, timeout time.Duration, udp *udpRuntime) error {
-	_ = conn.stream.SetDeadline(time.Now().Add(timeout))
-	stream, extension, err := conn.Authenticate()
+func handle(ctx context.Context, stream net.Conn, auth AuthAdaptor, socketAddr netip.AddrPort, connector *connect.Connector, timeout time.Duration, udp *udpRuntime) error {
+	// Read the handshake and request through a pooled buffered reader so the
+	// multi-field negotiation costs one recv per client flight instead of one
+	// syscall per field. Replies are written straight to the raw stream, and the
+	// CONNECT/BIND data path splices the raw stream after draining any bytes the
+	// reader pulled ahead, preserving kernel zero-copy.
+	br := serverbase.AcquireBufferedReader(stream)
+	defer serverbase.ReleaseBufferedReader(br)
+
+	_ = stream.SetDeadline(time.Now().Add(timeout))
+	authed, extension, err := NewIncomingConnection(stream, br, auth).Authenticate()
 	if err != nil {
 		if err == errNoAcceptableMethods {
 			return nil
 		}
-		if stream != nil {
+		if authed != nil {
 			slog.Debug("SOCKS5 authentication failed", "error", err, "client", socketAddr)
-			_ = stream.Close()
+			_ = authed.Close()
 			return nil
 		}
 		return err
 	}
 
-	req, err := proto.ReadRequest(stream)
+	req, err := proto.ReadRequest(br)
 	if err != nil {
 		_ = stream.Close()
 		return err
@@ -214,9 +226,9 @@ func handle(ctx context.Context, conn IncomingConnection, socketAddr netip.AddrP
 	case proto.CmdUDPAssociate:
 		return handleUDP(ctx, stream, req.Address, connector.UDP(extension), udp)
 	case proto.CmdConnect:
-		return handleConnect(ctx, stream, req.Address, connector.TCP(extension))
+		return handleConnect(ctx, stream, br, req.Address, connector.TCP(extension))
 	case proto.CmdBind:
-		return handleBind(ctx, stream, req.Address, connector.TCP(extension), timeout)
+		return handleBind(ctx, stream, br, req.Address, connector.TCP(extension), timeout)
 	default:
 		_ = proto.NewResponse(proto.ReplyCommandNotSupported, proto.Unspecified()).MarshalTo(stream)
 		_ = stream.Close()
@@ -226,7 +238,7 @@ func handle(ctx context.Context, conn IncomingConnection, socketAddr netip.AddrP
 
 // handleConnect implements the SOCKS5 CONNECT command: establish a TCP tunnel
 // between the client and the target.
-func handleConnect(ctx context.Context, client net.Conn, address proto.Address, connector *connect.TcpConnector) error {
+func handleConnect(ctx context.Context, client net.Conn, br *bufio.Reader, address proto.Address, connector *connect.TcpConnector) error {
 	var outbound *net.TCPConn
 	var dialErr error
 
@@ -252,6 +264,18 @@ func handleConnect(ctx context.Context, client net.Conn, address proto.Address, 
 		return err
 	}
 
+	// Forward any client bytes the buffered handshake reader pulled ahead of the
+	// request before splicing the raw connection. SOCKS5 clients normally wait
+	// for this reply, so this is almost always a no-op; performing it keeps the
+	// subsequent copy on the raw stream so io.Copy can use splice(2).
+	if n := br.Buffered(); n > 0 {
+		if _, err := io.CopyN(outbound, br, int64(n)); err != nil {
+			_ = outbound.Close()
+			_ = client.Close()
+			return err
+		}
+	}
+
 	fromClient, fromServer, _ := serverbase.CopyBidirectionalContext(ctx, client, outbound, serverbase.DefaultHalfCloseGrace)
 	slog.Debug("SOCKS5 connection closed", "sent", fromClient, "received", fromServer)
 	_ = outbound.CloseWrite()
@@ -263,7 +287,7 @@ func handleConnect(ctx context.Context, client net.Conn, address proto.Address, 
 
 // handleBind implements the SOCKS5 BIND command: listen for an inbound
 // connection from the target and forward data between client and target.
-func handleBind(ctx context.Context, client net.Conn, _ proto.Address, connector *connect.TcpConnector, timeout time.Duration) error {
+func handleBind(ctx context.Context, client net.Conn, br *bufio.Reader, _ proto.Address, connector *connect.TcpConnector, timeout time.Duration) error {
 	listenIP, err := connector.SocketAddr(func() (netip.Addr, error) {
 		if la := client.LocalAddr(); la != nil {
 			if ap, perr := netip.ParseAddrPort(la.String()); perr == nil {
@@ -330,6 +354,14 @@ func handleBind(ctx context.Context, client net.Conn, _ proto.Address, connector
 	if err := proto.NewResponse(proto.ReplySucceeded, proto.SocketAddress(outboundAddr)).MarshalTo(client); err != nil {
 		_ = client.Close()
 		return err
+	}
+
+	// Forward any client bytes buffered ahead of the request before splicing.
+	if n := br.Buffered(); n > 0 {
+		if _, err := io.CopyN(outbound, br, int64(n)); err != nil {
+			_ = client.Close()
+			return err
+		}
 	}
 
 	fromClient, fromServer, _ := serverbase.CopyBidirectionalContext(ctx, client, outbound, serverbase.DefaultHalfCloseGrace)

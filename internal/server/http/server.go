@@ -155,17 +155,20 @@ func (s *HttpServer) acceptLoop(ln net.Listener) error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		// Acquire a connection slot before taking launchMu: a saturated gate must
+		// apply backpressure to this accept loop without holding the mutex, which
+		// would otherwise serialize every SO_REUSEPORT accept shard (and Close's
+		// launch barrier) behind a single blocked waiter.
+		if !s.gate.AcquireUntil(s.conns.Done()) {
+			_ = conn.Close()
+			return nil
+		}
 		s.launchMu.Lock()
 		if !s.conns.Add(conn) {
 			s.launchMu.Unlock()
+			s.gate.Release()
 			_ = conn.Close()
 			continue
-		}
-		if !s.gate.AcquireUntil(s.conns.Done()) {
-			s.conns.Remove(conn)
-			s.launchMu.Unlock()
-			_ = conn.Close()
-			return nil
 		}
 		s.wg.Add(1)
 		go func() {
@@ -522,12 +525,9 @@ func splitHostPort(target string) (string, uint16, error) {
 }
 
 func parsePort(s string) (uint16, error) {
-	var p int
-	if _, err := fmt.Sscanf(s, "%d", &p); err != nil {
+	p, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
 		return 0, err
-	}
-	if p < 0 || p > 65535 {
-		return 0, errors.New("invalid port")
 	}
 	return uint16(p), nil
 }

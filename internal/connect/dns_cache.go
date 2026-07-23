@@ -34,7 +34,7 @@ type dnsLookupCall struct {
 // same hostname. It prevents connection bursts from creating matching DNS
 // bursts against the system resolver.
 type dnsCache struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	entries     map[string]dnsCacheEntry
 	inflight    map[string]*dnsLookupCall
 	ttl         time.Duration
@@ -82,8 +82,8 @@ var defaultDNSCache = newDNSCache(
 func (c *dnsCache) LookupCached(host string) ([]netip.Addr, bool) {
 	key := normalizeDNSName(host)
 	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	entry, ok := c.entries[key]
 	if !ok || entry.err != nil || len(entry.addrs) == 0 || !now.Before(entry.expiresAt) {
 		return nil, false
@@ -97,7 +97,18 @@ func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error
 	key := normalizeDNSName(host)
 	now := time.Now()
 
+	// Fast path: a valid cached entry needs only a read lock, so concurrent
+	// hits on the process-wide cache resolve in parallel instead of serializing.
+	c.mu.RLock()
+	if entry, ok := c.entries[key]; ok && now.Before(entry.expiresAt) {
+		c.mu.RUnlock()
+		return entry.addrs, entry.err
+	}
+	c.mu.RUnlock()
+
 	c.mu.Lock()
+	// Re-check under the write lock: another goroutine may have resolved this
+	// key (or started an in-flight lookup) between the read unlock and here.
 	if entry, ok := c.entries[key]; ok {
 		if now.Before(entry.expiresAt) {
 			c.mu.Unlock()
