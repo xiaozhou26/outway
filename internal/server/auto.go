@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	nethttp "net/http"
-	"net/netip"
 	"sync"
 	"time"
 
@@ -194,10 +193,7 @@ func (s *AutoDetectServer) accept(conn net.Conn) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	var peer netip.AddrPort
-	if ra, rerr := netip.ParseAddrPort(conn.RemoteAddr().String()); rerr == nil {
-		peer = ra
-	}
+	peer := serverbase.AddrPortOf(conn.RemoteAddr())
 
 	switch {
 	case first[0] == 0x05:

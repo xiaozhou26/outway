@@ -131,10 +131,7 @@ func (s *Socks5Server) acceptLoop(ln net.Listener) error {
 			continue
 		}
 		serverbase.TuneTCPConnection(conn)
-		var peer netip.AddrPort
-		if ra, rerr := netip.ParseAddrPort(conn.RemoteAddr().String()); rerr == nil {
-			peer = ra
-		}
+		peer := serverbase.AddrPortOf(conn.RemoteAddr())
 		acceptor := s.acceptor
 		// Acquire a connection slot before taking launchMu: a saturated gate must
 		// apply backpressure to this accept loop without holding the mutex, which
@@ -289,10 +286,8 @@ func handleConnect(ctx context.Context, client net.Conn, br *bufio.Reader, addre
 // connection from the target and forward data between client and target.
 func handleBind(ctx context.Context, client net.Conn, br *bufio.Reader, _ proto.Address, connector *connect.TcpConnector, timeout time.Duration) error {
 	listenIP, err := connector.SocketAddr(func() (netip.Addr, error) {
-		if la := client.LocalAddr(); la != nil {
-			if ap, perr := netip.ParseAddrPort(la.String()); perr == nil {
-				return ap.Addr(), nil
-			}
+		if ap := serverbase.AddrPortOf(client.LocalAddr()); ap.IsValid() {
+			return ap.Addr(), nil
 		}
 		return netip.IPv4Unspecified(), nil
 	})
@@ -314,7 +309,7 @@ func handleBind(ctx context.Context, client net.Conn, br *bufio.Reader, _ proto.
 	}
 	slog.Debug("SOCKS5 bind listening", "address", ln.Addr())
 
-	bndAddr, _ := netip.ParseAddrPort(ln.Addr().String())
+	bndAddr := serverbase.AddrPortOf(ln.Addr())
 	if err := proto.NewResponse(proto.ReplySucceeded, proto.SocketAddress(bndAddr)).MarshalTo(client); err != nil {
 		_ = client.Close()
 		return err
@@ -350,7 +345,7 @@ func handleBind(ctx context.Context, client net.Conn, br *bufio.Reader, _ proto.
 	defer outbound.Close()
 	slog.Debug("SOCKS5 bind accepted connection", "remote", outbound.RemoteAddr())
 
-	outboundAddr, _ := netip.ParseAddrPort(outbound.RemoteAddr().String())
+	outboundAddr := serverbase.AddrPortOf(outbound.RemoteAddr())
 	if err := proto.NewResponse(proto.ReplySucceeded, proto.SocketAddress(outboundAddr)).MarshalTo(client); err != nil {
 		_ = client.Close()
 		return err
@@ -385,10 +380,8 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	// Bind the inbound UDP socket on the same IP family as the TCP control
 	// connection's local address.
 	localIP := netip.IPv4Unspecified()
-	if la := client.LocalAddr(); la != nil {
-		if ap, perr := netip.ParseAddrPort(la.String()); perr == nil {
-			localIP = ap.Addr()
-		}
+	if ap := serverbase.AddrPortOf(client.LocalAddr()); ap.IsValid() {
+		localIP = ap.Addr()
 	}
 	inbound, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IP(localIP.AsSlice()), Port: 0})
 	if err != nil {
@@ -397,7 +390,7 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 		return err
 	}
 	connect.TuneUDPBuffers(inbound, runtime.config.SocketBufferBytes)
-	listenAddr, _ := netip.ParseAddrPort(inbound.LocalAddr().String())
+	listenAddr := serverbase.AddrPortOf(inbound.LocalAddr())
 	slog.Debug("SOCKS5 UDP association listening", "address", listenAddr)
 
 	if err := proto.NewResponse(proto.ReplySucceeded, proto.SocketAddress(listenAddr)).MarshalTo(client); err != nil {
@@ -422,8 +415,8 @@ func handleUDP(parentCtx context.Context, client net.Conn, address proto.Address
 	if address.Socket != nil && !address.Socket.Addr().IsUnspecified() {
 		srcIP = address.Socket.Addr()
 	} else {
-		if ra, rerr := netip.ParseAddrPort(client.RemoteAddr().String()); rerr == nil {
-			srcIP = ra.Addr()
+		if ap := serverbase.AddrPortOf(client.RemoteAddr()); ap.IsValid() {
+			srcIP = ap.Addr()
 		} else {
 			srcIP = netip.IPv4Unspecified()
 		}
