@@ -433,3 +433,75 @@ func TestTLSConfigOnlyAdvertisesHTTP11(t *testing.T) {
 		t.Fatalf("unexpected ALPN protocols: %v", protos)
 	}
 }
+
+// BenchmarkHTTPConnectSetupParallel measures the full per-connection CONNECT
+// setup cost — TCP accept, request parse, auth, outbound dial, 200 response,
+// and teardown.
+func BenchmarkHTTPConnectSetupParallel(b *testing.B) {
+	echo, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	proxy, err := NewServer(serverbase.Context{
+		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
+		Concurrent:     10000,
+		ConnectTimeout: 5,
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer proxy.Close()
+	go func() { _ = proxy.Start() }()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			conn, err := openHTTPConnectTunnel(proxy.listener.Addr().String(), echo.Addr().String())
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			_ = conn.Close()
+		}
+	})
+}
+
+// TestConnectEstablishedResponseIsValid200 ensures the prerendered CONNECT
+// success bytes stay a parseable 200 response with no body.
+func TestConnectEstablishedResponseIsValid200(t *testing.T) {
+	reader := bufio.NewReader(bytes.NewReader(connectEstablishedResponse))
+	response, err := stdhttp.ReadResponse(reader, &stdhttp.Request{Method: stdhttp.MethodConnect})
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("unexpected body %q", body)
+	}
+	if reader.Buffered() != 0 {
+		t.Fatalf("%d trailing bytes after response", reader.Buffered())
+	}
+}

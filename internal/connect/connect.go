@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -253,32 +252,32 @@ func (t *TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindI
 		return sockErr
 	}
 
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.Addr().String(), strconv.Itoa(int(target.Port()))))
+	conn, err := dialer.DialContext(ctx, "tcp", target.String())
 	if err != nil {
 		return nil, err
 	}
 	tc := conn.(*net.TCPConn)
 	_ = tc.SetNoDelay(true)
-	logger().Debug("TCP connected", "target", target, "local", tc.LocalAddr())
+	if debugEnabled() {
+		logger().Debug("TCP connected", "target", target, "local", tc.LocalAddr())
+	}
 	return tc, nil
 }
 
+// The connect* helpers below rely on the deadline Connect placed on ctx: it
+// starts earlier than any per-attempt timer would, so wrapping ctx again here
+// would only add a redundant timer and a child registration per dial.
+
 func (t *TcpConnector) connectPlain(ctx context.Context, target netip.AddrPort) (*net.TCPConn, error) {
-	ctx, cancel := context.WithTimeout(ctx, t.inner.ConnectTimeout)
-	defer cancel()
 	return t.dialContext(ctx, netip.Addr{}, "", target)
 }
 
 func (t *TcpConnector) connectWithCIDR(ctx context.Context, target netip.AddrPort, cidr netip.Prefix) (*net.TCPConn, error) {
-	ctx, cancel := context.WithTimeout(ctx, t.inner.ConnectTimeout)
-	defer cancel()
 	bindIP := assignSourceIP(cidr, t.inner.CIDRRange, t.extension)
 	return t.dialContext(ctx, bindIP, "", target)
 }
 
 func (t *TcpConnector) connectWithFallback(ctx context.Context, target netip.AddrPort, fb config.Fallback) (*net.TCPConn, error) {
-	ctx, cancel := context.WithTimeout(ctx, t.inner.ConnectTimeout)
-	defer cancel()
 	var bindIP netip.Addr
 	iface := ""
 	if fb.IsInterface() {

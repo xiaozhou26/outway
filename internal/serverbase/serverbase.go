@@ -8,11 +8,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +26,13 @@ const (
 	DefaultHalfCloseGrace = 30 * time.Second
 	DefaultShutdownWait   = 5 * time.Second
 )
+
+// DebugEnabled reports whether debug logging is enabled on the default logger.
+// Hot paths guard slog.Debug calls with it: evaluating and boxing the
+// arguments of a disabled debug call costs several allocations per request.
+func DebugEnabled() bool {
+	return slog.Default().Enabled(context.Background(), slog.LevelDebug)
+}
 
 var bufferedReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReader(nil) },
@@ -267,6 +276,40 @@ func (s *ConnectionSet) CloseAll() error {
 // Done is closed when shutdown starts.
 func (s *ConnectionSet) Done() <-chan struct{} { return s.done }
 
+// lifetimeShardBits selects the number of lifetime context shards (1<<bits).
+const (
+	lifetimeShardBits  = 3
+	lifetimeShardCount = 1 << lifetimeShardBits
+)
+
+// LifetimeShards fans a server's root lifetime context out into a fixed set of
+// child contexts. Per-request context helpers (WithTimeout around dials,
+// AfterFunc for copy interruption) register with their nearest cancellable
+// ancestor under that ancestor's mutex, so deriving every request from the one
+// root context serializes all handlers on a single lock; deriving from one of
+// several shards spreads that registration traffic. Cancelling the root still
+// cancels every shard.
+type LifetimeShards struct {
+	shards  [lifetimeShardCount]context.Context
+	cancels [lifetimeShardCount]context.CancelFunc
+}
+
+// NewLifetimeShards derives the shard contexts from parent.
+func NewLifetimeShards(parent context.Context) *LifetimeShards {
+	s := &LifetimeShards{}
+	for i := range s.shards {
+		s.shards[i], s.cancels[i] = context.WithCancel(parent)
+	}
+	return s
+}
+
+// For returns the lifetime shard for a connection, keyed by connection
+// identity the same way ConnectionSet spreads its lock shards.
+func (s *LifetimeShards) For(conn net.Conn) context.Context {
+	h := uint64(reflect.ValueOf(conn).Pointer()) * 0x9e3779b97f4a7c15
+	return s.shards[h>>(64-lifetimeShardBits)]
+}
+
 // NewConnectionGate creates a connection concurrency gate.
 func NewConnectionGate(max uint32) *ConnectionGate {
 	if max == 0 {
@@ -312,17 +355,24 @@ func (g *ConnectionGate) AcquireUntil(done <-chan struct{}) bool {
 			return true
 		}
 	}
+	// Fast path: when a slot is free (the common case), a non-blocking send
+	// avoids the two-channel select below, which every accept would otherwise
+	// pay for.
 	select {
 	case g.tokens <- struct{}{}:
+	default:
 		select {
+		case g.tokens <- struct{}{}:
 		case <-done:
-			<-g.tokens
 			return false
-		default:
-			return true
 		}
+	}
+	select {
 	case <-done:
+		<-g.tokens
 		return false
+	default:
+		return true
 	}
 }
 
@@ -353,7 +403,11 @@ func CopyBidirectionalContext(ctx context.Context, a, b net.Conn, halfCloseGrace
 	var n1, n2 int64
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var firstDone sync.Once
+	// firstDone is a CAS rather than a sync.Once: when both directions finish
+	// simultaneously (every short-lived tunnel teardown), Once.Do parks the
+	// losing goroutine on its internal mutex while the winner arms the grace
+	// timer; the loser needs nothing from the winner, so it can simply skip.
+	var firstDone atomic.Bool
 	var graceTimer *time.Timer
 	interrupt := func() {
 		now := time.Now()
@@ -363,11 +417,11 @@ func CopyBidirectionalContext(ctx context.Context, a, b net.Conn, halfCloseGrace
 	cancelStop := context.AfterFunc(ctx, interrupt)
 	finishDirection := func(dst net.Conn) {
 		_ = CloseWrite(dst)
-		firstDone.Do(func() {
+		if firstDone.CompareAndSwap(false, true) {
 			if halfCloseGrace > 0 {
 				graceTimer = time.AfterFunc(halfCloseGrace, interrupt)
 			}
-		})
+		}
 	}
 
 	go func() {

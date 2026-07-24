@@ -662,3 +662,53 @@ func openSOCKS5Tunnel(proxyAddress string, target netip.AddrPort) (net.Conn, err
 	}
 	return conn, nil
 }
+
+// BenchmarkSOCKS5TunnelSetupParallel measures the full per-connection setup
+// cost — TCP accept, SOCKS5 handshake, request parse, outbound dial, reply,
+// and teardown — as opposed to the steady-state relay throughput above.
+func BenchmarkSOCKS5TunnelSetupParallel(b *testing.B) {
+	echo, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	ctx := serverbase.Context{
+		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
+		Concurrent:     10000,
+		ConnectTimeout: 5,
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
+	}
+	proxy, err := NewServer(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer proxy.Close()
+	go func() { _ = proxy.Start() }()
+
+	target := echo.Addr().(*net.TCPAddr).AddrPort()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			conn, err := openSOCKS5Tunnel(proxy.listener.Addr().String(), target)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			_ = conn.Close()
+		}
+	})
+}

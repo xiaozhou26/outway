@@ -60,11 +60,21 @@ func (a Socks5Acceptor) WaitUDPWorkers(timeout time.Duration) bool {
 	return a.udp.wait(timeout)
 }
 
+// WithLifetime returns a copy of the acceptor whose handlers derive request
+// contexts from ctx (typically a serverbase.LifetimeShards shard) instead of
+// the root lifetime.
+func (a Socks5Acceptor) WithLifetime(ctx context.Context) Socks5Acceptor {
+	a.ctx = ctx
+	return a
+}
+
 // Accept drives a single SOCKS5 connection to completion.
 func (a Socks5Acceptor) Accept(stream net.Conn, socketAddr netip.AddrPort) {
 	defer stream.Close()
 	if err := handle(a.ctx, stream, a.auth, socketAddr, a.connector, a.timeout, a.udp); err != nil {
-		slog.Debug("SOCKS5 connection failed", "error", err)
+		if serverbase.DebugEnabled() {
+			slog.Debug("SOCKS5 connection failed", "error", err)
+		}
 	}
 }
 
@@ -75,9 +85,9 @@ type Socks5Server struct {
 	acceptor       Socks5Acceptor
 	gate           *serverbase.ConnectionGate
 	conns          *serverbase.ConnectionSet
+	lifetimes      *serverbase.LifetimeShards
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
-	launchMu       sync.Mutex
 	closeOnce      sync.Once
 	closeErr       error
 }
@@ -101,6 +111,7 @@ func NewServer(ctx serverbase.Context) (*Socks5Server, error) {
 		acceptor:       NewAcceptor(ctx, lifetime),
 		gate:           serverbase.NewConnectionGate(ctx.Concurrent),
 		conns:          serverbase.NewConnectionSet(),
+		lifetimes:      serverbase.NewLifetimeShards(lifetime),
 		cancel:         cancel,
 	}, nil
 }
@@ -116,6 +127,11 @@ func (s *Socks5Server) Start() error {
 			_ = s.acceptLoop(listener)
 		}()
 	}
+	// The main accept loop holds a WaitGroup slot too, so handler goroutines can
+	// wg.Add from inside any accept loop without racing a concurrent wg.Wait
+	// (the counter cannot reach zero while an accept loop is still running).
+	s.wg.Add(1)
+	defer s.wg.Done()
 	return s.acceptLoop(s.listener)
 }
 
@@ -132,18 +148,15 @@ func (s *Socks5Server) acceptLoop(ln net.Listener) error {
 		}
 		serverbase.TuneTCPConnection(conn)
 		peer := serverbase.AddrPortOf(conn.RemoteAddr())
-		acceptor := s.acceptor
-		// Acquire a connection slot before taking launchMu: a saturated gate must
-		// apply backpressure to this accept loop without holding the mutex, which
-		// would otherwise serialize every SO_REUSEPORT accept shard (and Close's
-		// launch barrier) behind a single blocked waiter.
+		acceptor := s.acceptor.WithLifetime(s.lifetimes.For(conn))
 		if !s.gate.AcquireUntil(s.conns.Done()) {
 			_ = conn.Close()
 			return nil
 		}
-		s.launchMu.Lock()
+		// A connection registered before CloseAll marked its shard is closed by
+		// CloseAll, so the handler's blocked I/O cannot outlive shutdown; one
+		// that lost the race is refused here.
 		if !s.conns.Add(conn) {
-			s.launchMu.Unlock()
 			s.gate.Release()
 			_ = conn.Close()
 			continue
@@ -155,7 +168,6 @@ func (s *Socks5Server) acceptLoop(ln net.Listener) error {
 			defer s.conns.Remove(conn)
 			acceptor.Accept(conn, peer)
 		}()
-		s.launchMu.Unlock()
 	}
 }
 
@@ -173,8 +185,6 @@ func (s *Socks5Server) Close() error {
 				listenerErr = errors.Join(listenerErr, err)
 			}
 		}
-		s.launchMu.Lock()
-		s.launchMu.Unlock()
 		var waitErr error
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
 			waitErr = errors.New("SOCKS5 handlers did not stop before shutdown timeout")
@@ -241,10 +251,14 @@ func handleConnect(ctx context.Context, client net.Conn, br *bufio.Reader, addre
 
 	if address.Socket != nil {
 		ap := *address.Socket
-		slog.Debug("SOCKS5 connection forwarding", "client", client.RemoteAddr(), "target", ap)
+		if serverbase.DebugEnabled() {
+			slog.Debug("SOCKS5 connection forwarding", "client", client.RemoteAddr(), "target", ap)
+		}
 		outbound, dialErr = connector.Connect(ctx, connect.FromAddr(ap))
 	} else {
-		slog.Debug("SOCKS5 connection forwarding", "client", client.RemoteAddr(), "host", address.Domain, "port", address.Port)
+		if serverbase.DebugEnabled() {
+			slog.Debug("SOCKS5 connection forwarding", "client", client.RemoteAddr(), "host", address.Domain, "port", address.Port)
+		}
 		outbound, dialErr = connector.Connect(ctx, connect.FromHost(address.Domain, address.Port))
 	}
 
@@ -274,7 +288,9 @@ func handleConnect(ctx context.Context, client net.Conn, br *bufio.Reader, addre
 	}
 
 	fromClient, fromServer, _ := serverbase.CopyBidirectionalContext(ctx, client, outbound, serverbase.DefaultHalfCloseGrace)
-	slog.Debug("SOCKS5 connection closed", "sent", fromClient, "received", fromServer)
+	if serverbase.DebugEnabled() {
+		slog.Debug("SOCKS5 connection closed", "sent", fromClient, "received", fromServer)
+	}
 	_ = outbound.CloseWrite()
 	_ = outbound.Close()
 	_ = serverbase.CloseWrite(client)

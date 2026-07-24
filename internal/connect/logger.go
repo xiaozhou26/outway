@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"sync/atomic"
@@ -15,6 +16,12 @@ func logger() *slog.Logger {
 		return configured
 	}
 	return fallbackLogger
+}
+
+// debugEnabled reports whether debug logging is enabled, so dial hot paths can
+// skip evaluating and boxing the arguments of disabled slog.Debug calls.
+func debugEnabled() bool {
+	return logger().Enabled(context.Background(), slog.LevelDebug)
 }
 
 // SetLogger allows the server runtime to inject a configured logger.

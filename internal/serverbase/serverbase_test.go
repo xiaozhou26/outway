@@ -258,3 +258,34 @@ func TestConnectionSetConcurrentChurnAndShutdown(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestLifetimeShardsCancelWithParent verifies that cancelling the root
+// lifetime cancels every shard, and that a connection maps to a stable shard.
+func TestLifetimeShardsCancelWithParent(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	shards := NewLifetimeShards(parent)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	first := shards.For(client)
+	if first == nil {
+		t.Fatal("For returned nil context")
+	}
+	if again := shards.For(client); again != first {
+		t.Fatal("For is not stable for the same connection")
+	}
+	if err := first.Err(); err != nil {
+		t.Fatalf("shard cancelled before parent: %v", err)
+	}
+
+	cancel()
+	for i := range shards.shards {
+		select {
+		case <-shards.shards[i].Done():
+		case <-time.After(time.Second):
+			t.Fatalf("shard %d not cancelled after parent cancel", i)
+		}
+	}
+}
