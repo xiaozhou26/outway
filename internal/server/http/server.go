@@ -2,6 +2,7 @@ package http
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -31,10 +32,9 @@ type HttpServer struct {
 	gate           *serverbase.ConnectionGate
 	tlsGate        *serverbase.ConnectionGate
 	conns          *serverbase.ConnectionSet
-	ctx            context.Context
+	lifetimes      *serverbase.LifetimeShards
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
-	launchMu       sync.Mutex
 	closeOnce      sync.Once
 	closeErr       error
 }
@@ -47,6 +47,15 @@ type Handler struct {
 }
 
 const maxTransportEntries = 128
+
+// connectEstablishedResponse holds the exact bytes writeResponse produces for
+// (http.StatusOK, ""), rendered once at startup: building an http.Response and
+// a Header map per CONNECT costs a couple dozen allocations on the hot path.
+var connectEstablishedResponse = func() []byte {
+	var buf bytes.Buffer
+	writeResponse(bufio.NewWriter(&buf), http.StatusOK, "")
+	return buf.Bytes()
+}()
 
 type transportPool struct {
 	mu               sync.Mutex
@@ -97,7 +106,7 @@ func NewServer(ctx serverbase.Context) (*HttpServer, error) {
 		gate:           serverbase.NewConnectionGate(ctx.Concurrent),
 		tlsGate:        serverbase.NewTLSHandshakeGate(ctx.Concurrent),
 		conns:          serverbase.NewConnectionSet(),
-		ctx:            lifetime,
+		lifetimes:      serverbase.NewLifetimeShards(lifetime),
 		cancel:         cancel,
 	}, nil
 }
@@ -141,6 +150,11 @@ func (s *HttpServer) Start() error {
 			_ = s.acceptLoop(listener)
 		}()
 	}
+	// The main accept loop holds a WaitGroup slot too, so handler goroutines can
+	// wg.Add from inside any accept loop without racing a concurrent wg.Wait
+	// (the counter cannot reach zero while an accept loop is still running).
+	s.wg.Add(1)
+	defer s.wg.Done()
 	return s.acceptLoop(s.listener)
 }
 
@@ -155,17 +169,14 @@ func (s *HttpServer) acceptLoop(ln net.Listener) error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		// Acquire a connection slot before taking launchMu: a saturated gate must
-		// apply backpressure to this accept loop without holding the mutex, which
-		// would otherwise serialize every SO_REUSEPORT accept shard (and Close's
-		// launch barrier) behind a single blocked waiter.
 		if !s.gate.AcquireUntil(s.conns.Done()) {
 			_ = conn.Close()
 			return nil
 		}
-		s.launchMu.Lock()
+		// A connection registered before CloseAll marked its shard is closed by
+		// CloseAll, so the handler's blocked I/O cannot outlive shutdown; one
+		// that lost the race is refused here.
 		if !s.conns.Add(conn) {
-			s.launchMu.Unlock()
 			s.gate.Release()
 			_ = conn.Close()
 			continue
@@ -175,9 +186,8 @@ func (s *HttpServer) acceptLoop(ln net.Listener) error {
 			defer s.wg.Done()
 			defer s.gate.Release()
 			defer s.conns.Remove(conn)
-			s.accept(conn)
+			s.accept(s.lifetimes.For(conn), conn)
 		}()
-		s.launchMu.Unlock()
 	}
 }
 
@@ -195,8 +205,6 @@ func (s *HttpServer) Close() error {
 				listenerErr = errors.Join(listenerErr, err)
 			}
 		}
-		s.launchMu.Lock()
-		s.launchMu.Unlock()
 		s.handler.CloseIdleConnections()
 		var waitErr error
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
@@ -208,8 +216,9 @@ func (s *HttpServer) Close() error {
 }
 
 // accept handles a single accepted connection, optionally performing a TLS
-// handshake, then serving HTTP requests on it.
-func (s *HttpServer) accept(conn net.Conn) {
+// handshake, then serving HTTP requests on it. ctx is the lifetime shard the
+// connection's requests derive their contexts from.
+func (s *HttpServer) accept(ctx context.Context, conn net.Conn) {
 	serverbase.TuneTCPConnection(conn)
 
 	var stream net.Conn = conn
@@ -246,7 +255,7 @@ func (s *HttpServer) accept(conn net.Conn) {
 			break
 		}
 		_ = stream.SetReadDeadline(time.Time{})
-		keepAlive, err := s.handler.Proxy(s.ctx, stream, br, req, bw)
+		keepAlive, err := s.handler.Proxy(ctx, stream, br, req, bw)
 		if err != nil {
 			slog.Debug("HTTP connection failed", "error", err)
 			break
@@ -299,7 +308,9 @@ func (h Handler) handleConnect(ctx context.Context, client net.Conn, br *bufio.R
 		return false, nil
 	}
 
-	slog.Debug("HTTP tunnel forwarding", "client", client.RemoteAddr(), "target", target)
+	if serverbase.DebugEnabled() {
+		slog.Debug("HTTP tunnel forwarding", "client", client.RemoteAddr(), "target", target)
+	}
 
 	connector := h.connector.TCP(extension)
 	outbound, err := connector.Connect(ctx, connect.FromHost(host, port))
@@ -308,8 +319,9 @@ func (h Handler) handleConnect(ctx context.Context, client net.Conn, br *bufio.R
 		return false, err
 	}
 
-	// Send 200 OK and flush.
-	writeResponse(bw, http.StatusOK, "")
+	// Send 200 OK and flush. The response bytes are prerendered; a CONNECT
+	// reply never varies.
+	_, _ = bw.Write(connectEstablishedResponse)
 	_ = bw.Flush()
 
 	// If the bufio.Reader has buffered bytes from the client, forward them to
@@ -323,7 +335,9 @@ func (h Handler) handleConnect(ctx context.Context, client net.Conn, br *bufio.R
 
 	// Tunnel raw bytes between client and outbound.
 	fromClient, fromServer, _ := serverbase.CopyBidirectionalContext(ctx, client, outbound, serverbase.DefaultHalfCloseGrace)
-	slog.Debug("HTTP tunnel closed", "sent", fromClient, "received", fromServer)
+	if serverbase.DebugEnabled() {
+		slog.Debug("HTTP tunnel closed", "sent", fromClient, "received", fromServer)
+	}
 	_ = outbound.CloseWrite()
 	_ = outbound.Close()
 	_ = serverbase.CloseWrite(client)

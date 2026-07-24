@@ -31,10 +31,9 @@ type AutoDetectServer struct {
 	gate           *serverbase.ConnectionGate
 	tlsGate        *serverbase.ConnectionGate
 	conns          *serverbase.ConnectionSet
-	ctx            context.Context
+	lifetimes      *serverbase.LifetimeShards
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
-	launchMu       sync.Mutex
 	closeOnce      sync.Once
 	closeErr       error
 }
@@ -91,7 +90,7 @@ func NewAutoDetectServer(ctx Context, certPath, keyPath string) (*AutoDetectServ
 		gate:           serverbase.NewConnectionGate(ctx.Concurrent),
 		tlsGate:        serverbase.NewTLSHandshakeGate(ctx.Concurrent),
 		conns:          serverbase.NewConnectionSet(),
-		ctx:            lifetime,
+		lifetimes:      serverbase.NewLifetimeShards(lifetime),
 		cancel:         cancel,
 	}, nil
 }
@@ -107,6 +106,11 @@ func (s *AutoDetectServer) Start() error {
 			_ = s.acceptLoop(listener)
 		}()
 	}
+	// The main accept loop holds a WaitGroup slot too, so handler goroutines can
+	// wg.Add from inside any accept loop without racing a concurrent wg.Wait
+	// (the counter cannot reach zero while an accept loop is still running).
+	s.wg.Add(1)
+	defer s.wg.Done()
 	return s.acceptLoop(s.listener)
 }
 
@@ -121,17 +125,20 @@ func (s *AutoDetectServer) acceptLoop(ln net.Listener) error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		s.launchMu.Lock()
-		if !s.conns.Add(conn) {
-			s.launchMu.Unlock()
-			_ = conn.Close()
-			continue
-		}
+		// Acquire a connection slot before registering: a saturated gate applies
+		// backpressure to this accept loop alone and must not block shutdown or
+		// other SO_REUSEPORT accept shards.
 		if !s.gate.AcquireUntil(s.conns.Done()) {
-			s.conns.Remove(conn)
-			s.launchMu.Unlock()
 			_ = conn.Close()
 			return nil
+		}
+		// A connection registered before CloseAll marked its shard is closed by
+		// CloseAll, so the handler's blocked I/O cannot outlive shutdown; one
+		// that lost the race is refused here.
+		if !s.conns.Add(conn) {
+			s.gate.Release()
+			_ = conn.Close()
+			continue
 		}
 		s.wg.Add(1)
 		go func() {
@@ -140,7 +147,6 @@ func (s *AutoDetectServer) acceptLoop(ln net.Listener) error {
 			defer s.conns.Remove(conn)
 			s.accept(conn)
 		}()
-		s.launchMu.Unlock()
 	}
 }
 
@@ -158,8 +164,6 @@ func (s *AutoDetectServer) Close() error {
 				listenerErr = errors.Join(listenerErr, err)
 			}
 		}
-		s.launchMu.Lock()
-		s.launchMu.Unlock()
 		s.httpHdl.CloseIdleConnections()
 		var waitErr error
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
@@ -194,23 +198,24 @@ func (s *AutoDetectServer) accept(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Time{})
 
 	peer := serverbase.AddrPortOf(conn.RemoteAddr())
+	ctx := s.lifetimes.For(conn)
 
 	switch {
 	case first[0] == 0x05:
 		// SOCKS5: pass the connection (with buffered reader) to the SOCKS5
 		// acceptor.
-		s.socksAcc.Accept(&bufferedConn{Conn: conn, br: br}, peer)
+		s.socksAcc.WithLifetime(ctx).Accept(&bufferedConn{Conn: conn, br: br}, peer)
 	case first[0] < 0x41:
 		// HTTPS: wrap with TLS and serve HTTP.
-		s.serveHTTPS(&bufferedConn{Conn: conn, br: br})
+		s.serveHTTPS(ctx, &bufferedConn{Conn: conn, br: br})
 	default:
 		// HTTP: serve plain HTTP.
-		s.serveHTTP(conn, br)
+		s.serveHTTP(ctx, conn, br)
 	}
 }
 
 // serveHTTPS wraps the connection with TLS and serves HTTP over it.
-func (s *AutoDetectServer) serveHTTPS(conn net.Conn) {
+func (s *AutoDetectServer) serveHTTPS(ctx context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(s.timeout))
 	tlsConn := tls.Server(conn, s.tlsConfig)
 	if !s.tlsGate.AcquireUntil(s.conns.Done()) {
@@ -236,7 +241,7 @@ func (s *AutoDetectServer) serveHTTPS(conn net.Conn) {
 			break
 		}
 		_ = tlsConn.SetReadDeadline(time.Time{})
-		keepAlive, _ := s.httpsHdl.Proxy(s.ctx, tlsConn, br, req, bw)
+		keepAlive, _ := s.httpsHdl.Proxy(ctx, tlsConn, br, req, bw)
 		if !keepAlive {
 			break
 		}
@@ -245,7 +250,7 @@ func (s *AutoDetectServer) serveHTTPS(conn net.Conn) {
 }
 
 // serveHTTP serves plain HTTP on the connection.
-func (s *AutoDetectServer) serveHTTP(conn net.Conn, br *bufio.Reader) {
+func (s *AutoDetectServer) serveHTTP(ctx context.Context, conn net.Conn, br *bufio.Reader) {
 	bw := serverbase.AcquireBufferedWriter(conn)
 	defer serverbase.ReleaseBufferedWriter(bw)
 	for {
@@ -255,7 +260,7 @@ func (s *AutoDetectServer) serveHTTP(conn net.Conn, br *bufio.Reader) {
 			break
 		}
 		_ = conn.SetReadDeadline(time.Time{})
-		keepAlive, _ := s.httpHdl.Proxy(s.ctx, conn, br, req, bw)
+		keepAlive, _ := s.httpHdl.Proxy(ctx, conn, br, req, bw)
 		if !keepAlive {
 			break
 		}

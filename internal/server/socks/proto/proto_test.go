@@ -158,3 +158,38 @@ func netipMustAddrPort(s string) netip.AddrPort {
 	}
 	return ap
 }
+
+// countingWriter records each Write it receives.
+type countingWriter struct {
+	writes int
+	buf    bytes.Buffer
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.buf.Write(p)
+}
+
+// TestResponseMarshalSingleWrite pins the reply serialization to one Write
+// call: replies go straight to the connection, so each extra Write is an
+// extra syscall on the per-request path.
+func TestResponseMarshalSingleWrite(t *testing.T) {
+	responses := []Response{
+		NewResponse(ReplySucceeded, Unspecified()),
+		NewResponse(ReplySucceeded, SocketAddress(netipMustAddrPort("127.0.0.1:1080"))),
+		NewResponse(ReplyHostUnreachable, SocketAddress(netipMustAddrPort("[2001:db8::1]:443"))),
+		NewResponse(ReplySucceeded, DomainAddress("example.com", 80)),
+	}
+	for _, resp := range responses {
+		w := &countingWriter{}
+		if err := resp.MarshalTo(w); err != nil {
+			t.Fatalf("MarshalTo: %v", err)
+		}
+		if w.writes != 1 {
+			t.Errorf("MarshalTo issued %d writes, want 1", w.writes)
+		}
+		if got := w.buf.Len(); got != 3+resp.Address.Len() {
+			t.Errorf("serialized length %d, want %d", got, 3+resp.Address.Len())
+		}
+	}
+}

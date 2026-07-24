@@ -38,10 +38,13 @@ func DomainAddress(domain string, port uint16) Address {
 	return Address{Domain: domain, Port: port}
 }
 
+// unspecifiedAddrPort backs Unspecified. Address holds a read-only pointer, so
+// every reply can share one immutable value instead of allocating its own.
+var unspecifiedAddrPort = netip.AddrPortFrom(netip.IPv4Unspecified(), 0)
+
 // Unspecified returns the unspecified IPv4 address (used in replies).
 func Unspecified() Address {
-	a := netip.AddrPortFrom(netip.IPv4Unspecified(), 0)
-	return Address{Socket: &a}
+	return Address{Socket: &unspecifiedAddrPort}
 }
 
 // MaxSerializedLen is the maximum length of a serialized address (1 + 1 + 255 + 2).
@@ -58,40 +61,35 @@ func (a Address) Len() int {
 	return 1 + 1 + len(a.Domain) + 2
 }
 
-// MarshalTo writes the address to w in SOCKS5 wire format.
-func (a Address) MarshalTo(w io.Writer) error {
+// AppendTo appends the address in SOCKS5 wire format to b.
+func (a Address) AppendTo(b []byte) ([]byte, error) {
 	if a.Socket != nil {
 		ap := *a.Socket
 		if ap.Addr().Is4() {
-			b := make([]byte, 0, 7)
 			b = append(b, byte(AddrIPv4))
 			v4 := ap.Addr().As4()
 			b = append(b, v4[:]...)
-			var p [2]byte
-			binary.BigEndian.PutUint16(p[:], ap.Port())
-			b = append(b, p[:]...)
-			return writeAll(w, b)
+			return binary.BigEndian.AppendUint16(b, ap.Port()), nil
 		}
-		b := make([]byte, 0, 19)
 		b = append(b, byte(AddrIPv6))
 		v6 := ap.Addr().As16()
 		b = append(b, v6[:]...)
-		var p [2]byte
-		binary.BigEndian.PutUint16(p[:], ap.Port())
-		b = append(b, p[:]...)
-		return writeAll(w, b)
+		return binary.BigEndian.AppendUint16(b, ap.Port()), nil
 	}
-	domain := []byte(a.Domain)
-	if len(domain) > 255 {
-		return fmt.Errorf("domain too long: %d", len(domain))
+	if len(a.Domain) > 255 {
+		return nil, fmt.Errorf("domain too long: %d", len(a.Domain))
 	}
-	b := make([]byte, 0, 4+len(domain))
-	b = append(b, byte(AddrDomain))
-	b = append(b, byte(len(domain)))
-	b = append(b, domain...)
-	var p [2]byte
-	binary.BigEndian.PutUint16(p[:], a.Port)
-	b = append(b, p[:]...)
+	b = append(b, byte(AddrDomain), byte(len(a.Domain)))
+	b = append(b, a.Domain...)
+	return binary.BigEndian.AppendUint16(b, a.Port), nil
+}
+
+// MarshalTo writes the address to w in SOCKS5 wire format.
+func (a Address) MarshalTo(w io.Writer) error {
+	b, err := a.AppendTo(make([]byte, 0, a.Len()))
+	if err != nil {
+		return err
+	}
 	return writeAll(w, b)
 }
 
