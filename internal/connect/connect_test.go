@@ -2,12 +2,35 @@ package connect
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/ext"
 )
+
+func TestUDPConnectUsesSameFamilyFallbackWhenCIDRBindFails(t *testing.T) {
+	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	cidr := netip.MustParsePrefix("192.0.2.1/32")
+	fallback := config.Fallback{Address: netip.MustParseAddr("127.0.0.1")}
+	connector := New(&cidr, nil, &fallback, 1, nil, nil, 0)
+	conn, err := connector.UDP(ext.None).Connect(context.Background(), FromAddr(target.LocalAddr().(*net.UDPAddr).AddrPort()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	local := conn.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Unmap()
+	if local != fallback.Address {
+		t.Fatalf("local address = %s, want fallback %s", local, fallback.Address)
+	}
+}
 
 func TestIPv4ToUint32RoundTrip(t *testing.T) {
 	addr := netip.AddrFrom4([4]byte{192, 168, 1, 100})

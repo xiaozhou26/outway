@@ -1,6 +1,5 @@
 // Package main is the outway command-line entry point. It wires up the CLI
-// commands (run, start, restart, stop, ps, log, self) to the server, daemon,
-// and self-update modules.
+// commands (run, systemd, self) to the server and self-update modules.
 package main
 
 import (
@@ -13,7 +12,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/xiaozhou26/outway/internal/config"
-	"github.com/xiaozhou26/outway/internal/daemon"
 	"github.com/xiaozhou26/outway/internal/oneself"
 	"github.com/xiaozhou26/outway/internal/server"
 )
@@ -65,17 +63,19 @@ func main() {
 	runCmd := newProxyCommand("run", "Run server", execRun)
 	rootCmd.AddCommand(runCmd)
 
-	// Unix-only daemon commands.
-	if runtime.GOOS != "windows" {
-		startCmd := newProxyCommand("start", "Start server daemon", execStart)
-		restartCmd := newProxyCommand("restart", "Restart server daemon", execRestart)
-		rootCmd.AddCommand(startCmd, restartCmd)
-
-		rootCmd.AddCommand(
-			&cobra.Command{Use: "stop", Short: "Stop server daemon", RunE: execStop},
-			&cobra.Command{Use: "ps", Short: "Show server daemon process", RunE: execPS},
-			&cobra.Command{Use: "log", Short: "Show server daemon log", RunE: execLog},
+	// Linux-only systemd service commands.
+	if runtime.GOOS == "linux" {
+		systemdCmd := &cobra.Command{Use: "systemd", Short: "Manage the systemd service"}
+		systemdCmd.AddCommand(
+			newProxyCommand("install", "Install the systemd service", execSystemdInstall),
+			newProxyCommand("enable", "Install and enable the systemd service", execSystemdEnable),
+			newProxyCommand("start", "Install, enable, and start the systemd service", execSystemdStart),
+			newProxyCommand("restart", "Update and restart the systemd service", execSystemdRestart),
+			&cobra.Command{Use: "stop", Short: "Stop the systemd service", Args: cobra.NoArgs, RunE: execSystemdStop},
+			&cobra.Command{Use: "status", Short: "Show the systemd service status", Args: cobra.NoArgs, RunE: execSystemdStatus},
+			&cobra.Command{Use: "logs", Short: "Show recent logs and follow new entries", Args: cobra.NoArgs, RunE: execSystemdLogs},
 		)
+		rootCmd.AddCommand(systemdCmd)
 	}
 
 	// self command.
@@ -92,7 +92,7 @@ func main() {
 	}
 }
 
-// newProxyCommand creates a command (run/start/restart) with BootArgs flags
+// newProxyCommand creates a run or systemd configuration command with BootArgs flags
 // and proxy subcommands (http/https/socks5/auto).
 func newProxyCommand(use, short string, exec func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	cmd := &cobra.Command{
@@ -128,6 +128,17 @@ func newProxyCommand(use, short string, exec func(cmd *cobra.Command, args []str
 	}
 	addAuthFlags(socks5Cmd)
 	cmd.AddCommand(socks5Cmd)
+
+	// masque subcommand.
+	masqueCmd := &cobra.Command{
+		Use:     "masque",
+		Aliases: []string{"quic"},
+		Short:   "HTTP/3 CONNECT-UDP (MASQUE) server",
+		RunE:    exec,
+	}
+	addAuthFlags(masqueCmd)
+	addTLSFlags(masqueCmd)
+	cmd.AddCommand(masqueCmd)
 
 	// auto subcommand.
 	autoCmd := &cobra.Command{
@@ -257,6 +268,10 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 		args.Proxy.TLSKey = flagTLSKey
 	case "socks5":
 		args.Proxy.Kind = config.ProxySocks5
+	case "masque", "quic":
+		args.Proxy.Kind = config.ProxyMASQUE
+		args.Proxy.TLSCert = flagTLSCert
+		args.Proxy.TLSKey = flagTLSKey
 	case "auto":
 		args.Proxy.Kind = config.ProxyAuto
 		args.Proxy.TLSCert = flagTLSCert
@@ -291,38 +306,51 @@ func execRun(cmd *cobra.Command, _ []string) error {
 	return server.Run(args)
 }
 
-// execStart executes the "start" command: re-exec with "run" in daemon mode.
-func execStart(cmd *cobra.Command, _ []string) error {
-	if _, err := buildBootArgs(proxyNameFromArgs(cmd)); err != nil {
+// systemdServiceArgs validates the server settings and returns the arguments
+// that should follow "outway run" in ExecStart.
+func systemdServiceArgs(cmd *cobra.Command) (config.BootArgs, []string, error) {
+	args, err := buildBootArgs(proxyNameFromArgs(cmd))
+	if err != nil {
+		return config.BootArgs{}, nil, err
+	}
+	return args, buildRunArgsFromOSArgs(), nil
+}
+
+func execSystemdInstall(cmd *cobra.Command, _ []string) error {
+	args, runArgs, err := systemdServiceArgs(cmd)
+	if err != nil {
 		return err
 	}
-	runArgs := buildRunArgsFromOSArgs("start")
-	return daemon.Default().Start(runArgs)
+	return systemdInstall(args, runArgs)
 }
 
-// execRestart executes the "restart" command: stop then start in daemon mode.
-func execRestart(cmd *cobra.Command, _ []string) error {
-	if _, err := buildBootArgs(proxyNameFromArgs(cmd)); err != nil {
+func execSystemdEnable(cmd *cobra.Command, _ []string) error {
+	args, runArgs, err := systemdServiceArgs(cmd)
+	if err != nil {
 		return err
 	}
-	runArgs := buildRunArgsFromOSArgs("restart")
-	return daemon.Default().Restart(runArgs)
+	return systemdEnable(args, runArgs)
 }
 
-// execStop executes the "stop" command.
-func execStop(cmd *cobra.Command, _ []string) error {
-	return daemon.Default().Stop()
+func execSystemdStart(cmd *cobra.Command, _ []string) error {
+	args, runArgs, err := systemdServiceArgs(cmd)
+	if err != nil {
+		return err
+	}
+	return systemdStart(args, runArgs)
 }
 
-// execPS executes the "ps" command.
-func execPS(cmd *cobra.Command, _ []string) error {
-	return daemon.Default().Status()
+func execSystemdRestart(cmd *cobra.Command, _ []string) error {
+	args, runArgs, err := systemdServiceArgs(cmd)
+	if err != nil {
+		return err
+	}
+	return systemdRestart(args, runArgs)
 }
 
-// execLog executes the "log" command.
-func execLog(cmd *cobra.Command, _ []string) error {
-	return daemon.Default().Log()
-}
+func execSystemdStop(*cobra.Command, []string) error   { return systemdStop() }
+func execSystemdStatus(*cobra.Command, []string) error { return systemdStatus() }
+func execSystemdLogs(*cobra.Command, []string) error   { return systemdLogs() }
 
 // execSelfUpdate executes the "self update" command.
 func execSelfUpdate(cmd *cobra.Command, _ []string) error {
@@ -334,15 +362,13 @@ func execSelfUninstall(cmd *cobra.Command, _ []string) error {
 	return oneself.Uninstall()
 }
 
-// buildRunArgsFromOSArgs builds the args for re-executing the binary with the
-// "run" subcommand by replacing the command name in os.Args.
-func buildRunArgsFromOSArgs(cmdName string) []string {
-	// os.Args[0] is the program name, os.Args[1] is the command name (e.g.
-	// "start" or "restart"), and the rest are the command args.
-	args := make([]string, 0, len(os.Args)-1)
+// buildRunArgsFromOSArgs builds the ExecStart arguments from
+// "outway systemd <action> ..." by replacing the management prefix with "run".
+func buildRunArgsFromOSArgs() []string {
+	args := make([]string, 0, len(os.Args)-2)
 	args = append(args, "run")
-	if len(os.Args) > 2 {
-		args = append(args, os.Args[2:]...)
+	if len(os.Args) > 3 {
+		args = append(args, os.Args[3:]...)
 	}
 	return args
 }

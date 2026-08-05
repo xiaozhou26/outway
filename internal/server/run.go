@@ -9,11 +9,14 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/connect"
 	httpsvr "github.com/xiaozhou26/outway/internal/server/http"
+	"github.com/xiaozhou26/outway/internal/server/masque"
 	"github.com/xiaozhou26/outway/internal/server/socks"
+	"github.com/xiaozhou26/outway/internal/serverbase"
 )
 
 // Run starts the proxy server with the provided boot arguments and blocks
@@ -110,8 +113,12 @@ func Run(args config.BootArgs) error {
 	case sig := <-sigCh:
 		slog.Info(fmt.Sprintf("Shutdown signal received (%v), shutting down gracefully...", sig))
 		closeErr := srv.Close()
-		serveErr := <-errCh
-		return errors.Join(closeErr, serveErr)
+		select {
+		case serveErr := <-errCh:
+			return errors.Join(closeErr, serveErr)
+		case <-time.After(serverbase.DefaultShutdownWait):
+			return errors.Join(closeErr, errors.New("server did not stop before shutdown timeout"))
+		}
 	}
 }
 
@@ -139,6 +146,8 @@ func newProxyServer(proxy config.ProxyConfig, ctx Context) (proxyServer, error) 
 		return srv, nil
 	case config.ProxySocks5:
 		return socks.NewServer(ctx)
+	case config.ProxyMASQUE:
+		return masque.NewServer(ctx, proxy.TLSCert, proxy.TLSKey)
 	case config.ProxyAuto:
 		return NewAutoDetectServer(ctx, proxy.TLSCert, proxy.TLSKey)
 	default:
@@ -179,7 +188,7 @@ func warnIfUDPBufferClamped(args config.BootArgs) {
 	if args.UDP.SocketBufferBytes <= 0 {
 		return
 	}
-	if args.Proxy.Kind != config.ProxySocks5 && args.Proxy.Kind != config.ProxyAuto {
+	if args.Proxy.Kind != config.ProxySocks5 && args.Proxy.Kind != config.ProxyMASQUE && args.Proxy.Kind != config.ProxyAuto {
 		return
 	}
 	applied, clamped, ok := connect.VerifyUDPBufferTuning(args.UDP.SocketBufferBytes)

@@ -28,11 +28,13 @@ go build -ldflags "-X github.com/xiaozhou26/outway/internal/oneself.currentVersi
 
 The CLI is structured as `<lifecycle> <protocol>`:
 
-- Lifecycle commands: `run` (foreground), and on non-Windows `start` / `restart` / `stop` / `ps` / `log` (daemon management).
-- Protocol subcommands under each: `http`, `https`, `socks5`, `auto`.
+- Lifecycle commands: `run` (foreground), plus Linux-only `systemd install` / `enable` / `start` / `restart` / `stop` / `status` / `logs` service management.
+- Protocol subcommands under each: `http`, `https`, `socks5`, `masque` (`quic` alias), `auto`.
 - `self update` / `self uninstall` manage the installed binary.
 
 Example: `outway run auto -b 127.0.0.1:1080 -u user -p pass`
+
+MASQUE is a separate UDP/HTTP3 listener (`internal/server/masque`) and is not part of TCP auto-detection. Its RFC 9298 path is `/.well-known/masque/udp/{target_host}/{target_port}/`; `--concurrent` limits active CONNECT-UDP tunnels.
 
 ## Architecture
 
@@ -77,9 +79,10 @@ The `config.UDPConfig` fields map 1:1 to the `--udp-*` flags; `MaxPacketSize` al
 Several concerns split by build constraint (`_linux.go` / `_unix.go` / `_windows.go` / `_other.go`):
 - `internal/server/route_linux.go` configures policy routing for the CIDR (no-op elsewhere via the `configureRoutes` function variable in `run.go`).
 - `internal/connect/sockopts_*.go` sets socket options (SO_REUSEADDR, TCP user timeout).
-- `internal/daemon/daemon_*.go` — daemon management is Unix-only; Windows builds omit the daemon lifecycle commands (gated in `main.go` by `runtime.GOOS`).
+- `internal/systemd` installs and controls the Linux service; `systemd_linux.go` / `systemd_other.go` keep the root package cross-platform.
+- `internal/state` resolves persistent certificate storage, preferring systemd's `STATE_DIRECTORY`.
 
-When touching connection setup, routing, or daemonization, check for a sibling file under another build tag and keep the platform variants in sync.
+When touching connection setup, routing, systemd service management, or state paths, check platform build tags and keep variants in sync.
 
 ### Self-update
 

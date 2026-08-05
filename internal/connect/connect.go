@@ -427,6 +427,107 @@ func (u *UdpConnector) createSocketWithCIDR(cidr netip.Prefix) (*net.UDPConn, er
 	return u.createSocketWithAddr(ip)
 }
 
+// Connect resolves target and returns a connected UDP socket using the same
+// CIDR, fallback address, and fallback interface policy as TCP connections.
+// Targets matching the configured CIDR family are attempted first, followed by
+// targets that can use the fallback path.
+func (u *UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, u.inner.ConnectTimeout)
+	defer cancel()
+
+	var addrs []netip.AddrPort
+	if target.Addr != nil {
+		addrs = []netip.AddrPort{*target.Addr}
+	} else {
+		resolved, err := resolveHost(ctx, target.Host, target.Port)
+		if err != nil {
+			return nil, err
+		}
+		addrs = resolved
+	}
+
+	var lastErr error
+	if u.inner.CIDR != nil {
+		for _, addr := range addrs {
+			if u.inner.CIDR.Addr().Is4() != addr.Addr().Is4() {
+				continue
+			}
+			bindIP := assignSourceIP(*u.inner.CIDR, u.inner.CIDRRange, u.extension)
+			conn, err := u.dialContext(ctx, bindIP, "", addr)
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+	}
+	for _, addr := range addrs {
+		bindIP, iface, ok := u.fallbackBindForTarget(addr)
+		if !ok {
+			continue
+		}
+		conn, err := u.dialContext(ctx, bindIP, iface, addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("failed to connect UDP socket to any resolved address")
+	}
+	return nil, lastErr
+}
+
+func (u *UdpConnector) fallbackBindForTarget(target netip.AddrPort) (bindIP netip.Addr, iface string, ok bool) {
+	if fallback := u.inner.Fallback; fallback != nil {
+		if fallback.IsInterface() {
+			return netip.Addr{}, fallback.Interface, true
+		}
+		if fallback.Address.Is4() == target.Addr().Is4() {
+			return fallback.Address, "", true
+		}
+		return netip.Addr{}, "", false
+	}
+	if u.inner.CIDR == nil {
+		return netip.Addr{}, "", true
+	}
+	return netip.Addr{}, "", false
+}
+
+func (u *UdpConnector) dialContext(ctx context.Context, bindIP netip.Addr, iface string, target netip.AddrPort) (*net.UDPConn, error) {
+	network := "udp6"
+	wildcard := net.IPv6zero
+	if target.Addr().Is4() {
+		network = "udp4"
+		wildcard = net.IPv4zero
+	}
+	localIP := wildcard
+	if bindIP.IsValid() {
+		localIP = net.IP(bindIP.AsSlice())
+	}
+	dialer := net.Dialer{LocalAddr: &net.UDPAddr{IP: localIP}}
+	if iface != "" {
+		dialer.Control = func(_, _ string, raw syscall.RawConn) error {
+			var sockErr error
+			if err := raw.Control(func(fd uintptr) {
+				sockErr = bindToDevice(int(fd), iface)
+			}); err != nil {
+				return err
+			}
+			return sockErr
+		}
+	}
+	conn, err := dialer.DialContext(ctx, network, target.String())
+	if err != nil {
+		return nil, err
+	}
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("UDP dial returned an unexpected connection type")
+	}
+	return udpConn, nil
+}
+
 // SendPacket sends a UDP packet to the target address using the preferred and
 // optional fallback outbound sockets, racing them after the connect timeout.
 func (u *UdpConnector) SendPacket(ctx context.Context, pkt []byte, target TargetAddr, preferred, fallback *net.UDPConn) (int, error) {

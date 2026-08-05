@@ -1,15 +1,15 @@
 # outway
 
-A high-performance HTTP/HTTPS/SOCKS5 proxy server written in Go, with per-connection outbound source-address selection driven by proxy-username extensions.
+A high-performance HTTP/HTTPS/SOCKS5/MASQUE proxy server written in Go, with per-connection outbound source-address selection driven by proxy-username extensions.
 
 ## Features
 
-- **Multiple protocols** — HTTP, HTTPS, and SOCKS5 proxying.
+- **Multiple protocols** — HTTP, HTTPS, SOCKS5, and HTTP/3 CONNECT-UDP (MASQUE) proxying.
 - **Auto-detection** — a single port can serve SOCKS5, HTTP, and HTTPS simultaneously, dispatching each connection by inspecting its first byte.
 - **CIDR-based source selection** — bind outbound connections to addresses chosen from a configured CIDR block, selected deterministically per session/TTL/range via username extensions.
 - **High-concurrency SOCKS5 UDP relay** — batched `recvmmsg`/`sendmmsg` I/O on Linux, a bounded buffer pool, per-association source-IP authorization, and tunable socket buffers for large UDP proxy pools.
 - **Authentication** — optional username/password (Basic auth for HTTP, username/password auth for SOCKS5).
-- **Daemon management** — start, stop, restart, status, and log commands (Unix).
+- **systemd management** — install, enable, start, restart, stop, status, and journal log commands (Linux).
 - **Self-update** — download and install the latest release directly from GitHub.
 
 ## Installation
@@ -34,7 +34,8 @@ Commands follow a `<lifecycle> <protocol>` structure:
 outway run http        # Run an HTTP proxy in the foreground
 outway run https       # HTTPS proxy (self-signed cert if none provided)
 outway run socks5      # SOCKS5 proxy
-outway run auto        # Serve SOCKS5/HTTP/HTTPS on one port
+outway run masque      # HTTP/3 CONNECT-UDP (MASQUE) proxy over UDP
+outway run auto        # Serve SOCKS5/HTTP/HTTPS on one TCP port
 ```
 
 Example with bind address and authentication:
@@ -43,10 +44,20 @@ Example with bind address and authentication:
 outway run auto -b 127.0.0.1:1080 -u user -p pass
 ```
 
+MASQUE listens with HTTP/3 on UDP and uses the RFC 9298 URI template
+`https://<bind>/.well-known/masque/udp/{target_host}/{target_port}/`:
+
+```
+outway run masque -b 0.0.0.0:443 --tls-cert cert.pem --tls-key key.pem
+```
+
+If TLS files are omitted, the persistent self-signed certificate is reused.
+`--concurrent` limits active CONNECT-UDP tunnels rather than QUIC connections.
+
 ### High-concurrency IPv6 CIDR example
 
 ```bash
-sudo ./outway start -i 2001:db8::/56 --bind 0.0.0.0:1080 auto -u user -p password
+sudo ./outway systemd start -i 2001:db8::/56 --bind 0.0.0.0:1080 auto -u user -p password
 ```
 
 The default active-connection limit is 8192. On Unix, outway raises the soft
@@ -127,15 +138,28 @@ sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 sysctl -w net.netfilter.nf_conntrack_max=1048576
 ```
 
-### Daemon (Unix)
+### Linux systemd
+
+The legacy Unix `start`, `restart`, `stop`, `ps`, and `log` commands have been
+replaced by a Linux-only `systemd` command group. The proxy remains in the
+foreground and systemd owns its lifecycle, restart policy, stdout/stderr, and
+journal logs.
 
 ```
-outway start auto -b 127.0.0.1:1080   # Start in the background
-outway ps                              # Show daemon status
-outway log                             # Show daemon log
-outway restart auto -b 127.0.0.1:1080  # Restart
-outway stop                            # Stop
+sudo outway systemd install auto -b 127.0.0.1:1080  # Write the unit
+sudo outway systemd enable auto -b 127.0.0.1:1080   # Enable at boot
+sudo outway systemd start auto -b 127.0.0.1:1080    # Enable and start
+sudo outway systemd restart auto -b 127.0.0.1:1080  # Update and restart
+sudo outway systemd stop                              # Stop, keep enabled
+sudo outway systemd status                            # Show service status
+sudo outway systemd logs                              # Follow journal logs
 ```
+
+The generated unit is installed at `/etc/systemd/system/outway.service` and
+uses `StateDirectory=outway`, normally `/var/lib/outway`, for generated
+`cert.pem` and `key.pem`. On non-interactive installation, the unit also sets
+`NO_COLOR=1`/`TERM=dumb` and enables stronger systemd sandboxing. Custom TLS
+paths supplied with `--tls-cert` and `--tls-key` are not moved.
 
 ### Self-management
 

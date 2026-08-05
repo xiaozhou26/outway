@@ -25,6 +25,7 @@ const (
 	ProxyHTTP ProxyKind = iota
 	ProxyHTTPS
 	ProxySocks5
+	ProxyMASQUE
 	ProxyAuto
 )
 

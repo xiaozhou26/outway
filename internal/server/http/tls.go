@@ -42,7 +42,7 @@ func NewTLSConfigFromFiles(certPath, keyPath string) (*TLSConfig, error) {
 // NewSelfSignedTLSConfig builds a TLSConfig from a freshly generated (or
 // cached) self-signed certificate.
 func NewSelfSignedTLSConfig() (*TLSConfig, error) {
-	cert, key, err := getSelfSignedCert()
+	cert, key, err := GetSelfSignedCert()
 	if err != nil {
 		return nil, err
 	}

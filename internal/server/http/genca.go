@@ -11,20 +11,24 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/xiaozhou26/outway/internal/state"
 )
 
-// getSelfSignedCert returns the PEM-encoded certificate and private key,
-// generating and caching them in the OS temp directory if needed.
-func getSelfSignedCert() (cert, key []byte, err error) {
-	tempDir := filepath.Join(os.TempDir(), "outway")
-	if _, statErr := os.Stat(tempDir); os.IsNotExist(statErr) {
-		if mkErr := os.MkdirAll(tempDir, 0o755); mkErr != nil {
-			return nil, nil, mkErr
-		}
+// GetSelfSignedCert returns the PEM-encoded certificate and private key,
+// generating and caching them in the platform state directory if needed.
+// Under systemd, STATE_DIRECTORY points at the unit's private StateDirectory.
+func GetSelfSignedCert() (cert, key []byte, err error) {
+	stateDir, err := state.Directory()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := state.PreparePrivateDirectory(stateDir); err != nil {
+		return nil, nil, err
 	}
 
-	certPath := filepath.Join(tempDir, "cert.pem")
-	keyPath := filepath.Join(tempDir, "key.pem")
+	certPath := filepath.Join(stateDir, "cert.pem")
+	keyPath := filepath.Join(stateDir, "key.pem")
 
 	if certData, cerr := os.ReadFile(certPath); cerr == nil {
 		if keyData, kerr := os.ReadFile(keyPath); kerr == nil {
