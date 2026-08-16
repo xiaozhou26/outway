@@ -4,8 +4,11 @@
 package masque
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,10 +38,15 @@ const proxyPath = "/.well-known/masque/udp/"
 type Server struct {
 	ctx      serverbase.Context
 	server   *http3.Server
-	proxy    *masquego.Proxy
 	template *uritemplate.Template
 	limit    chan struct{}
 	close    sync.Once
+
+	mu           sync.Mutex
+	closed       bool
+	tunnels      map[*tunnel]struct{}
+	tunnelsWG    sync.WaitGroup
+	datagramBufs sync.Pool
 }
 
 // NewServer builds a MASQUE server. An empty certificate pair generates and
@@ -58,9 +66,14 @@ func NewServer(ctx serverbase.Context, certFile, keyFile string) (*Server, error
 
 	s := &Server{
 		ctx:      ctx,
-		proxy:    &masquego.Proxy{},
 		template: template,
 		limit:    make(chan struct{}, ctx.Concurrent),
+		tunnels:  make(map[*tunnel]struct{}),
+	}
+	s.datagramBufs.New = func() any {
+		// One extra byte lets an over-limit packet be detected and dropped
+		// instead of silently forwarded truncated.
+		return make([]byte, len(contextIDZero)+ctx.UDP.MaxPacketSize+1)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(proxyPath, s.handle)
@@ -88,9 +101,36 @@ func (s *Server) Start() error {
 func (s *Server) Close() error {
 	var err error
 	s.close.Do(func() {
-		err = errors.Join(s.proxy.Close(), s.server.Close())
+		s.mu.Lock()
+		s.closed = true
+		tunnels := make([]*tunnel, 0, len(s.tunnels))
+		for t := range s.tunnels {
+			tunnels = append(tunnels, t)
+		}
+		s.mu.Unlock()
+		for _, t := range tunnels {
+			t.teardown()
+		}
+		s.tunnelsWG.Wait()
+		err = s.server.Close()
 	})
 	return err
+}
+
+// closedQuietly reports whether the server is shutting down, so pump errors
+// triggered by teardown are not logged.
+func (s *Server) closedQuietly() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+func (s *Server) getDatagramBuffer() []byte {
+	return s.datagramBufs.Get().([]byte)
+}
+
+func (s *Server) putDatagramBuffer(buf []byte) {
+	s.datagramBufs.Put(buf)
 }
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
@@ -132,9 +172,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(proxyErrorStatus(err))
 		return
 	}
-	if err := s.proxy.ProxyConnectedSocket(w, req, conn); err != nil && !errors.Is(err, net.ErrClosed) {
-		slog.Debug("MASQUE tunnel failed", "target", req.Target, "error", err)
-	}
+	// serveTunnel owns conn from here and closes it before returning.
+	s.serveTunnel(w, conn)
 }
 
 func (s *Server) connectUDP(ctx context.Context, target string, extension ext.Extension) (*net.UDPConn, error) {
@@ -146,7 +185,14 @@ func (s *Server) connectUDP(ctx context.Context, target string, extension ext.Ex
 	if err != nil || portValue == 0 {
 		return nil, &net.AddrError{Err: "invalid port", Addr: target}
 	}
-	return s.ctx.Connector.UDP(extension).Connect(ctx, connect.FromHost(host, uint16(portValue)))
+	conn, err := s.ctx.Connector.UDP(extension).Connect(ctx, connect.FromHost(host, uint16(portValue)))
+	if err != nil {
+		return nil, err
+	}
+	// Match the SOCKS5 path: outbound sockets get the configured kernel buffer
+	// sizes so bursts are not dropped before the datagram pump reads them.
+	connect.TuneUDPBuffers(conn, s.ctx.UDP.SocketBufferBytes)
+	return conn, nil
 }
 
 func templateURL(bind netip.AddrPort) string {
@@ -187,15 +233,25 @@ func authenticate(r *http.Request, auth config.AuthMode) (ext.Extension, bool) {
 		return ext.Extension{}, true
 	}
 	value := r.Header.Get("Proxy-Authorization")
+	// Decode the Basic credentials directly instead of cloning the request
+	// into an Authorization header for Request.BasicAuth; the scheme match
+	// and first-colon split mirror net/http's parseBasicAuth.
 	const prefix = "Basic "
-	if !strings.HasPrefix(value, prefix) {
+	if len(value) < len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
 		return ext.None, false
 	}
-	request := r.Clone(r.Context())
-	request.Header = r.Header.Clone()
-	request.Header.Set("Authorization", value)
-	username, password, ok := request.BasicAuth()
-	if !ok || !strings.HasPrefix(username, auth.Username) || password != auth.Password {
+	credentials, err := base64.StdEncoding.DecodeString(value[len(prefix):])
+	if err != nil {
+		return ext.None, false
+	}
+	idx := bytes.IndexByte(credentials, ':')
+	if idx < 0 {
+		return ext.None, false
+	}
+	username := string(credentials[:idx])
+	password := credentials[idx+1:]
+	if !strings.HasPrefix(username, auth.Username) ||
+		subtle.ConstantTimeCompare(password, []byte(auth.Password)) != 1 {
 		return ext.None, false
 	}
 	return ext.TryFrom(auth.Username, username), true

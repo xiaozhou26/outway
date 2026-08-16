@@ -69,14 +69,18 @@ func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connec
 	return c
 }
 
-// TCP returns a TCP connector bound to the given extension.
-func (c *Connector) TCP(e ext.Extension) *TcpConnector {
-	return &TcpConnector{inner: c, extension: e}
+// TCP returns a TCP connector bound to the given extension. The connector is
+// returned by value: it is two pointers' worth of state (16-byte Extension plus
+// the parent pointer), so per-request construction stays on the caller's stack
+// instead of escaping to the heap.
+func (c *Connector) TCP(e ext.Extension) TcpConnector {
+	return TcpConnector{inner: c, extension: e}
 }
 
-// UDP returns a UDP connector bound to the given extension.
-func (c *Connector) UDP(e ext.Extension) *UdpConnector {
-	return &UdpConnector{inner: c, extension: e}
+// UDP returns a UDP connector bound to the given extension, returned by value
+// for the same reason as TCP.
+func (c *Connector) UDP(e ext.Extension) UdpConnector {
+	return UdpConnector{inner: c, extension: e}
 }
 
 // TcpConnector establishes outbound TCP connections using the parent
@@ -88,7 +92,7 @@ type TcpConnector struct {
 
 // SocketAddr returns a bind address (port 0) chosen from the CIDR, fallback, or
 // the default function. Used by SOCKS5 BIND.
-func (t *TcpConnector) SocketAddr(defaultFn func() (netip.Addr, error)) (netip.AddrPort, error) {
+func (t TcpConnector) SocketAddr(defaultFn func() (netip.Addr, error)) (netip.AddrPort, error) {
 	if t.inner.CIDR != nil {
 		if t.inner.CIDR.Addr().Is4() {
 			addr := assignIPv4FromExtension(*t.inner.CIDR, t.inner.CIDRRange, t.extension)
@@ -108,7 +112,7 @@ func (t *TcpConnector) SocketAddr(defaultFn func() (netip.Addr, error)) (netip.A
 }
 
 // Connect establishes a TCP connection to the given target address.
-func (t *TcpConnector) Connect(ctx context.Context, target TargetAddr) (*net.TCPConn, error) {
+func (t TcpConnector) Connect(ctx context.Context, target TargetAddr) (*net.TCPConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, t.inner.ConnectTimeout)
 	defer cancel()
 
@@ -126,7 +130,7 @@ func (t *TcpConnector) Connect(ctx context.Context, target TargetAddr) (*net.TCP
 	return t.connectAny(ctx, addrs)
 }
 
-func (t *TcpConnector) connectAny(ctx context.Context, addrs []netip.AddrPort) (*net.TCPConn, error) {
+func (t TcpConnector) connectAny(ctx context.Context, addrs []netip.AddrPort) (*net.TCPConn, error) {
 	if len(addrs) == 0 {
 		return nil, errors.New("failed to connect to any resolved address")
 	}
@@ -201,7 +205,7 @@ func (t *TcpConnector) connectAny(ctx context.Context, addrs []netip.AddrPort) (
 	}
 }
 
-func (t *TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (*net.TCPConn, error) {
+func (t TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (*net.TCPConn, error) {
 	if t.inner.CIDR != nil && t.inner.CIDR.Addr().Is4() != target.Addr().Is4() {
 		if t.inner.Fallback != nil {
 			return t.connectWithFallback(ctx, target, *t.inner.Fallback)
@@ -222,7 +226,7 @@ func (t *TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (
 
 // dialContext builds a net.Dialer with the configured source address and socket
 // options, then dials the target.
-func (t *TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindInterface string, target netip.AddrPort) (*net.TCPConn, error) {
+func (t TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindInterface string, target netip.AddrPort) (*net.TCPConn, error) {
 	if t.inner.dialSlots != nil {
 		select {
 		case t.inner.dialSlots <- struct{}{}:
@@ -268,16 +272,16 @@ func (t *TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindI
 // starts earlier than any per-attempt timer would, so wrapping ctx again here
 // would only add a redundant timer and a child registration per dial.
 
-func (t *TcpConnector) connectPlain(ctx context.Context, target netip.AddrPort) (*net.TCPConn, error) {
+func (t TcpConnector) connectPlain(ctx context.Context, target netip.AddrPort) (*net.TCPConn, error) {
 	return t.dialContext(ctx, netip.Addr{}, "", target)
 }
 
-func (t *TcpConnector) connectWithCIDR(ctx context.Context, target netip.AddrPort, cidr netip.Prefix) (*net.TCPConn, error) {
+func (t TcpConnector) connectWithCIDR(ctx context.Context, target netip.AddrPort, cidr netip.Prefix) (*net.TCPConn, error) {
 	bindIP := assignSourceIP(cidr, t.inner.CIDRRange, t.extension)
 	return t.dialContext(ctx, bindIP, "", target)
 }
 
-func (t *TcpConnector) connectWithFallback(ctx context.Context, target netip.AddrPort, fb config.Fallback) (*net.TCPConn, error) {
+func (t TcpConnector) connectWithFallback(ctx context.Context, target netip.AddrPort, fb config.Fallback) (*net.TCPConn, error) {
 	var bindIP netip.Addr
 	iface := ""
 	if fb.IsInterface() {
@@ -296,7 +300,7 @@ type connResult struct {
 // connectWithCIDRFallback tries the CIDR-preferred path first; if it does not
 // complete within the connect timeout it also races the fallback path,
 // returning the first success.
-func (t *TcpConnector) connectWithCIDRFallback(ctx context.Context, target netip.AddrPort, cidr netip.Prefix, fb config.Fallback) (*net.TCPConn, error) {
+func (t TcpConnector) connectWithCIDRFallback(ctx context.Context, target netip.AddrPort, cidr netip.Prefix, fb config.Fallback) (*net.TCPConn, error) {
 	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// An unbuffered result channel ensures a losing successful dial cannot be
@@ -377,7 +381,7 @@ type UdpConnector struct {
 
 // CreateSocketDualStack creates one or two UDP sockets for dual-stack outbound
 // traffic depending on the CIDR/fallback configuration.
-func (u *UdpConnector) CreateSocketDualStack() (*net.UDPConn, *net.UDPConn, error) {
+func (u UdpConnector) CreateSocketDualStack() (*net.UDPConn, *net.UDPConn, error) {
 	cidr := u.inner.CIDR
 	fb := u.inner.Fallback
 
@@ -418,11 +422,11 @@ func (u *UdpConnector) CreateSocketDualStack() (*net.UDPConn, *net.UDPConn, erro
 	}
 }
 
-func (u *UdpConnector) createSocketWithAddr(ip netip.Addr) (*net.UDPConn, error) {
+func (u UdpConnector) createSocketWithAddr(ip netip.Addr) (*net.UDPConn, error) {
 	return net.ListenUDP("udp", &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: 0})
 }
 
-func (u *UdpConnector) createSocketWithCIDR(cidr netip.Prefix) (*net.UDPConn, error) {
+func (u UdpConnector) createSocketWithCIDR(cidr netip.Prefix) (*net.UDPConn, error) {
 	ip := assignSourceIP(cidr, u.inner.CIDRRange, u.extension)
 	return u.createSocketWithAddr(ip)
 }
@@ -431,7 +435,7 @@ func (u *UdpConnector) createSocketWithCIDR(cidr netip.Prefix) (*net.UDPConn, er
 // CIDR, fallback address, and fallback interface policy as TCP connections.
 // Targets matching the configured CIDR family are attempted first, followed by
 // targets that can use the fallback path.
-func (u *UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPConn, error) {
+func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, u.inner.ConnectTimeout)
 	defer cancel()
 
@@ -477,7 +481,7 @@ func (u *UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDP
 	return nil, lastErr
 }
 
-func (u *UdpConnector) fallbackBindForTarget(target netip.AddrPort) (bindIP netip.Addr, iface string, ok bool) {
+func (u UdpConnector) fallbackBindForTarget(target netip.AddrPort) (bindIP netip.Addr, iface string, ok bool) {
 	if fallback := u.inner.Fallback; fallback != nil {
 		if fallback.IsInterface() {
 			return netip.Addr{}, fallback.Interface, true
@@ -493,7 +497,7 @@ func (u *UdpConnector) fallbackBindForTarget(target netip.AddrPort) (bindIP neti
 	return netip.Addr{}, "", false
 }
 
-func (u *UdpConnector) dialContext(ctx context.Context, bindIP netip.Addr, iface string, target netip.AddrPort) (*net.UDPConn, error) {
+func (u UdpConnector) dialContext(ctx context.Context, bindIP netip.Addr, iface string, target netip.AddrPort) (*net.UDPConn, error) {
 	network := "udp6"
 	wildcard := net.IPv6zero
 	if target.Addr().Is4() {
@@ -530,7 +534,7 @@ func (u *UdpConnector) dialContext(ctx context.Context, bindIP netip.Addr, iface
 
 // SendPacket sends a UDP packet to the target address using the preferred and
 // optional fallback outbound sockets, racing them after the connect timeout.
-func (u *UdpConnector) SendPacket(ctx context.Context, pkt []byte, target TargetAddr, preferred, fallback *net.UDPConn) (int, error) {
+func (u UdpConnector) SendPacket(ctx context.Context, pkt []byte, target TargetAddr, preferred, fallback *net.UDPConn) (int, error) {
 	var addrs []netip.AddrPort
 	if target.Addr != nil {
 		addrs = []netip.AddrPort{*target.Addr}
@@ -558,7 +562,7 @@ func (u *UdpConnector) SendPacket(ctx context.Context, pkt []byte, target Target
 	return 0, lastErr
 }
 
-func (u *UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr netip.AddrPort, preferred, fallback *net.UDPConn) (int, error) {
+func (u UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr netip.AddrPort, preferred, fallback *net.UDPConn) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -569,8 +573,9 @@ func (u *UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr 
 	return u.trySendTo(pkt, addr, fallback)
 }
 
-func (u *UdpConnector) trySendTo(pkt []byte, addr netip.AddrPort, s *net.UDPConn) (int, error) {
-	return s.WriteToUDP(pkt, net.UDPAddrFromAddrPort(addr))
+func (u UdpConnector) trySendTo(pkt []byte, addr netip.AddrPort, s *net.UDPConn) (int, error) {
+	// WriteToUDPAddrPort avoids the *net.UDPAddr allocation of WriteToUDP.
+	return s.WriteToUDPAddrPort(pkt, addr)
 }
 
 // LookupCachedHost returns resolved addresses for host from the DNS cache
@@ -753,137 +758,6 @@ func ipv4ToUint32(addr netip.Addr) uint32 {
 
 func uint32ToIPv4(v uint32) netip.Addr {
 	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
-}
-
-// ---- uint128 helpers (two uint64 halves: hi, lo) ----
-
-type uint128 struct{ hi, lo uint64 }
-
-func uint128One() uint128             { return uint128{0, 1} }
-func uint128FromU64(v uint64) uint128 { return uint128{0, v} }
-func isZeroUint128(a uint128) bool    { return a.hi == 0 && a.lo == 0 }
-func bytesToUint128(b [16]byte) uint128 {
-	hi := uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
-		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
-	lo := uint64(b[8])<<56 | uint64(b[9])<<48 | uint64(b[10])<<40 | uint64(b[11])<<32 |
-		uint64(b[12])<<24 | uint64(b[13])<<16 | uint64(b[14])<<8 | uint64(b[15])
-	return uint128{hi, lo}
-}
-
-func ipv6ToUint128(addr netip.Addr) uint128 { return bytesToUint128(addr.As16()) }
-
-func uint128ToIPv6(a uint128) netip.Addr {
-	b := [16]byte{}
-	for i := 0; i < 8; i++ {
-		b[i] = byte(a.hi >> (8 * (7 - i)))
-		b[i+8] = byte(a.lo >> (8 * (7 - i)))
-	}
-	return netip.AddrFrom16(b)
-}
-
-// newUint128LShiftOne returns 1 << n.
-func newUint128LShiftOne(n uint) uint128 {
-	if n >= 128 {
-		return uint128{}
-	}
-	if n < 64 {
-		return uint128{0, 1 << n}
-	}
-	return uint128{1 << (n - 64), 0}
-}
-
-// newUint128FromBitRange returns (1 << n) - 1 (a mask of n low bits).
-func newUint128FromBitRange(n uint) uint128 {
-	if n >= 128 {
-		return uint128{^uint64(0), ^uint64(0)}
-	}
-	if n < 64 {
-		return uint128{0, (1 << n) - 1}
-	}
-	return uint128{(1 << (n - 64)) - 1, ^uint64(0)}
-}
-
-func notUint128(a uint128) uint128 { return uint128{^a.hi, ^a.lo} }
-
-func andUint128(a, b uint128) uint128 { return uint128{a.hi & b.hi, a.lo & b.lo} }
-func orUint128(a, b uint128) uint128  { return uint128{a.hi | b.hi, a.lo | b.lo} }
-
-func shlUint128(a uint128, n uint) uint128 {
-	if n == 0 {
-		return a
-	}
-	if n >= 128 {
-		return uint128{}
-	}
-	if n < 64 {
-		return uint128{a.hi<<n | a.lo>>(64-n), a.lo << n}
-	}
-	return uint128{a.lo << (n - 64), 0}
-}
-
-func shrUint128(a uint128, n uint) uint128 {
-	if n == 0 {
-		return a
-	}
-	if n >= 128 {
-		return uint128{}
-	}
-	if n < 64 {
-		return uint128{a.hi >> n, a.lo>>n | a.hi<<(64-n)}
-	}
-	return uint128{0, a.hi >> (n - 64)}
-}
-
-func subUint128(a, b uint128) uint128 {
-	lo := a.lo - b.lo
-	carry := uint64(0)
-	if a.lo < b.lo {
-		carry = 1
-	}
-	return uint128{a.hi - b.hi - carry, lo}
-}
-
-// modUint128 computes a % b using shift-and-subtract.
-func modUint128(a, b uint128) uint128 {
-	if isZeroUint128(b) {
-		return a
-	}
-	if b.hi == 0 && a.hi == 0 {
-		return uint128{0, a.lo % b.lo}
-	}
-	// Find the highest set bit.
-	r := uint128{}
-	for i := 127; i >= 0; i-- {
-		r = shlUint128(r, 1)
-		if (a.hi>>(63-i%64))&1 != 0 || (i < 64 && (a.lo>>(63-i))&1 != 0) {
-			// set bit i of r
-			if i >= 64 {
-				r.hi |= 1 << (i - 64)
-			} else {
-				r.lo |= 1 << i
-			}
-		}
-		if cmpUint128(r, b) >= 0 {
-			r = subUint128(r, b)
-		}
-	}
-	return r
-}
-
-func cmpUint128(a, b uint128) int {
-	if a.hi != b.hi {
-		if a.hi > b.hi {
-			return 1
-		}
-		return -1
-	}
-	if a.lo > b.lo {
-		return 1
-	}
-	if a.lo < b.lo {
-		return -1
-	}
-	return 0
 }
 
 // applySocketOptions sets SO_REUSEADDR, TCP_USER_TIMEOUT (Linux) and

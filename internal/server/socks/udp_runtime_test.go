@@ -41,11 +41,11 @@ func TestUDPDispatchReleasesBuffers(t *testing.T) {
 		}
 	}
 
-	// Workers drain asynchronously; queue depth must return to zero.
+	// Workers drain asynchronously; the queued job count must return to zero.
 	deadline := time.Now().Add(2 * time.Second)
-	for rt.metrics.queueDepth.Load() != 0 {
+	for rt.queuedJobs() != 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("queue depth did not drain: %d", rt.metrics.queueDepth.Load())
+			t.Fatalf("queue depth did not drain: %d", rt.queuedJobs())
 		}
 		time.Sleep(time.Millisecond)
 	}

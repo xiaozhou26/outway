@@ -470,3 +470,88 @@ func CloseWrite(c net.Conn) error {
 	}
 	return nil
 }
+
+// IsConnClosed reports whether err indicates a closed listener or connection,
+// including the string form Windows and some wrappers produce instead of
+// wrapping net.ErrClosed.
+func IsConnClosed(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Err != nil && opErr.Err.Error() == "use of closed network connection" {
+			return true
+		}
+	}
+	return false
+}
+
+// AuthMode identifies the configured authentication method, shared by the HTTP
+// and SOCKS5 authenticators.
+type AuthMode int
+
+const (
+	// AuthNone skips authentication.
+	AuthNone AuthMode = iota
+	// AuthPassword requires username/password credentials.
+	AuthPassword
+)
+
+// AcceptLoop serves one listener. Every accepted connection is gated by the
+// concurrency gate, registered in the connection set, and handled in a
+// goroutine that releases its slot on exit. The loop returns nil once the
+// listener or the server is closed.
+func AcceptLoop(
+	ln net.Listener,
+	wg *sync.WaitGroup,
+	gate *ConnectionGate,
+	conns *ConnectionSet,
+	handle func(net.Conn),
+) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if IsConnClosed(err) {
+				return nil
+			}
+			slog.Debug("Failed to accept connection", "error", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if !gate.AcquireUntil(conns.Done()) {
+			_ = conn.Close()
+			return nil
+		}
+		// A connection registered before CloseAll marked its shard is closed by
+		// CloseAll, so the handler's blocked I/O cannot outlive shutdown; one
+		// that lost the race is refused here.
+		if !conns.Add(conn) {
+			gate.Release()
+			_ = conn.Close()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer gate.Release()
+			defer conns.Remove(conn)
+			handle(conn)
+		}()
+	}
+}
+
+// CloseListeners closes the primary listener plus any shard listeners,
+// suppressing net.ErrClosed and joining the remaining errors.
+func CloseListeners(primary net.Listener, extra []net.Listener) error {
+	listenerErr := primary.Close()
+	if errors.Is(listenerErr, net.ErrClosed) {
+		listenerErr = nil
+	}
+	for _, ln := range extra {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			listenerErr = errors.Join(listenerErr, err)
+		}
+	}
+	return listenerErr
+}

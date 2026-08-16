@@ -57,11 +57,38 @@ var connectEstablishedResponse = func() []byte {
 	return buf.Bytes()
 }()
 
+// prerenderedResponses holds the exact bytes writeResponse produces for the
+// fixed (status, body) pairs reachable on error paths. Error replies are
+// triggerable by any unauthenticated client, so they avoid the per-reply
+// http.Response + Header map + formatting allocations the same way the CONNECT
+// 200 reply does.
+type responseKey struct {
+	status int
+	body   string
+}
+
+var prerenderedResponses = map[responseKey][]byte{
+	{http.StatusProxyAuthRequired, ""}:                            renderResponse(http.StatusProxyAuthRequired, ""),
+	{http.StatusForbidden, ""}:                                     renderResponse(http.StatusForbidden, ""),
+	{http.StatusInternalServerError, ""}:                           renderResponse(http.StatusInternalServerError, ""),
+	{http.StatusBadGateway, ""}:                                    renderResponse(http.StatusBadGateway, ""),
+	{http.StatusBadRequest, "CONNECT must be to a socket address"}: renderResponse(http.StatusBadRequest, "CONNECT must be to a socket address"),
+}
+
+// transportShards splits the per-extension transport map across independently
+// locked sub-maps so forward requests with different extensions do not
+// contend, mirroring the sharded connection registry and DNS cache.
+const transportShards = 16
+
+type transportShard struct {
+	mu      sync.Mutex
+	entries map[ext.Extension]*transportEntry
+	clock   uint64
+}
+
 type transportPool struct {
-	mu               sync.Mutex
 	connector        *connect.Connector
-	entries          map[ext.Extension]*transportEntry
-	clock            uint64
+	shards           [transportShards]transportShard
 	defaultTransport *http.Transport
 }
 
@@ -159,36 +186,9 @@ func (s *HttpServer) Start() error {
 }
 
 func (s *HttpServer) acceptLoop(ln net.Listener) error {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if isClosed(err) {
-				return nil
-			}
-			slog.Debug("Failed to accept connection", "error", err)
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		if !s.gate.AcquireUntil(s.conns.Done()) {
-			_ = conn.Close()
-			return nil
-		}
-		// A connection registered before CloseAll marked its shard is closed by
-		// CloseAll, so the handler's blocked I/O cannot outlive shutdown; one
-		// that lost the race is refused here.
-		if !s.conns.Add(conn) {
-			s.gate.Release()
-			_ = conn.Close()
-			continue
-		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer s.gate.Release()
-			defer s.conns.Remove(conn)
-			s.accept(s.lifetimes.For(conn), conn)
-		}()
-	}
+	return serverbase.AcceptLoop(ln, &s.wg, s.gate, s.conns, func(conn net.Conn) {
+		s.accept(s.lifetimes.For(conn), conn)
+	})
 }
 
 // Close stops the listeners.
@@ -196,15 +196,7 @@ func (s *HttpServer) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
 		connectionErr := s.conns.CloseAll()
-		listenerErr := s.listener.Close()
-		if errors.Is(listenerErr, net.ErrClosed) {
-			listenerErr = nil
-		}
-		for _, ln := range s.extraListeners {
-			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				listenerErr = errors.Join(listenerErr, err)
-			}
-		}
+		listenerErr := serverbase.CloseListeners(s.listener, s.extraListeners)
 		s.handler.CloseIdleConnections()
 		var waitErr error
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
@@ -379,43 +371,55 @@ func (h Handler) forwardRequest(ctx context.Context, req *http.Request, extensio
 }
 
 func newTransportPool(connector *connect.Connector) *transportPool {
-	pool := &transportPool{
-		connector: connector,
-		entries:   make(map[ext.Extension]*transportEntry),
+	pool := &transportPool{connector: connector}
+	for i := range pool.shards {
+		pool.shards[i].entries = make(map[ext.Extension]*transportEntry)
 	}
 	pool.defaultTransport = pool.newTransport(ext.None)
 	return pool
+}
+
+// extensionShardIndex spreads extensions across shards with a Fibonacci-style
+// mix of the extension value and type.
+func extensionShardIndex(e ext.Extension) int {
+	v := e.Value*0x9E3779B97F4A7C15 + uint64(e.Type)*0x100000001B3
+	return int((v ^ (v >> 32)) % transportShards)
 }
 
 func (p *transportPool) Get(extension ext.Extension) *http.Transport {
 	if extension.Type == ext.ExtNone {
 		return p.defaultTransport
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.clock++
-	if entry := p.entries[extension]; entry != nil {
-		entry.lastUsed = p.clock
+	shard := &p.shards[extensionShardIndex(extension)]
+	maxEntries := maxTransportEntries / transportShards
+	if maxEntries < 1 {
+		maxEntries = 1
+	}
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	shard.clock++
+	if entry := shard.entries[extension]; entry != nil {
+		entry.lastUsed = shard.clock
 		return entry.transport
 	}
 
-	if len(p.entries) >= maxTransportEntries {
+	if len(shard.entries) >= maxEntries {
 		var oldestExtension ext.Extension
 		var oldestEntry *transportEntry
-		for candidate, entry := range p.entries {
+		for candidate, entry := range shard.entries {
 			if oldestEntry == nil || entry.lastUsed < oldestEntry.lastUsed {
 				oldestExtension = candidate
 				oldestEntry = entry
 			}
 		}
 		if oldestEntry != nil {
-			delete(p.entries, oldestExtension)
+			delete(shard.entries, oldestExtension)
 			oldestEntry.transport.CloseIdleConnections()
 		}
 	}
 
 	transport := p.newTransport(extension)
-	p.entries[extension] = &transportEntry{transport: transport, lastUsed: p.clock}
+	shard.entries[extension] = &transportEntry{transport: transport, lastUsed: shard.clock}
 	return transport
 }
 
@@ -455,13 +459,19 @@ func (p *transportPool) dialContext(extension ext.Extension) func(context.Contex
 }
 
 func (p *transportPool) CloseIdleConnections() {
-	p.mu.Lock()
-	transports := make([]*http.Transport, 0, len(p.entries)+1)
-	transports = append(transports, p.defaultTransport)
-	for _, entry := range p.entries {
-		transports = append(transports, entry.transport)
+	var total int
+	for i := range p.shards {
+		total += len(p.shards[i].entries)
 	}
-	p.mu.Unlock()
+	transports := make([]*http.Transport, 0, total+1)
+	transports = append(transports, p.defaultTransport)
+	for i := range p.shards {
+		p.shards[i].mu.Lock()
+		for _, entry := range p.shards[i].entries {
+			transports = append(transports, entry.transport)
+		}
+		p.shards[i].mu.Unlock()
+	}
 	for _, transport := range transports {
 		transport.CloseIdleConnections()
 	}
@@ -487,22 +497,44 @@ var hopHeaders = []string{
 }
 
 func removeHopHeaders(h http.Header) {
-	// Connection may name additional hop-by-hop fields. Capture those tokens
-	// before deleting the Connection header itself.
-	var connectionTokens []string
-	if conn := h.Get("Connection"); conn != "" {
-		connectionTokens = strings.Split(conn, ",")
-	}
+	// Connection may name additional hop-by-hop fields. Walk its comma-separated
+	// tokens in place instead of allocating a slice via strings.Split.
+	connection := h.Get("Connection")
 	for _, k := range hopHeaders {
 		h.Del(k)
 	}
-	for _, tok := range connectionTokens {
-		h.Del(strings.TrimSpace(tok))
+	for len(connection) > 0 {
+		token := connection
+		if i := strings.IndexByte(connection, ','); i >= 0 {
+			token, connection = connection[:i], connection[i+1:]
+		} else {
+			connection = ""
+		}
+		h.Del(strings.TrimSpace(token))
 	}
 }
 
-// writeResponse writes a simple HTTP response to the buffered writer.
+// writeResponse writes a simple HTTP response to the buffered writer. Common
+// (status, body) pairs are prerendered at startup and written without any
+// allocation.
 func writeResponse(bw *bufio.Writer, status int, body string) {
+	if pre, ok := prerenderedResponses[responseKey{status, body}]; ok {
+		_, _ = bw.Write(pre)
+		_ = bw.Flush()
+		return
+	}
+	writeResponseRaw(bw, status, body)
+}
+
+// renderResponse produces the bytes writeResponseRaw writes for (status, body),
+// used to prerender fixed replies at startup.
+func renderResponse(status int, body string) []byte {
+	var buf bytes.Buffer
+	writeResponseRaw(bufio.NewWriter(&buf), status, body)
+	return buf.Bytes()
+}
+
+func writeResponseRaw(bw *bufio.Writer, status int, body string) {
 	resp := &http.Response{
 		StatusCode: status,
 		ProtoMajor: 1,
@@ -544,18 +576,4 @@ func parsePort(s string) (uint16, error) {
 		return 0, err
 	}
 	return uint16(p), nil
-}
-
-// isClosed reports whether the error indicates a closed listener.
-func isClosed(err error) bool {
-	if errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		if opErr.Err != nil && opErr.Err.Error() == "use of closed network connection" {
-			return true
-		}
-	}
-	return false
 }

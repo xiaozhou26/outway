@@ -182,8 +182,9 @@ var validateSourceCIDR = func(cidr netip.Prefix) error { return nil }
 var prepareResourceLimits = func(args config.BootArgs) error { return nil }
 
 // warnIfUDPBufferClamped probes whether the requested UDP socket buffer can be
-// honored and warns once at startup if the kernel clamps it. The buffer is only
-// used by the SOCKS5 UDP relay, so the check is skipped for HTTP-only proxies.
+// honored and warns once at startup if the kernel clamps it. The buffer is
+// only used by the UDP relays (SOCKS5 and MASQUE), so the check is skipped for
+// HTTP-only proxies.
 func warnIfUDPBufferClamped(args config.BootArgs) {
 	if args.UDP.SocketBufferBytes <= 0 {
 		return

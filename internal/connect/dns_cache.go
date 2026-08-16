@@ -14,6 +14,11 @@ const (
 	defaultDNSNegativeCacheTTL = 3 * time.Second
 	defaultDNSCacheSize        = 4096
 	defaultMaxDNSLookups       = 128
+
+	// dnsCacheShards splits entries across independently locked sub-maps so
+	// cache hits on different hosts never contend, mirroring the sharded
+	// connection registry.
+	dnsCacheShards = 16
 )
 
 type dnsLookupFunc func(context.Context, string) ([]netip.Addr, error)
@@ -30,33 +35,65 @@ type dnsLookupCall struct {
 	err   error
 }
 
-// dnsCache is a bounded TTL cache that also merges concurrent lookups for the
-// same hostname. It prevents connection bursts from creating matching DNS
-// bursts against the system resolver.
-type dnsCache struct {
+// dnsCacheShard holds one lock over a subset of cache entries. It also owns a
+// share of the resolver-concurrency budget so a miss storm on one shard cannot
+// starve or serialize lookups on the others.
+type dnsCacheShard struct {
 	mu          sync.RWMutex
 	entries     map[string]dnsCacheEntry
 	inflight    map[string]*dnsLookupCall
+	lookupSlots chan struct{}
+}
+
+// dnsCache is a bounded TTL cache that also merges concurrent lookups for the
+// same hostname. It prevents connection bursts from creating matching DNS
+// bursts against the system resolver. Entries, in-flight lookups, and resolver
+// concurrency slots are sharded by hostname hash so lookups on different hosts
+// proceed under different locks.
+type dnsCache struct {
+	shards      [dnsCacheShards]dnsCacheShard
 	ttl         time.Duration
 	negativeTTL time.Duration
 	maxEntries  int
 	lookup      dnsLookupFunc
-	lookupSlots chan struct{}
 }
 
 func newDNSCache(ttl, negativeTTL time.Duration, maxEntries, maxConcurrent int, lookup dnsLookupFunc) *dnsCache {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	return &dnsCache{
-		entries:     make(map[string]dnsCacheEntry),
-		inflight:    make(map[string]*dnsLookupCall),
+	c := &dnsCache{
 		ttl:         ttl,
 		negativeTTL: negativeTTL,
 		maxEntries:  maxEntries,
 		lookup:      lookup,
-		lookupSlots: make(chan struct{}, maxConcurrent),
 	}
+	// Each shard gets an equal share of the budget (at least one slot); the
+	// process-wide ceiling becomes shards × slots.
+	slotsPerShard := maxConcurrent / dnsCacheShards
+	if slotsPerShard < 1 {
+		slotsPerShard = 1
+	}
+	for i := range c.shards {
+		c.shards[i].entries = make(map[string]dnsCacheEntry)
+		c.shards[i].inflight = make(map[string]*dnsLookupCall)
+		c.shards[i].lookupSlots = make(chan struct{}, slotsPerShard)
+	}
+	return c
+}
+
+// shardIndexOf maps a normalized hostname to a shard via FNV-1a.
+func shardIndexOf(key string) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h % dnsCacheShards)
+}
+
+func (c *dnsCache) shardFor(key string) *dnsCacheShard {
+	return &c.shards[shardIndexOf(key)]
 }
 
 var defaultDNSCache = newDNSCache(
@@ -82,9 +119,10 @@ var defaultDNSCache = newDNSCache(
 func (c *dnsCache) LookupCached(host string) ([]netip.Addr, bool) {
 	key := normalizeDNSName(host)
 	now := time.Now()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	entry, ok := c.entries[key]
+	shard := c.shardFor(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	entry, ok := shard.entries[key]
 	if !ok || entry.err != nil || len(entry.addrs) == 0 || !now.Before(entry.expiresAt) {
 		return nil, false
 	}
@@ -96,28 +134,29 @@ func (c *dnsCache) LookupCached(host string) ([]netip.Addr, bool) {
 func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	key := normalizeDNSName(host)
 	now := time.Now()
+	shard := c.shardFor(key)
 
 	// Fast path: a valid cached entry needs only a read lock, so concurrent
-	// hits on the process-wide cache resolve in parallel instead of serializing.
-	c.mu.RLock()
-	if entry, ok := c.entries[key]; ok && now.Before(entry.expiresAt) {
-		c.mu.RUnlock()
+	// hits resolve in parallel instead of serializing.
+	shard.mu.RLock()
+	if entry, ok := shard.entries[key]; ok && now.Before(entry.expiresAt) {
+		shard.mu.RUnlock()
 		return entry.addrs, entry.err
 	}
-	c.mu.RUnlock()
+	shard.mu.RUnlock()
 
-	c.mu.Lock()
+	shard.mu.Lock()
 	// Re-check under the write lock: another goroutine may have resolved this
 	// key (or started an in-flight lookup) between the read unlock and here.
-	if entry, ok := c.entries[key]; ok {
+	if entry, ok := shard.entries[key]; ok {
 		if now.Before(entry.expiresAt) {
-			c.mu.Unlock()
+			shard.mu.Unlock()
 			return entry.addrs, entry.err
 		}
-		delete(c.entries, key)
+		delete(shard.entries, key)
 	}
-	if call, ok := c.inflight[key]; ok {
-		c.mu.Unlock()
+	if call, ok := shard.inflight[key]; ok {
+		shard.mu.Unlock()
 		select {
 		case <-call.done:
 			return call.addrs, call.err
@@ -127,23 +166,23 @@ func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error
 	}
 
 	call := &dnsLookupCall{done: make(chan struct{})}
-	c.inflight[key] = call
-	c.mu.Unlock()
+	shard.inflight[key] = call
+	shard.mu.Unlock()
 
-	addrs, err := c.resolve(ctx, key)
+	addrs, err := shard.resolve(ctx, c.lookup, key)
 
-	c.mu.Lock()
+	shard.mu.Lock()
 	call.addrs = addrs
 	call.err = err
-	delete(c.inflight, key)
+	delete(shard.inflight, key)
 	if ctx.Err() == nil {
 		ttl := c.ttl
 		if err != nil {
 			ttl = c.negativeTTL
 		}
 		if ttl > 0 && c.maxEntries > 0 {
-			c.evictLocked(now)
-			c.entries[key] = dnsCacheEntry{
+			c.evictLocked(shard, now)
+			shard.entries[key] = dnsCacheEntry{
 				addrs:     addrs,
 				err:       err,
 				expiresAt: time.Now().Add(ttl),
@@ -151,37 +190,38 @@ func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error
 		}
 	}
 	close(call.done)
-	c.mu.Unlock()
+	shard.mu.Unlock()
 
 	return addrs, err
 }
 
-func (c *dnsCache) resolve(ctx context.Context, host string) ([]netip.Addr, error) {
+func (s *dnsCacheShard) resolve(ctx context.Context, lookup dnsLookupFunc, host string) ([]netip.Addr, error) {
 	select {
-	case c.lookupSlots <- struct{}{}:
-		defer func() { <-c.lookupSlots }()
-		return c.lookup(ctx, host)
+	case s.lookupSlots <- struct{}{}:
+		defer func() { <-s.lookupSlots }()
+		return lookup(ctx, host)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-func (c *dnsCache) evictLocked(now time.Time) {
-	if len(c.entries) < c.maxEntries {
+func (c *dnsCache) evictLocked(shard *dnsCacheShard, now time.Time) {
+	perShardMax := c.maxEntries / dnsCacheShards
+	if len(shard.entries) < perShardMax {
 		return
 	}
-	for key, entry := range c.entries {
+	for key, entry := range shard.entries {
 		if !now.Before(entry.expiresAt) {
-			delete(c.entries, key)
+			delete(shard.entries, key)
 		}
 	}
-	if len(c.entries) < c.maxEntries {
+	if len(shard.entries) < perShardMax {
 		return
 	}
 	// The cache is deliberately small and DNS lookups are relatively expensive;
 	// arbitrary eviction is sufficient here and avoids a global LRU hot lock.
-	for key := range c.entries {
-		delete(c.entries, key)
+	for key := range shard.entries {
+		delete(shard.entries, key)
 		break
 	}
 }

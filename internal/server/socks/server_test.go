@@ -192,7 +192,7 @@ func TestWriteUDPResponseTargetsClient(t *testing.T) {
 	}
 	defer relay.Close()
 
-	remote := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 10), Port: 5353}
+	remote := netip.MustParseAddrPort("198.51.100.10:5353")
 	pkt := outboundPacket{payload: []byte("response"), remote: remote}
 	clientAddr := client.LocalAddr().(*net.UDPAddr).AddrPort()
 	if err := writeUDPResponse(relay, clientAddr, pkt); err != nil {
@@ -711,4 +711,12 @@ func BenchmarkSOCKS5TunnelSetupParallel(b *testing.B) {
 			_ = conn.Close()
 		}
 	})
+}
+
+// writeUDPResponse sends one prepared response packet to the client. It is a
+// test-only helper exercising prepareUDPResponse plus a single WriteToUDP.
+func writeUDPResponse(inbound *net.UDPConn, clientAddr netip.AddrPort, pkt outboundPacket) error {
+	packet := prepareUDPResponse(pkt)
+	_, err := inbound.WriteToUDPAddrPort(packet, clientAddr)
+	return err
 }

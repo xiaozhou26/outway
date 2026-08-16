@@ -25,7 +25,6 @@ type udpMetrics struct {
 	unauthorizedDrops  atomic.Uint64
 	associationDrops   atomic.Uint64
 	errors             atomic.Uint64
-	queueDepth         atomic.Int64
 	batchFallbacks     atomic.Uint64
 	groCoalescedReads  atomic.Uint64
 	groTruncatedReads  atomic.Uint64
@@ -36,7 +35,7 @@ type udpRuntime struct {
 	pool             sync.Pool
 	metrics          udpMetrics
 	startOnce        sync.Once
-	shards           []chan udpSendJob
+	shards           atomic.Pointer[[]chan udpSendJob]
 	sequence         atomic.Uint64
 	lifetime         context.Context
 	associationSlots chan struct{}
@@ -45,12 +44,50 @@ type udpRuntime struct {
 	reactor          *udpReactor
 	reactorOnce      sync.Once
 	reactorReady     atomic.Bool
+	writerPools      udpWriterPools
+	batchSlicePool   sync.Pool
 }
 
-// sharedReactor lazily creates the process-wide UDP read reactor and returns it.
-// ok is false when a reactor is unavailable (non-Linux, or epoll setup failed),
-// in which case callers fall back to a blocking read goroutine per socket. The
-// reactor is closed when the runtime lifetime ends.
+// udpBatchSlices holds the association's reusable batch slices so short-lived
+// associations recycle them instead of reallocating up to six slices each.
+type udpBatchSlices struct {
+	preferred []udpWritePacket
+	fallback  []udpWritePacket
+	writes    []udpWritePacket
+	payloads  []int
+}
+
+func (r *udpRuntime) getBatchSlices() *udpBatchSlices {
+	if s, ok := r.batchSlicePool.Get().(*udpBatchSlices); ok {
+		return s
+	}
+	n := r.config.BatchSize
+	return &udpBatchSlices{
+		preferred: make([]udpWritePacket, 0, n),
+		fallback:  make([]udpWritePacket, 0, n),
+		writes:    make([]udpWritePacket, 0, n),
+		payloads:  make([]int, 0, n),
+	}
+}
+
+// putBatchSlices clears packet-buffer references (so a pooled slice cannot pin
+// pooled buffers) and returns the slices to the pool.
+func (r *udpRuntime) putBatchSlices(s *udpBatchSlices) {
+	clear(s.preferred[:cap(s.preferred)])
+	clear(s.fallback[:cap(s.fallback)])
+	clear(s.writes[:cap(s.writes)])
+	clear(s.payloads[:cap(s.payloads)])
+	s.preferred, s.fallback, s.writes, s.payloads =
+		s.preferred[:0], s.fallback[:0], s.writes[:0], s.payloads[:0]
+	r.batchSlicePool.Put(s)
+}
+
+// sharedReactor lazily creates this runtime's UDP read reactor and returns it.
+// The reactor is shared by every UDP association served by this runtime (one
+// per acceptor), not process-wide. ok is false when a reactor is unavailable
+// (non-Linux, or epoll setup failed), in which case callers fall back to a
+// blocking read goroutine per socket. The reactor is closed when the runtime
+// lifetime ends.
 func (r *udpRuntime) sharedReactor() (*udpReactor, bool) {
 	r.reactorOnce.Do(func() {
 		workers := runtime.GOMAXPROCS(0)
@@ -88,6 +125,7 @@ func newUDPRuntime(cfg config.UDPConfig, concurrent uint32, lifetime context.Con
 		lifetime:         lifetime,
 		associationSlots: make(chan struct{}, int(maxAssociations)),
 	}
+	r.writerPools.init(cfg.BatchSize)
 	if cfg.BatchBufferBudget > 0 {
 		r.batchSlots = make(chan struct{}, cfg.BatchBufferBudget)
 	}
@@ -171,24 +209,38 @@ func (r *udpRuntime) endAssociation() {
 }
 
 // dispatch enqueues a send job onto the shard owning the association. It reads
-// r.shards without a lock: startOnce establishes a happens-before edge, and the
-// shards slice is written once and never mutated afterward. Shard channels are
-// never closed (workers exit via the lifetime context), so a send can never
-// race a close.
+// the shard slice through an atomic pointer: startDispatcher publishes it once
+// and it is never mutated afterward. Shard channels are never closed (workers
+// exit via the lifetime context), so a send can never race a close.
 func (r *udpRuntime) dispatch(job udpSendJob) bool {
 	if r.lifetime.Err() != nil {
 		return false
 	}
 	r.startOnce.Do(r.startDispatcher)
-	shard := r.shards[job.associationID%uint64(len(r.shards))]
+	shards := *r.shards.Load()
+	shard := shards[job.associationID%uint64(len(shards))]
 	select {
 	case shard <- job:
-		r.metrics.queueDepth.Add(1)
 		return true
 	default:
 		r.metrics.queueDrops.Add(1)
 		return false
 	}
+}
+
+// queuedJobs reports how many send jobs are waiting across all shards. It
+// replaces a per-datagram queue-depth counter with an on-demand sum of the
+// channel lengths, keeping the counter off the hot path.
+func (r *udpRuntime) queuedJobs() int {
+	shards := r.shards.Load()
+	if shards == nil {
+		return 0
+	}
+	queued := 0
+	for _, shard := range *shards {
+		queued += len(shard)
+	}
+	return queued
 }
 
 func (r *udpRuntime) startDispatcher() {
@@ -207,14 +259,14 @@ func (r *udpRuntime) startDispatcher() {
 	}
 	queuePerShard := r.config.SendQueueSize / workers
 	extraQueueSlots := r.config.SendQueueSize % workers
-	r.shards = make([]chan udpSendJob, workers)
+	shards := make([]chan udpSendJob, workers)
 	for index := range workers {
 		capacity := queuePerShard
 		if index < extraQueueSlots {
 			capacity++
 		}
 		jobs := make(chan udpSendJob, capacity)
-		r.shards[index] = jobs
+		shards[index] = jobs
 		r.workerWG.Add(1)
 		go func() {
 			defer r.workerWG.Done()
@@ -229,7 +281,6 @@ func (r *udpRuntime) startDispatcher() {
 					for {
 						select {
 						case job := <-jobs:
-							r.metrics.queueDepth.Add(-1)
 							r.releaseInboundPacket(job.packet)
 						default:
 							return
@@ -239,11 +290,11 @@ func (r *udpRuntime) startDispatcher() {
 			}
 		}()
 	}
+	r.shards.Store(&shards)
 }
 
 // runSendJob performs one outbound send and releases the packet buffer.
 func (r *udpRuntime) runSendJob(job udpSendJob) {
-	r.metrics.queueDepth.Add(-1)
 	if job.ctx.Err() == nil {
 		_, err := job.connector.SendPacket(job.ctx, job.packet.payload, job.target, job.preferred, job.fallback)
 		if err != nil {
@@ -282,7 +333,7 @@ func (r *udpRuntime) logMetrics(ctx context.Context, interval time.Duration) {
 				"out_packets", r.metrics.outPackets.Load(),
 				"out_bytes", r.metrics.outBytes.Load(),
 				"queue_drops", r.metrics.queueDrops.Load(),
-				"queue_depth", r.metrics.queueDepth.Load(),
+				"queue_depth", r.queuedJobs(),
 				"queue_capacity", r.config.SendQueueSize,
 				"truncated_drops", r.metrics.truncatedDrops.Load(),
 				"malformed_drops", r.metrics.malformedDrops.Load(),

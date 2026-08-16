@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -77,9 +78,19 @@ func TestDNSCacheExpiresEntries(t *testing.T) {
 }
 
 func TestDNSCacheBoundsConcurrentLookups(t *testing.T) {
+	// Concurrency slots are per shard: with 16 shards and a budget of 16, each
+	// shard gets one slot. Collect hostnames that land in the same shard so the
+	// per-shard bound is directly observable.
+	buckets := make(map[int][]string)
+	for i := 0; len(buckets[0]) < 4; i++ {
+		host := fmt.Sprintf("host-%d.example", i)
+		shard := shardIndexOf(host)
+		buckets[shard] = append(buckets[shard], host)
+	}
+
 	var active atomic.Int32
 	var maximum atomic.Int32
-	cache := newDNSCache(time.Minute, time.Second, 16, 2, func(context.Context, string) ([]netip.Addr, error) {
+	cache := newDNSCache(time.Minute, time.Second, 16, 16, func(context.Context, string) ([]netip.Addr, error) {
 		current := active.Add(1)
 		defer active.Add(-1)
 		for {
@@ -93,18 +104,18 @@ func TestDNSCacheBoundsConcurrentLookups(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
-	for i := range 8 {
+	for _, host := range buckets[0] {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := cache.Lookup(context.Background(), "host-"+string(rune('a'+i))+".example"); err != nil {
+			if _, err := cache.Lookup(context.Background(), host); err != nil {
 				t.Errorf("lookup failed: %v", err)
 			}
 		}()
 	}
 	wg.Wait()
-	if got := maximum.Load(); got > 2 {
-		t.Fatalf("observed %d concurrent lookups, want at most 2", got)
+	if got := maximum.Load(); got > 1 {
+		t.Fatalf("observed %d concurrent lookups within one shard, want at most 1", got)
 	}
 }
 
@@ -178,6 +189,37 @@ func BenchmarkDNSCacheHitParallel(b *testing.B) {
 				b.Fatal(err)
 			}
 			i++
+		}
+	})
+}
+
+// BenchmarkDNSCacheMiss exercises the miss path: shard write lock, in-flight
+// registration, resolver call, and store.
+func BenchmarkDNSCacheMiss(b *testing.B) {
+	cache := newDNSCache(time.Minute, time.Second, 4096, 128, func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+	})
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := cache.Lookup(context.Background(), fmt.Sprintf("miss-%d.example", i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDNSCacheSingleflight measures coalesced lookups: many goroutines
+// resolving the same host share one resolver call.
+func BenchmarkDNSCacheSingleflight(b *testing.B) {
+	cache := newDNSCache(time.Minute, time.Second, 16, 128, func(context.Context, string) ([]netip.Addr, error) {
+		time.Sleep(50 * time.Microsecond)
+		return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+	})
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := cache.Lookup(context.Background(), "shared.example"); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }

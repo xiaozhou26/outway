@@ -153,8 +153,10 @@ func ReadAddress(r io.Reader) (Address, error) {
 		if err != nil {
 			return Address{}, err
 		}
-		buf := make([]byte, int(ln)+2)
-		if err := readFull(r, buf); err != nil {
+		// Max domain length is 255 plus 2 port bytes; a stack buffer keeps the
+		// domain string as the branch's only allocation.
+		var buf [257]byte
+		if err := readFull(r, buf[:ln+2]); err != nil {
 			return Address{}, err
 		}
 		port := binary.BigEndian.Uint16(buf[ln:])

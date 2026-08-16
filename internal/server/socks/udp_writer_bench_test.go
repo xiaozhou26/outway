@@ -3,12 +3,15 @@
 package socks
 
 import (
+	"context"
 	"net"
 	"testing"
+
+	"github.com/xiaozhou26/outway/internal/config"
 )
 
-// BenchmarkLinuxUDPBatchWriter measures the per-batch send path; the reusable
-// address slots should keep it allocation-free.
+// BenchmarkLinuxUDPBatchWriter measures the per-batch send path; the pooled
+// message arrays should keep it allocation-free after the first batch.
 func BenchmarkLinuxUDPBatchWriter(b *testing.B) {
 	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -23,7 +26,13 @@ func BenchmarkLinuxUDPBatchWriter(b *testing.B) {
 	defer sender.Close()
 
 	const batchSize = 32
-	writer := newUDPBatchWriter(sender, batchSize)
+	runtime := newUDPRuntime(config.UDPConfig{
+		MaxPacketSize: 1500,
+		BatchSize:     batchSize,
+		SendQueueSize: 8192,
+	}, 1024, context.Background())
+	defer runtime.putBatchSlices(runtime.getBatchSlices())
+	writer := newUDPBatchWriter(sender, runtime)
 	dst := target.LocalAddr().(*net.UDPAddr).AddrPort()
 	payload := make([]byte, 200)
 	batch := make([]udpWritePacket, batchSize)

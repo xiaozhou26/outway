@@ -118,7 +118,7 @@ func (s *AutoDetectServer) acceptLoop(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if isClosedErr(err) {
+			if serverbase.IsConnClosed(err) {
 				return nil
 			}
 			slog.Debug("Failed to accept connection", "error", err)
@@ -276,17 +276,3 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.br.Read(p) }
-
-// isClosedErr reports whether the error indicates a closed listener.
-func isClosedErr(err error) bool {
-	if errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		if opErr.Err != nil && opErr.Err.Error() == "use of closed network connection" {
-			return true
-		}
-	}
-	return false
-}

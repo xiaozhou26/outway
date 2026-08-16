@@ -10,6 +10,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// reactorRegShards splits the fd registry across independently locked sub-maps
+// (mirroring ConnectionSet) so readiness dispatch and registration on
+// different fds never contend on one lock.
+const (
+	reactorRegShards    = 16
+	reactorRegShardBits = 4
+)
+
+type reactorRegShard struct {
+	mu   sync.RWMutex
+	regs map[int32]*reactorReg
+	// Pad to a cache line so hot shard locks on different cores don't
+	// false-share.
+	_ [40]byte
+}
+
 // udpReactor multiplexes read-readiness of many UDP sockets over a small pool of
 // worker goroutines using epoll, so associations no longer each need a blocking
 // read goroutine parked in the Go netpoller. Sockets are registered by raw file
@@ -19,10 +35,16 @@ import (
 type udpReactor struct {
 	epfd    int
 	eventfd int
-	mu      sync.RWMutex
-	regs    map[int32]*reactorReg
+	shards  [reactorRegShards]reactorRegShard
 	wg      sync.WaitGroup
 	closed  atomic.Bool
+}
+
+// shardFor maps an fd to its registry shard, Fibonacci-hashing the fd so
+// sequential descriptors spread evenly.
+func (r *udpReactor) shardFor(fd int32) *reactorRegShard {
+	h := uint64(uint32(fd)) * 0x9e3779b97f4a7c15
+	return &r.shards[h>>(64-reactorRegShardBits)]
 }
 
 // reactorReg couples an fd's ready handler with a lock that serializes it
@@ -57,7 +79,10 @@ func newUDPReactor(workers int) (*udpReactor, error) {
 	if workers < 1 {
 		workers = 1
 	}
-	r := &udpReactor{epfd: epfd, eventfd: eventfd, regs: make(map[int32]*reactorReg)}
+	r := &udpReactor{epfd: epfd, eventfd: eventfd}
+	for i := range r.shards {
+		r.shards[i].regs = make(map[int32]*reactorReg)
+	}
 	for range workers {
 		r.wg.Add(1)
 		go r.loop()
@@ -70,14 +95,15 @@ func newUDPReactor(workers int) (*udpReactor, error) {
 // call rearm(fd) to receive further readiness notifications.
 func (r *udpReactor) register(fd int, handler func()) error {
 	reg := &reactorReg{handler: handler}
-	r.mu.Lock()
-	r.regs[int32(fd)] = reg
-	r.mu.Unlock()
+	shard := r.shardFor(int32(fd))
+	shard.mu.Lock()
+	shard.regs[int32(fd)] = reg
+	shard.mu.Unlock()
 	event := unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLONESHOT, Fd: int32(fd)}
 	if err := unix.EpollCtl(r.epfd, unix.EPOLL_CTL_ADD, fd, &event); err != nil {
-		r.mu.Lock()
-		delete(r.regs, int32(fd))
-		r.mu.Unlock()
+		shard.mu.Lock()
+		delete(shard.regs, int32(fd))
+		shard.mu.Unlock()
 		return err
 	}
 	return nil
@@ -93,10 +119,11 @@ func (r *udpReactor) rearm(fd int) error {
 // for it has returned, so the caller can then safely close the underlying
 // socket without an fd-reuse hazard.
 func (r *udpReactor) deregister(fd int) {
-	r.mu.Lock()
-	reg := r.regs[int32(fd)]
-	delete(r.regs, int32(fd))
-	r.mu.Unlock()
+	shard := r.shardFor(int32(fd))
+	shard.mu.Lock()
+	reg := shard.regs[int32(fd)]
+	delete(shard.regs, int32(fd))
+	shard.mu.Unlock()
 	_ = unix.EpollCtl(r.epfd, unix.EPOLL_CTL_DEL, fd, nil)
 	if reg != nil {
 		// Wait for any running handler, then keep it from running again.
@@ -125,9 +152,10 @@ func (r *udpReactor) loop() {
 				}
 				continue
 			}
-			r.mu.RLock()
-			reg := r.regs[fd]
-			r.mu.RUnlock()
+			shard := r.shardFor(fd)
+			shard.mu.RLock()
+			reg := shard.regs[fd]
+			shard.mu.RUnlock()
 			if reg == nil {
 				continue
 			}

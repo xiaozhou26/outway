@@ -91,3 +91,17 @@ func TestTryFromPlainPrefix(t *testing.T) {
 		t.Errorf("TryFrom plain: type = %v, want ExtNone", got.Type)
 	}
 }
+
+// BenchmarkTryFrom covers username parsing on the auth fast path.
+func BenchmarkTryFrom(b *testing.B) {
+	usernames := []string{
+		"plain-user",
+		"user-session-abc123defg",
+		"user-ttl-60",
+		"user-range-1048576",
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = TryFrom("user", usernames[i&3])
+	}
+}

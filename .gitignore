@@ -3,3 +3,5 @@ vproxy/
 AGENTS.md
 .codex-go-cache
 CLAUDE.md
+.claude/
+.trellis/

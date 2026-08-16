@@ -1,6 +1,7 @@
 ﻿package socks
 
 import (
+	"crypto/subtle"
 	"errors"
 	"io"
 	"net"
@@ -9,35 +10,28 @@ import (
 	"github.com/xiaozhou26/outway/internal/ext"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto/handshake"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto/handshake/password"
-)
-
-// authMode identifies the configured authentication method.
-type authMode int
-
-const (
-	authNone authMode = iota
-	authPassword
+	"github.com/xiaozhou26/outway/internal/serverbase"
 )
 
 // AuthAdaptor unifies the available SOCKS5 authentication methods.
 type AuthAdaptor struct {
-	mode     authMode
+	mode     serverbase.AuthMode
 	username string
 	password string
 }
 
 // NoAuthConfig builds a no-authentication adaptor.
-func NoAuthConfig() AuthAdaptor { return AuthAdaptor{mode: authNone} }
+func NoAuthConfig() AuthAdaptor { return AuthAdaptor{mode: serverbase.AuthNone} }
 
 // PasswordConfig builds a username/password adaptor.
 func PasswordConfig(username, password string) AuthAdaptor {
-	return AuthAdaptor{mode: authPassword, username: username, password: password}
+	return AuthAdaptor{mode: serverbase.AuthPassword, username: username, password: password}
 }
 
 // Method returns the SOCKS5 method offered by this adaptor.
 func (a AuthAdaptor) Method() handshake.Method {
 	switch a.mode {
-	case authPassword:
+	case serverbase.AuthPassword:
 		return handshake.MethodPassword
 	default:
 		return handshake.MethodNoAuth
@@ -48,7 +42,7 @@ func (a AuthAdaptor) Method() handshake.Method {
 // parsed extension (if any).
 func (a AuthAdaptor) Execute(stream io.ReadWriter) (ext.Extension, error) {
 	switch a.mode {
-	case authPassword:
+	case serverbase.AuthPassword:
 		return a.executePassword(stream)
 	default:
 		return ext.None, nil
@@ -62,7 +56,7 @@ func (a AuthAdaptor) executePassword(stream io.ReadWriter) (ext.Extension, error
 	}
 
 	equal := strings.HasPrefix(req.UserPass.Username, a.username) &&
-		req.UserPass.Password == a.password
+		subtle.ConstantTimeCompare([]byte(req.UserPass.Password), []byte(a.password)) == 1
 
 	status := password.StatusFailed
 	if equal {

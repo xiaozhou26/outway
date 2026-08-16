@@ -5,6 +5,7 @@ package socks
 import (
 	"errors"
 	"net"
+	"sync"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -198,33 +199,96 @@ func (r *linuxUDPBatchReader) readBatch() ([]udpReadPacket, error) {
 	return r.packets[:drained+1], nil
 }
 
+// linuxWriterKit holds one batch writer's inert per-message arrays so they can
+// be pooled across associations instead of reallocated per UDP ASSOCIATE.
+type linuxWriterKit struct {
+	addrs  []*net.UDPAddr
+	v4msgs []ipv4.Message
+	v6msgs []ipv6.Message
+}
+
+// udpWriterPools recycles writer kits per address family. Kits are sized from
+// the runtime's batch size at first use.
+type udpWriterPools struct {
+	batchSize int
+	v4        sync.Pool
+	v6        sync.Pool
+}
+
+func (p *udpWriterPools) init(batchSize int) { p.batchSize = batchSize }
+
+func (p *udpWriterPools) getKit(v4 bool, conn *net.UDPConn) *linuxWriterKit {
+	size := p.batchSize
+	var pool *sync.Pool
+	if v4 {
+		pool = &p.v4
+	} else {
+		pool = &p.v6
+	}
+	if kit, ok := pool.Get().(*linuxWriterKit); ok && len(kit.addrs) == size {
+		return kit
+	}
+	kit := &linuxWriterKit{addrs: make([]*net.UDPAddr, size)}
+	for i := range kit.addrs {
+		kit.addrs[i] = newReusableUDPAddr()
+	}
+	if v4 {
+		kit.v4msgs = make([]ipv4.Message, size)
+		for i := range kit.v4msgs {
+			kit.v4msgs[i].Buffers = make([][]byte, 1)
+		}
+	} else {
+		kit.v6msgs = make([]ipv6.Message, size)
+		for i := range kit.v6msgs {
+			kit.v6msgs[i].Buffers = make([][]byte, 1)
+		}
+	}
+	return kit
+}
+
+// putKit clears packet-buffer references so a pooled kit cannot pin pooled
+// buffers, then returns it to its family pool.
+func (p *udpWriterPools) putKit(kit *linuxWriterKit, v4 bool) {
+	if kit == nil {
+		return
+	}
+	if v4 {
+		for i := range kit.v4msgs {
+			kit.v4msgs[i].Buffers[0] = nil
+			kit.v4msgs[i].Addr = nil
+		}
+		p.v4.Put(kit)
+		return
+	}
+	for i := range kit.v6msgs {
+		kit.v6msgs[i].Buffers[0] = nil
+		kit.v6msgs[i].Addr = nil
+	}
+	p.v6.Put(kit)
+}
+
 type linuxUDPBatchWriter struct {
 	v4     *ipv4.PacketConn
 	v6     *ipv6.PacketConn
-	v4msgs []ipv4.Message
-	v6msgs []ipv6.Message
-	addrs  []*net.UDPAddr
+	kit    *linuxWriterKit
 }
 
-func newUDPBatchWriter(conn *net.UDPConn, batchSize int) udpBatchWriter {
-	w := &linuxUDPBatchWriter{addrs: make([]*net.UDPAddr, batchSize)}
-	for i := range w.addrs {
-		w.addrs[i] = newReusableUDPAddr()
-	}
-	if conn.LocalAddr().(*net.UDPAddr).IP.To4() != nil {
+func newUDPBatchWriter(conn *net.UDPConn, runtime *udpRuntime) udpBatchWriter {
+	v4 := conn.LocalAddr().(*net.UDPAddr).IP.To4() != nil
+	w := &linuxUDPBatchWriter{kit: runtime.writerPools.getKit(v4, conn)}
+	if v4 {
 		w.v4 = ipv4.NewPacketConn(conn)
-		w.v4msgs = make([]ipv4.Message, batchSize)
-		for i := range w.v4msgs {
-			w.v4msgs[i].Buffers = make([][]byte, 1)
-		}
 	} else {
 		w.v6 = ipv6.NewPacketConn(conn)
-		w.v6msgs = make([]ipv6.Message, batchSize)
-		for i := range w.v6msgs {
-			w.v6msgs[i].Buffers = make([][]byte, 1)
-		}
 	}
 	return w
+}
+
+// releaseTo returns the writer's kit to the pool. The packet-con wrappers are
+// dropped: they are bound to the (now closed) socket.
+func (w *linuxUDPBatchWriter) releaseTo(pools *udpWriterPools) {
+	pools.putKit(w.kit, w.v4 != nil)
+	w.v4, w.v6, w.kit = nil, nil, nil
 }
 
 func (w *linuxUDPBatchWriter) Write(packets []udpWritePacket) (int, error) {
@@ -232,19 +296,19 @@ func (w *linuxUDPBatchWriter) Write(packets []udpWritePacket) (int, error) {
 		return 0, nil
 	}
 	if w.v4 != nil {
-		messages := w.v4msgs[:len(packets)]
+		messages := w.kit.v4msgs[:len(packets)]
 		for i, packet := range packets {
 			messages[i].Buffers[0] = packet.buffer
-			setUDPAddr(w.addrs[i], packet.addr)
-			messages[i].Addr = w.addrs[i]
+			setUDPAddr(w.kit.addrs[i], packet.addr)
+			messages[i].Addr = w.kit.addrs[i]
 		}
 		return writeIPv4Messages(w.v4, messages)
 	}
-	messages := w.v6msgs[:len(packets)]
+	messages := w.kit.v6msgs[:len(packets)]
 	for i, packet := range packets {
 		messages[i].Buffers[0] = packet.buffer
-		setUDPAddr(w.addrs[i], packet.addr)
-		messages[i].Addr = w.addrs[i]
+		setUDPAddr(w.kit.addrs[i], packet.addr)
+		messages[i].Addr = w.kit.addrs[i]
 	}
 	return writeIPv6Messages(w.v6, messages)
 }

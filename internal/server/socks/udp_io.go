@@ -26,6 +26,9 @@ type udpBatchReader interface {
 
 type udpBatchWriter interface {
 	Write([]udpWritePacket) (int, error)
+	// releaseTo returns the writer's pooled per-message arrays. It must be
+	// called only after the writer's last use.
+	releaseTo(pools *udpWriterPools)
 }
 
 func udpAddrPort(addr net.Addr) (netip.AddrPort, bool) {

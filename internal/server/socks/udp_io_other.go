@@ -45,9 +45,17 @@ type genericUDPBatchWriter struct {
 	addr *net.UDPAddr
 }
 
-func newUDPBatchWriter(conn *net.UDPConn, _ int) udpBatchWriter {
+// udpWriterPools is the non-Linux writer-array pool: the generic writer has no
+// per-message arrays, so there is nothing to pool.
+type udpWriterPools struct{}
+
+func (p *udpWriterPools) init(int) {}
+
+func newUDPBatchWriter(conn *net.UDPConn, _ *udpRuntime) udpBatchWriter {
 	return &genericUDPBatchWriter{conn: conn, addr: newReusableUDPAddr()}
 }
+
+func (w *genericUDPBatchWriter) releaseTo(*udpWriterPools) {}
 
 func (w *genericUDPBatchWriter) Write(packets []udpWritePacket) (int, error) {
 	for index, packet := range packets {
