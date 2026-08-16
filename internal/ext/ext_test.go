@@ -105,3 +105,56 @@ func BenchmarkTryFrom(b *testing.B) {
 		_ = TryFrom("user", usernames[i&3])
 	}
 }
+
+// TestTryFromMalformedValues pins the behavior for malformed session/ttl/range
+// values: malformed TTLs collapse to None, session/range markers always win
+// over their content, and the marker order is session > ttl > range.
+func TestTryFromMalformedValues(t *testing.T) {
+	cases := []struct {
+		name string
+		full string
+		want ExtensionType
+	}{
+		{"empty session value", "user-session-", ExtSession},
+		{"session marker wins over ttl in same name", "user-session-a-ttl-60", ExtSession},
+		{"empty ttl value", "user-ttl-", ExtNone},
+		{"non-numeric ttl", "user-ttl-abc", ExtNone},
+		{"zero ttl", "user-ttl-0", ExtNone},
+		{"negative ttl", "user-ttl--5", ExtNone},
+		{"float ttl", "user-ttl-1.5", ExtNone},
+		{"ttl with trailing junk", "user-ttl-60x", ExtNone},
+		{"ttl overflow", "user-ttl-99999999999999999999999", ExtNone},
+		{"max uint64 ttl is valid", "user-ttl-9223372036854775807", ExtTTL},
+		{"empty range value", "user-range-", ExtRange},
+		{"marker without prefix", "session-x", ExtNone},
+	}
+	for _, tc := range cases {
+		got := TryFrom("user", tc.full)
+		if got.Type != tc.want {
+			t.Errorf("%s: TryFrom(%q).Type = %v, want %v", tc.name, tc.full, got.Type, tc.want)
+		}
+	}
+
+	// A malformed TTL must be indistinguishable from no extension at all: both
+	// produce the zero Extension, so the fallback source selection is uniform.
+	if got := TryFrom("user", "user-ttl-abc"); got != None {
+		t.Errorf("malformed TTL produced %+v, want None", got)
+	}
+}
+
+// TestTryFromSessionIsDeterministic pins the source-stickiness contract: the
+// same session username always maps to the same extension value.
+func TestTryFromSessionIsDeterministic(t *testing.T) {
+	first := TryFrom("user", "user-session-abc123")
+	if first.Type != ExtSession {
+		t.Fatalf("type = %v, want ExtSession", first.Type)
+	}
+	for i := 0; i < 100; i++ {
+		if got := TryFrom("user", "user-session-abc123"); got != first {
+			t.Fatalf("session extension not deterministic: %+v vs %+v", got, first)
+		}
+	}
+	if other := TryFrom("user", "user-session-other"); other == first {
+		t.Fatal("different session strings produced the same extension value")
+	}
+}

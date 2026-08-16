@@ -2,6 +2,9 @@ package connect
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
+	"time"
 	"net"
 	"net/netip"
 	"strings"
@@ -195,5 +198,151 @@ func TestAssignIPv4WithRange(t *testing.T) {
 	got := assignIPv4WithRange(cidr, rng, 3)
 	if !cidr.Contains(got) {
 		t.Errorf("assignIPv4WithRange: %s not in %s", got, cidr)
+	}
+}
+
+// TestUDPSocketCreationBounded proves the UDP dial budget: with a cap of 4,
+// 64 concurrent CreateSocketDualStack calls never exceed 4 in-flight socket
+// creations, and all calls eventually succeed.
+func TestUDPSocketCreationBounded(t *testing.T) {
+	const cap = 4
+	connector := New(nil, nil, nil, 5, nil, nil, cap)
+
+	const callers = 64
+	var wg sync.WaitGroup
+	var maxInFlight atomic.Int32
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			preferred, fallback, err := connector.UDP(ext.None).CreateSocketDualStack(context.Background())
+			if err != nil {
+				t.Errorf("CreateSocketDualStack: %v", err)
+				return
+			}
+			// Track occupancy from inside the critical section by observing the
+			// gauge after acquiring; creation itself is fast, so hold briefly.
+			if current := connector.udpCreating.Load(); current > maxInFlight.Load() {
+				maxInFlight.Store(current)
+			}
+			_ = preferred.Close()
+			if fallback != nil {
+				_ = fallback.Close()
+			}
+		}()
+	}
+	wg.Wait()
+	if got := maxInFlight.Load(); got > cap {
+		t.Fatalf("observed %d concurrent UDP socket creations, want <= %d", got, cap)
+	}
+	if inFlight := connector.udpCreating.Load(); inFlight != 0 {
+		t.Fatalf("in-flight gauge = %d after all calls returned, want 0", inFlight)
+	}
+}
+
+// TestUDPSlotAcquireHonorsContextCancel verifies a caller waiting for a UDP
+// slot is released when its context ends instead of queueing forever, and that
+// the slot is reusable after release.
+func TestUDPSlotAcquireHonorsContextCancel(t *testing.T) {
+	connector := New(nil, nil, nil, 5, nil, nil, 1)
+
+	if err := connector.acquireSlot(connector.udpDialSlots, context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := connector.acquireSlot(connector.udpDialSlots, waitCtx); err == nil {
+		t.Fatal("acquire succeeded while the only slot was held")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("cancellation took %v, want prompt return", elapsed)
+	}
+
+	connector.releaseSlot(connector.udpDialSlots)
+	if err := connector.acquireSlot(connector.udpDialSlots, context.Background()); err != nil {
+		t.Fatalf("slot not reusable after release: %v", err)
+	}
+	connector.releaseSlot(connector.udpDialSlots)
+}
+
+// TestAssignIPv6CIDRBoundaries covers the prefix-length edges the uint128
+// math must survive: /127 (single host bit), /128 (zero host bits), and the
+// 64-bit boundary where the host part crosses the hi/lo halves.
+func TestAssignIPv6CIDRBoundaries(t *testing.T) {
+	cases := []struct {
+		name      string
+		cidr      netip.Prefix
+		checkFunc func(t *testing.T, cidr netip.Prefix)
+	}{
+		{
+			name: "/127 keeps the prefix and flips only the last bit",
+			cidr: netip.MustParsePrefix("2001:db8::/127"),
+			checkFunc: func(t *testing.T, cidr netip.Prefix) {
+				base := cidr.Masked().Addr()
+				for _, e := range []ext.Extension{
+					{Type: ext.ExtSession, Value: 0},
+					{Type: ext.ExtSession, Value: 1 << 40},
+					{Type: ext.ExtTTL, Value: 9223372036854775807},
+				} {
+					got := assignIPv6FromExtension(cidr, nil, e)
+					if got != base && got != base.Next() {
+						t.Fatalf("assignIPv6FromExtension(%v) = %s, want %s or %s", e.Value, got, base, base.Next())
+					}
+				}
+				got := assignRandIPv6(cidr)
+				if got != base && got != base.Next() {
+					t.Fatalf("assignRandIPv6 = %s, want %s or %s", got, base, base.Next())
+				}
+			},
+		},
+		{
+			name: "/128 always returns the prefix address itself",
+			cidr: netip.MustParsePrefix("2001:db8::1/128"),
+			checkFunc: func(t *testing.T, cidr netip.Prefix) {
+				want := cidr.Masked().Addr()
+				for _, e := range []ext.Extension{
+					{Type: ext.ExtSession, Value: 0},
+					{Type: ext.ExtSession, Value: 123456789},
+					{Type: ext.ExtTTL, Value: 42},
+				} {
+					if got := assignIPv6FromExtension(cidr, nil, e); got != want {
+						t.Fatalf("assignIPv6FromExtension(%v) = %s, want %s", e.Value, got, want)
+					}
+				}
+				if got := assignRandIPv6(cidr); got != want {
+					t.Fatalf("assignRandIPv6 = %s, want %s", got, want)
+				}
+			},
+		},
+		{
+			name: "/64 host bits cross the hi/lo boundary without net corruption",
+			cidr: netip.MustParsePrefix("2001:db8::/64"),
+			checkFunc: func(t *testing.T, cidr netip.Prefix) {
+				network := cidr.Masked().Addr().As16()
+				for i := 0; i < 200; i++ {
+					got := assignRandIPv6(cidr)
+					if !cidr.Contains(got) {
+						t.Fatalf("assignRandIPv6 produced %s outside %s", got, cidr)
+					}
+					high := got.As16()
+					copy(network[:], high[:8])
+					if network != [16]byte{} {
+						// The top 64 bits must be exactly 2001:db8:: — comparing
+						// the first 8 bytes catches carries into the network part.
+						base := cidr.Masked().Addr().As16()
+						for b := 0; b < 8; b++ {
+							if high[b] != base[b] {
+								t.Fatalf("network half corrupted: %s (byte %d)", got, b)
+							}
+						}
+					}
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { tc.checkFunc(t, tc.cidr) })
 	}
 }

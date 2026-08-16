@@ -460,6 +460,7 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 	}
 	defer proxy.Close()
 	go func() { _ = proxy.Start() }()
+	proxy.acceptor.udp.startBalanceTracking()
 
 	associations := make([]udpStressAssociation, associationCount)
 	for index := range associationCount {
@@ -524,6 +525,22 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 	close(errorsCh)
 	for err := range errorsCh {
 		t.Error(err)
+	}
+
+	// Pool lifecycle invariant: once every association is torn down and the
+	// workers joined, every acquired buffer must have been released.
+	for _, association := range associations {
+		association.client.Close()
+		association.control.Close()
+	}
+	_ = proxy.Close()
+	runtime := proxy.acceptor.udp
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.metrics.activeAssociations.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got, put := runtime.bufferBalance(); got != put {
+		t.Errorf("buffer pool imbalance: acquired %d, released %d (leak of %d buffers)", got, put, got-put)
 	}
 }
 

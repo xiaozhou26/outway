@@ -223,3 +223,82 @@ func BenchmarkDNSCacheSingleflight(b *testing.B) {
 		}
 	})
 }
+
+func TestDNSCacheStatsCounters(t *testing.T) {
+	cache := newDNSCache(time.Minute, time.Minute, 16, 16, func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+	})
+	stats := cache.Stats()
+	if stats != (DNSCacheStatsSnapshot{}) {
+		t.Fatalf("fresh cache has non-zero stats: %+v", stats)
+	}
+
+	// A lookup on an absent host is a miss; the second one is a hit.
+	if _, err := cache.Lookup(context.Background(), "stats.example"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.LookupCached("stats.example"); !ok {
+		t.Fatal("expected cached hit after resolution")
+	}
+	stats = cache.Stats()
+	if stats.Misses != 1 || stats.Hits != 1 {
+		t.Fatalf("after one resolve + one hit: %+v", stats)
+	}
+	if stats.HitRate() != 0.5 {
+		t.Fatalf("hit rate = %f, want 0.5", stats.HitRate())
+	}
+}
+
+func TestDNSCacheStatsNegativeHits(t *testing.T) {
+	cache := newDNSCache(time.Minute, time.Minute, 16, 16, func(context.Context, string) ([]netip.Addr, error) {
+		return nil, fmt.Errorf("NXDOMAIN")
+	})
+	if _, err := cache.Lookup(context.Background(), "negative.example"); err == nil {
+		t.Fatal("expected resolution error")
+	}
+	// The failure is cached; a fresh Lookup must be served as a negative hit.
+	if _, err := cache.Lookup(context.Background(), "negative.example"); err == nil {
+		t.Fatal("expected cached error")
+	}
+	stats := cache.Stats()
+	if stats.Misses != 1 || stats.NegativeHits != 1 {
+		t.Fatalf("negative caching counters: %+v", stats)
+	}
+}
+
+func TestDNSCacheStatsCapacityDrops(t *testing.T) {
+	// maxEntries 16 across 16 shards = one entry per shard; two hosts sharing
+	// a shard force an arbitrary (capacity) eviction on the second insert.
+	cache := newDNSCache(time.Minute, time.Minute, 16, 16, func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.2")}, nil
+	})
+	first := "cap-0.example"
+	shard := shardIndexOf(first)
+	second := ""
+	for i := 1; ; i++ {
+		if candidate := fmt.Sprintf("cap-%d.example", i); shardIndexOf(candidate) == shard {
+			second = candidate
+			break
+		}
+	}
+	if _, err := cache.Lookup(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Lookup(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	stats := cache.Stats()
+	if stats.CapacityDrops != 1 {
+		t.Fatalf("capacity drops = %d, want 1 (stats: %+v)", stats.CapacityDrops, stats)
+	}
+	// The arbitrarily evicted host is gone; the newest one survives.
+	survived := 0
+	for _, host := range []string{first, second} {
+		if _, ok := cache.LookupCached(host); ok {
+			survived++
+		}
+	}
+	if survived != 1 {
+		t.Fatalf("expected exactly one survivor after capacity eviction, got %d", survived)
+	}
+}

@@ -1,7 +1,9 @@
 package serverbase
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"runtime"
@@ -286,6 +288,115 @@ func TestLifetimeShardsCancelWithParent(t *testing.T) {
 		case <-shards.shards[i].Done():
 		case <-time.After(time.Second):
 			t.Fatalf("shard %d not cancelled after parent cancel", i)
+		}
+	}
+}
+
+// TestCopyBidirectionalHalfCloseFlushesRemainingData pins half-close
+// semantics: data written before CloseWrite must still reach the peer, and the
+// copy must end within the grace once the remaining direction goes idle.
+func TestCopyBidirectionalHalfCloseFlushesRemainingData(t *testing.T) {
+	client, proxyClient := tcpConnPair(t)
+	proxyRemote, remote := tcpConnPair(t)
+	defer client.Close()
+	defer remote.Close()
+	defer proxyClient.Close()
+	defer proxyRemote.Close()
+
+	payload := bytes.Repeat([]byte("flush!"), 1000)
+	go func() {
+		if _, err := client.Write(payload); err != nil {
+			t.Errorf("client write: %v", err)
+		}
+		_ = client.CloseWrite()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = CopyBidirectionalContext(context.Background(), proxyClient, proxyRemote, 50*time.Millisecond)
+		close(done)
+	}()
+
+	got := make([]byte, len(payload))
+	_ = remote.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(remote, got); err != nil {
+		t.Fatalf("peer did not receive flushed data: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("flushed payload mismatch: %d bytes received", len(got))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("copy did not end after half-close grace")
+	}
+}
+
+// TestCopyBidirectionalDeadlineInterrupt verifies a deadline in the past
+// interrupts both blocked directions and the copy returns promptly instead of
+// hanging forever.
+func TestCopyBidirectionalDeadlineInterrupt(t *testing.T) {
+	client, proxyClient := tcpConnPair(t)
+	proxyRemote, remote := tcpConnPair(t)
+	defer client.Close()
+	defer remote.Close()
+
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = CopyBidirectionalContext(context.Background(), proxyClient, proxyRemote, time.Minute)
+		close(done)
+	}()
+
+	// Both directions are blocked (no data, no EOF). A deadline in the past on
+	// the inner conns must unblock them without cancellation or close.
+	past := time.Now().Add(-time.Second)
+	_ = proxyClient.SetDeadline(past)
+	_ = proxyRemote.SetDeadline(past)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("copy ignored expired deadlines and stayed blocked")
+	}
+}
+
+// TestLifetimeShardsConcurrentDerivation hammers For() from many goroutines
+// and asserts the parent cancellation reaches every derived context.
+func TestLifetimeShardsConcurrentDerivation(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	shards := NewLifetimeShards(parent)
+
+	const goroutines = 32
+	const iterations = 500
+	children := make([]context.Context, 0, goroutines*iterations)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				c := &recordConn{}
+				child := shards.For(c)
+				mu.Lock()
+				children = append(children, child)
+				mu.Unlock()
+				if err := child.Err(); err != nil {
+					t.Errorf("derived context already cancelled before parent cancel")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	cancel()
+	for i, child := range children {
+		select {
+		case <-child.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("derived context %d not cancelled after parent cancel", i)
 		}
 	}
 }

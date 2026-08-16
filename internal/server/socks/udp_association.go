@@ -94,7 +94,7 @@ func (a *udpAssociation) setup(address proto.Address) error {
 		return err
 	}
 
-	preferred, fallback, err := a.connector.CreateSocketDualStack()
+	preferred, fallback, err := a.connector.CreateSocketDualStack(a.ctx)
 	if err != nil {
 		_ = inbound.Close()
 		_ = a.client.Close()

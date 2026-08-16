@@ -34,6 +34,13 @@ type udpRuntime struct {
 	config           config.UDPConfig
 	pool             sync.Pool
 	metrics          udpMetrics
+	// Buffer balance tracking (audit/test aid, off by default): counts every
+	// pool acquire/release so a fully drained runtime must show acquired ==
+	// released — the one-buffer-per-datagram lifecycle invariant. When off the
+	// cost is one read-mostly branch per buffer op.
+	trackBalance atomic.Bool
+	buffersGot   atomic.Int64
+	buffersPut   atomic.Int64
 	startOnce        sync.Once
 	shards           atomic.Pointer[[]chan udpSendJob]
 	sequence         atomic.Uint64
@@ -154,8 +161,27 @@ func normalizeUDPConfig(cfg config.UDPConfig) config.UDPConfig {
 	return cfg
 }
 
-func (r *udpRuntime) getBuffer() []byte    { return r.pool.Get().([]byte) }
-func (r *udpRuntime) putBuffer(buf []byte) { r.pool.Put(buf) }
+func (r *udpRuntime) getBuffer() []byte {
+	if r.trackBalance.Load() {
+		r.buffersGot.Add(1)
+	}
+	return r.pool.Get().([]byte)
+}
+
+func (r *udpRuntime) putBuffer(buf []byte) {
+	if r.trackBalance.Load() {
+		r.buffersPut.Add(1)
+	}
+	r.pool.Put(buf)
+}
+
+// startBalanceTracking enables the pool acquire/release counters.
+func (r *udpRuntime) startBalanceTracking() { r.trackBalance.Store(true) }
+
+// bufferBalance reports the tracked acquire and release counts.
+func (r *udpRuntime) bufferBalance() (acquired, released int64) {
+	return r.buffersGot.Load(), r.buffersPut.Load()
+}
 
 func (r *udpRuntime) tryAcquireBatchBuffer() bool {
 	if r.batchSlots == nil {

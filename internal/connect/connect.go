@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,10 +48,18 @@ type Connector struct {
 	TCPUserTimeout *time.Duration // Linux only
 	ReuseAddr      *bool
 	dialSlots      chan struct{}
+	// udpDialSlots bounds concurrent outbound UDP socket creations with the
+	// same budget and semantics as dialSlots (0 = unbounded), so association
+	// or tunnel bursts cannot exhaust fds without backpressure.
+	udpDialSlots chan struct{}
+	// udpCreating is the in-flight UDP-creation gauge exposed for tests and
+	// debugging; it reports the semaphore's occupancy, not a lock.
+	udpCreating atomic.Int32
 }
 
 // New creates a Connector from boot configuration. maxPendingDials caps
-// concurrent outbound TCP dials; zero or negative leaves dialing unbounded.
+// concurrent outbound TCP dials and UDP socket creations (0 leaves both
+// unbounded).
 func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connectTimeoutSec uint64, tcpUserTimeout *uint64, reuseaddr *bool, maxPendingDials int) *Connector {
 	c := &Connector{
 		CIDR:           cidr,
@@ -61,12 +70,32 @@ func New(cidr *netip.Prefix, cidrRange *uint8, fallback *config.Fallback, connec
 	}
 	if maxPendingDials > 0 {
 		c.dialSlots = make(chan struct{}, maxPendingDials)
+		c.udpDialSlots = make(chan struct{}, maxPendingDials)
 	}
 	if tcpUserTimeout != nil {
 		d := time.Duration(*tcpUserTimeout) * time.Second
 		c.TCPUserTimeout = &d
 	}
 	return c
+}
+
+// acquireSlot blocks until a slot in the given semaphore frees up or ctx ends.
+func (c *Connector) acquireSlot(slots chan struct{}, ctx context.Context) error {
+	if slots == nil {
+		return nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Connector) releaseSlot(slots chan struct{}) {
+	if slots != nil {
+		<-slots
+	}
 }
 
 // TCP returns a TCP connector bound to the given extension. The connector is
@@ -227,14 +256,10 @@ func (t TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (*
 // dialContext builds a net.Dialer with the configured source address and socket
 // options, then dials the target.
 func (t TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindInterface string, target netip.AddrPort) (*net.TCPConn, error) {
-	if t.inner.dialSlots != nil {
-		select {
-		case t.inner.dialSlots <- struct{}{}:
-			defer func() { <-t.inner.dialSlots }()
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	if err := t.inner.acquireSlot(t.inner.dialSlots, ctx); err != nil {
+		return nil, err
 	}
+	defer t.inner.releaseSlot(t.inner.dialSlots)
 
 	dialer := &net.Dialer{
 		Timeout:   t.inner.ConnectTimeout,
@@ -380,8 +405,16 @@ type UdpConnector struct {
 }
 
 // CreateSocketDualStack creates one or two UDP sockets for dual-stack outbound
-// traffic depending on the CIDR/fallback configuration.
-func (u UdpConnector) CreateSocketDualStack() (*net.UDPConn, *net.UDPConn, error) {
+// traffic depending on the CIDR/fallback configuration. Socket creation is
+// bounded by the UDP dial budget; ctx ends the wait for a slot.
+func (u UdpConnector) CreateSocketDualStack(ctx context.Context) (*net.UDPConn, *net.UDPConn, error) {
+	if err := u.inner.acquireSlot(u.inner.udpDialSlots, ctx); err != nil {
+		return nil, nil, err
+	}
+	defer u.inner.releaseSlot(u.inner.udpDialSlots)
+	u.inner.udpCreating.Add(1)
+	defer u.inner.udpCreating.Add(-1)
+
 	cidr := u.inner.CIDR
 	fb := u.inner.Fallback
 
@@ -438,6 +471,13 @@ func (u UdpConnector) createSocketWithCIDR(cidr netip.Prefix) (*net.UDPConn, err
 func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, u.inner.ConnectTimeout)
 	defer cancel()
+
+	if err := u.inner.acquireSlot(u.inner.udpDialSlots, ctx); err != nil {
+		return nil, err
+	}
+	defer u.inner.releaseSlot(u.inner.udpDialSlots)
+	u.inner.udpCreating.Add(1)
+	defer u.inner.udpCreating.Add(-1)
 
 	var addrs []netip.AddrPort
 	if target.Addr != nil {

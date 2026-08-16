@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,12 +38,26 @@ type dnsLookupCall struct {
 
 // dnsCacheShard holds one lock over a subset of cache entries. It also owns a
 // share of the resolver-concurrency budget so a miss storm on one shard cannot
-// starve or serialize lookups on the others.
+// starve or serialize lookups on the others, and its own hit/miss counters so
+// statistics never reintroduce a cross-shard shared cache line.
 type dnsCacheShard struct {
 	mu          sync.RWMutex
 	entries     map[string]dnsCacheEntry
 	inflight    map[string]*dnsLookupCall
 	lookupSlots chan struct{}
+	stats       dnsShardStats
+}
+
+// dnsShardStats counts lookups and evictions for one shard. Counters live
+// inside the shard (aggregated on read) instead of on the cache: a single
+// shared counter would ping-pong one cache line across all 16 shards on every
+// lookup, undoing the sharding.
+type dnsShardStats struct {
+	hits          atomic.Uint64 // positive entries served without resolution
+	negativeHits  atomic.Uint64 // cached failures served without resolution
+	misses        atomic.Uint64 // lookups that had to resolve (or defer)
+	expiredDrops  atomic.Uint64 // entries removed by the expiry sweep
+	capacityDrops atomic.Uint64 // arbitrary keys dropped because the shard was full
 }
 
 // dnsCache is a bounded TTL cache that also merges concurrent lookups for the
@@ -121,11 +136,14 @@ func (c *dnsCache) LookupCached(host string) ([]netip.Addr, bool) {
 	now := time.Now()
 	shard := c.shardFor(key)
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
 	entry, ok := shard.entries[key]
 	if !ok || entry.err != nil || len(entry.addrs) == 0 || !now.Before(entry.expiresAt) {
+		shard.mu.RUnlock()
+		shard.stats.misses.Add(1)
 		return nil, false
 	}
+	shard.mu.RUnlock()
+	shard.stats.hits.Add(1)
 	return entry.addrs, true
 }
 
@@ -141,9 +159,15 @@ func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error
 	shard.mu.RLock()
 	if entry, ok := shard.entries[key]; ok && now.Before(entry.expiresAt) {
 		shard.mu.RUnlock()
+		if entry.err != nil {
+			shard.stats.negativeHits.Add(1)
+		} else {
+			shard.stats.hits.Add(1)
+		}
 		return entry.addrs, entry.err
 	}
 	shard.mu.RUnlock()
+	shard.stats.misses.Add(1)
 
 	shard.mu.Lock()
 	// Re-check under the write lock: another goroutine may have resolved this
@@ -151,6 +175,11 @@ func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error
 	if entry, ok := shard.entries[key]; ok {
 		if now.Before(entry.expiresAt) {
 			shard.mu.Unlock()
+			if entry.err != nil {
+				shard.stats.negativeHits.Add(1)
+			} else {
+				shard.stats.hits.Add(1)
+			}
 			return entry.addrs, entry.err
 		}
 		delete(shard.entries, key)
@@ -213,6 +242,7 @@ func (c *dnsCache) evictLocked(shard *dnsCacheShard, now time.Time) {
 	for key, entry := range shard.entries {
 		if !now.Before(entry.expiresAt) {
 			delete(shard.entries, key)
+			shard.stats.expiredDrops.Add(1)
 		}
 	}
 	if len(shard.entries) < perShardMax {
@@ -222,8 +252,48 @@ func (c *dnsCache) evictLocked(shard *dnsCacheShard, now time.Time) {
 	// arbitrary eviction is sufficient here and avoids a global LRU hot lock.
 	for key := range shard.entries {
 		delete(shard.entries, key)
+		shard.stats.capacityDrops.Add(1)
 		break
 	}
+}
+
+// DNSCacheStatsSnapshot aggregates the process-wide DNS cache counters at a
+// point in time.
+type DNSCacheStatsSnapshot struct {
+	Hits          uint64
+	NegativeHits  uint64
+	Misses        uint64
+	ExpiredDrops  uint64
+	CapacityDrops uint64
+}
+
+// HitRate returns the fraction of lookups served without resolution, negative
+// cache entries included.
+func (s DNSCacheStatsSnapshot) HitRate() float64 {
+	total := s.Hits + s.NegativeHits + s.Misses
+	if total == 0 {
+		return 0
+	}
+	return float64(s.Hits+s.NegativeHits) / float64(total)
+}
+
+func (c *dnsCache) Stats() DNSCacheStatsSnapshot {
+	var snapshot DNSCacheStatsSnapshot
+	for i := range c.shards {
+		snapshot.Hits += c.shards[i].stats.hits.Load()
+		snapshot.NegativeHits += c.shards[i].stats.negativeHits.Load()
+		snapshot.Misses += c.shards[i].stats.misses.Load()
+		snapshot.ExpiredDrops += c.shards[i].stats.expiredDrops.Load()
+		snapshot.CapacityDrops += c.shards[i].stats.capacityDrops.Load()
+	}
+	return snapshot
+}
+
+// DNSCacheStats returns the process-wide DNS cache counters. Counting is
+// per-shard, so reading aggregates 16 counter sets but adds no hot-path
+// synchronization.
+func DNSCacheStats() DNSCacheStatsSnapshot {
+	return defaultDNSCache.Stats()
 }
 
 func normalizeDNSName(host string) string {

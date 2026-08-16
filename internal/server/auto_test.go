@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -174,5 +175,128 @@ func closeConnections(connections []net.Conn) {
 		if conn != nil {
 			_ = conn.Close()
 		}
+	}
+}
+
+// newAutoTestServer starts an auto-detect server with no auth on a random
+// loopback port.
+func newAutoTestServer(t *testing.T) *AutoDetectServer {
+	t.Helper()
+	proxy, err := NewAutoDetectServer(Context{
+		Bind:           netip.MustParseAddrPort("127.0.0.1:0"),
+		Concurrent:     16,
+		ConnectTimeout: 5,
+		Connector:      connect.New(nil, nil, nil, 5, nil, nil, 0),
+	}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = proxy.Start() }()
+	t.Cleanup(func() { _ = proxy.Close() })
+	return proxy
+}
+
+// TestAutoDetectDispatchesSOCKS5 pins the 0x05 branch: the SOCKS5 greeting
+// survives the peek and the method negotiation reply comes back.
+func TestAutoDetectDispatchesSOCKS5(t *testing.T) {
+	proxy := newAutoTestServer(t)
+	conn, err := net.DialTimeout("tcp4", proxy.listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 2)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[0] != 0x05 || reply[1] != 0x00 {
+		t.Fatalf("SOCKS5 method reply = %x, want 05 00", reply)
+	}
+}
+
+// TestAutoDetectDispatchesHTTP pins the >= 0x41 branch: an ASCII request line
+// reaches the HTTP proxy handler (a target-less CONNECT yields a 400).
+func TestAutoDetectDispatchesHTTP(t *testing.T) {
+	proxy := newAutoTestServer(t)
+	conn, err := net.DialTimeout("tcp4", proxy.listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	request := "CONNECT x HTTP/1.1\r\nHost: x\r\n\r\n"
+	if _, err := fmt.Fprint(conn, request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed CONNECT status = %d, want 400", response.StatusCode)
+	}
+}
+
+// TestAutoDetectDispatchesHTTPS pins the < 0x41 branch: a TLS ClientHello
+// (first byte 0x16) is routed to the TLS path and an HTTP/1.1 request over the
+// handshake reaches the proxy handler.
+func TestAutoDetectDispatchesHTTPS(t *testing.T) {
+	proxy := newAutoTestServer(t)
+	raw, err := net.DialTimeout("tcp4", proxy.listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	tlsConn := tls.Client(raw, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+	defer tlsConn.Close()
+	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fmt.Fprint(tlsConn, "CONNECT x HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(tlsConn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("TLS-routed malformed CONNECT status = %d, want 400", response.StatusCode)
+	}
+}
+
+// TestBufferedConnPreservesPeekedBytes guards the dispatch wrapper: every byte
+// the bufio.Reader buffered during the peek must come back in order from Read.
+func TestBufferedConnPreservesPeekedBytes(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	payload := []byte{0x05, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+	go func() {
+		_, _ = client.Write(payload)
+	}()
+
+	br := bufio.NewReader(server)
+	if _, err := br.Peek(1); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &bufferedConn{Conn: server, br: br}
+	got := make([]byte, len(payload))
+	_ = wrapped.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(wrapped, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("read = %x, want %x — the peeked byte was lost", got, payload)
 	}
 }

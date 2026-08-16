@@ -295,22 +295,46 @@ func (w *linuxUDPBatchWriter) Write(packets []udpWritePacket) (int, error) {
 	if len(packets) == 0 {
 		return 0, nil
 	}
-	if w.v4 != nil {
-		messages := w.kit.v4msgs[:len(packets)]
-		for i, packet := range packets {
-			messages[i].Buffers[0] = packet.buffer
-			setUDPAddr(w.kit.addrs[i], packet.addr)
-			messages[i].Addr = w.kit.addrs[i]
+	// Callers do not bound their batch to the kit size: a GRO read can split
+	// into more segments than BatchSize, so chunk by the kit's capacity rather
+	// than assuming len(packets) fits.
+	total := 0
+	for len(packets) > 0 {
+		n := len(packets)
+		if w.v4 != nil {
+			if n > len(w.kit.v4msgs) {
+				n = len(w.kit.v4msgs)
+			}
+			messages := w.kit.v4msgs[:n]
+			for i, packet := range packets[:n] {
+				messages[i].Buffers[0] = packet.buffer
+				setUDPAddr(w.kit.addrs[i], packet.addr)
+				messages[i].Addr = w.kit.addrs[i]
+			}
+			written, err := writeIPv4Messages(w.v4, messages)
+			total += written
+			if err != nil {
+				return total, err
+			}
+		} else {
+			if n > len(w.kit.v6msgs) {
+				n = len(w.kit.v6msgs)
+			}
+			messages := w.kit.v6msgs[:n]
+			for i, packet := range packets[:n] {
+				messages[i].Buffers[0] = packet.buffer
+				setUDPAddr(w.kit.addrs[i], packet.addr)
+				messages[i].Addr = w.kit.addrs[i]
+			}
+			written, err := writeIPv6Messages(w.v6, messages)
+			total += written
+			if err != nil {
+				return total, err
+			}
 		}
-		return writeIPv4Messages(w.v4, messages)
+		packets = packets[n:]
 	}
-	messages := w.kit.v6msgs[:len(packets)]
-	for i, packet := range packets {
-		messages[i].Buffers[0] = packet.buffer
-		setUDPAddr(w.kit.addrs[i], packet.addr)
-		messages[i].Addr = w.kit.addrs[i]
-	}
-	return writeIPv6Messages(w.v6, messages)
+	return total, nil
 }
 
 func writeIPv4Messages(conn *ipv4.PacketConn, messages []ipv4.Message) (int, error) {

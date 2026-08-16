@@ -97,6 +97,11 @@ func Run(args config.BootArgs) error {
 		return err
 	}
 
+	// DNS cache hit-rate counters surface at debug level on a ticker; when
+	// debug logging is off the loop costs one tick every 30s.
+	stopDNSStats := startDNSStatsLogger(30 * time.Second)
+	defer stopDNSStats()
+
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -120,6 +125,37 @@ func Run(args config.BootArgs) error {
 			return errors.Join(closeErr, errors.New("server did not stop before shutdown timeout"))
 		}
 	}
+}
+
+
+// startDNSStatsLogger periodically logs the process-wide DNS cache counters at
+// debug level. It returns a stop function.
+func startDNSStatsLogger(interval time.Duration) (stop func()) {
+	ticker := time.NewTicker(interval)
+	done := make(chan struct{})
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !serverbase.DebugEnabled() {
+					continue
+				}
+				stats := connect.DNSCacheStats()
+				slog.Debug("DNS cache stats",
+					"hits", stats.Hits,
+					"negative_hits", stats.NegativeHits,
+					"misses", stats.Misses,
+					"hit_rate", fmt.Sprintf("%.3f", stats.HitRate()),
+					"expired_drops", stats.ExpiredDrops,
+					"capacity_drops", stats.CapacityDrops,
+				)
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 type proxyServer interface {
