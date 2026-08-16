@@ -94,3 +94,32 @@ func TestBootArgsValidateCIDRRange(t *testing.T) {
 		t.Fatalf("expected valid CIDR range: %v", err)
 	}
 }
+
+func TestDiagnosticsDisabledByDefault(t *testing.T) {
+	args := DefaultBootArgs()
+	if args.Diagnostics != nil {
+		t.Fatalf("diagnostics should be disabled by default: %v", args.Diagnostics)
+	}
+}
+
+func TestBootArgsValidateRejectsWildcardDiagnostics(t *testing.T) {
+	for _, endpoint := range []string{"0.0.0.0:6060", "[::]:6060"} {
+		t.Run(endpoint, func(t *testing.T) {
+			bind := netip.MustParseAddrPort(endpoint)
+			args := DefaultBootArgs()
+			args.Diagnostics = &bind
+			if err := args.Validate(); err == nil {
+				t.Fatal("expected wildcard diagnostics address to be rejected")
+			}
+		})
+	}
+}
+
+func TestBootArgsValidateAcceptsLoopbackDiagnostics(t *testing.T) {
+	bind := netip.MustParseAddrPort("127.0.0.1:6060")
+	args := DefaultBootArgs()
+	args.Diagnostics = &bind
+	if err := args.Validate(); err != nil {
+		t.Fatalf("expected loopback diagnostics address to validate: %v", err)
+	}
+}

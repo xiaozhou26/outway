@@ -30,17 +30,42 @@ type udpMetrics struct {
 	groTruncatedReads  atomic.Uint64
 }
 
+// UDPStatsSnapshot is a point-in-time view of the SOCKS5 UDP relay counters.
+// Reading it performs only atomic loads and an on-demand queue-depth sum.
+type UDPStatsSnapshot struct {
+	ActiveAssociations int64
+	TotalAssociations  uint64
+	InPackets          uint64
+	InBytes            uint64
+	OutPackets         uint64
+	OutBytes           uint64
+	QueueDrops         uint64
+	QueueDepth         int
+	QueueCapacity      int
+	TruncatedDrops     uint64
+	MalformedDrops     uint64
+	FragmentDrops      uint64
+	UnauthorizedDrops  uint64
+	AssociationDrops   uint64
+	BatchFallbacks     uint64
+	GROCoalescedReads  uint64
+	GROTruncatedReads  uint64
+	BatchBuffersInUse  int
+	BatchBufferBudget  int
+	Errors             uint64
+}
+
 type udpRuntime struct {
-	config           config.UDPConfig
-	pool             sync.Pool
-	metrics          udpMetrics
+	config  config.UDPConfig
+	pool    sync.Pool
+	metrics udpMetrics
 	// Buffer balance tracking (audit/test aid, off by default): counts every
 	// pool acquire/release so a fully drained runtime must show acquired ==
 	// released — the one-buffer-per-datagram lifecycle invariant. When off the
 	// cost is one read-mostly branch per buffer op.
-	trackBalance atomic.Bool
-	buffersGot   atomic.Int64
-	buffersPut   atomic.Int64
+	trackBalance     atomic.Bool
+	buffersGot       atomic.Int64
+	buffersPut       atomic.Int64
 	startOnce        sync.Once
 	shards           atomic.Pointer[[]chan udpSendJob]
 	sequence         atomic.Uint64
@@ -267,6 +292,31 @@ func (r *udpRuntime) queuedJobs() int {
 		queued += len(shard)
 	}
 	return queued
+}
+
+func (r *udpRuntime) statsSnapshot() UDPStatsSnapshot {
+	return UDPStatsSnapshot{
+		ActiveAssociations: r.metrics.activeAssociations.Load(),
+		TotalAssociations:  r.metrics.totalAssociations.Load(),
+		InPackets:          r.metrics.inPackets.Load(),
+		InBytes:            r.metrics.inBytes.Load(),
+		OutPackets:         r.metrics.outPackets.Load(),
+		OutBytes:           r.metrics.outBytes.Load(),
+		QueueDrops:         r.metrics.queueDrops.Load(),
+		QueueDepth:         r.queuedJobs(),
+		QueueCapacity:      r.config.SendQueueSize,
+		TruncatedDrops:     r.metrics.truncatedDrops.Load(),
+		MalformedDrops:     r.metrics.malformedDrops.Load(),
+		FragmentDrops:      r.metrics.fragmentDrops.Load(),
+		UnauthorizedDrops:  r.metrics.unauthorizedDrops.Load(),
+		AssociationDrops:   r.metrics.associationDrops.Load(),
+		BatchFallbacks:     r.metrics.batchFallbacks.Load(),
+		GROCoalescedReads:  r.metrics.groCoalescedReads.Load(),
+		GROTruncatedReads:  r.metrics.groTruncatedReads.Load(),
+		BatchBuffersInUse:  len(r.batchSlots),
+		BatchBufferBudget:  cap(r.batchSlots),
+		Errors:             r.metrics.errors.Load(),
+	}
 }
 
 func (r *udpRuntime) startDispatcher() {

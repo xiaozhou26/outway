@@ -1,4 +1,4 @@
-﻿// Package http implements the HTTP/HTTPS proxy server, including Basic auth,
+// Package http implements the HTTP/HTTPS proxy server, including Basic auth,
 // self-signed certificate generation, TLS configuration, CONNECT tunneling,
 // and HTTP request forwarding.
 package http
@@ -16,7 +16,7 @@ import (
 
 // Authenticator unifies the available HTTP proxy authentication methods.
 type Authenticator struct {
-	mode          serverbase.AuthMode
+	mode serverbase.AuthMode
 	// expectedToken is the full "Basic <credentials>" header for the plain
 	// username:password pair, prerendered so the common no-extension request
 	// authenticates with a single constant-time comparison and no base64 work.

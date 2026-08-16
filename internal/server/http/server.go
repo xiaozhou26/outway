@@ -68,7 +68,7 @@ type responseKey struct {
 }
 
 var prerenderedResponses = map[responseKey][]byte{
-	{http.StatusProxyAuthRequired, ""}:                            renderResponse(http.StatusProxyAuthRequired, ""),
+	{http.StatusProxyAuthRequired, ""}:                             renderResponse(http.StatusProxyAuthRequired, ""),
 	{http.StatusForbidden, ""}:                                     renderResponse(http.StatusForbidden, ""),
 	{http.StatusInternalServerError, ""}:                           renderResponse(http.StatusInternalServerError, ""),
 	{http.StatusBadGateway, ""}:                                    renderResponse(http.StatusBadGateway, ""),
@@ -174,7 +174,9 @@ func (s *HttpServer) Start() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			_ = s.acceptLoop(listener)
+			if err := s.acceptLoop(listener); err != nil && !serverbase.IsConnClosed(err) {
+				slog.Error("HTTP accept shard stopped", "error", err)
+			}
 		}()
 	}
 	// The main accept loop holds a WaitGroup slot too, so handler goroutines can
@@ -349,8 +351,9 @@ func (h Handler) forwardRequest(ctx context.Context, req *http.Request, extensio
 		outURL.Scheme = "http"
 	}
 
-	// Strip hop-by-hop headers.
-	outReq := req.Clone(ctx)
+	// Strip hop-by-hop headers. The request is not reused after forwarding, so
+	// a shallow context copy avoids cloning the entire header map.
+	outReq := req.WithContext(ctx)
 	outReq.URL = &outURL
 	outReq.RequestURI = ""
 	removeHopHeaders(outReq.Header)

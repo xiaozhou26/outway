@@ -97,6 +97,15 @@ func Run(args config.BootArgs) error {
 		return err
 	}
 
+	services := []namedService{{name: "proxy", server: srv}}
+	if args.Diagnostics != nil {
+		diagnostics, err := newDiagnosticsServer(*args.Diagnostics, srv)
+		if err != nil {
+			return errors.Join(err, srv.Close())
+		}
+		services = append(services, namedService{name: "diagnostics", server: diagnostics})
+	}
+
 	// DNS cache hit-rate counters surface at debug level on a ticker; when
 	// debug logging is off the loop costs one tick every 30s.
 	stopDNSStats := startDNSStatsLogger(30 * time.Second)
@@ -107,26 +116,19 @@ func Run(args config.BootArgs) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.Start()
-	}()
-
+	results := startServices(services)
 	select {
-	case err := <-errCh:
-		return err
+	case result := <-results:
+		closeErr := closeServices(services)
+		serveErr := errors.Join(serviceResultError(result), waitServiceResults(results, len(services)-1))
+		return errors.Join(serveErr, closeErr)
 	case sig := <-sigCh:
 		slog.Info(fmt.Sprintf("Shutdown signal received (%v), shutting down gracefully...", sig))
-		closeErr := srv.Close()
-		select {
-		case serveErr := <-errCh:
-			return errors.Join(closeErr, serveErr)
-		case <-time.After(serverbase.DefaultShutdownWait):
-			return errors.Join(closeErr, errors.New("server did not stop before shutdown timeout"))
-		}
+		closeErr := closeServices(services)
+		serveErr := waitServiceResults(results, len(services))
+		return errors.Join(closeErr, serveErr)
 	}
 }
-
 
 // startDNSStatsLogger periodically logs the process-wide DNS cache counters at
 // debug level. It returns a stop function.
@@ -161,6 +163,62 @@ func startDNSStatsLogger(interval time.Duration) (stop func()) {
 type proxyServer interface {
 	Start() error
 	Close() error
+}
+
+type namedService struct {
+	name   string
+	server proxyServer
+}
+
+type serviceResult struct {
+	name string
+	err  error
+}
+
+func startServices(services []namedService) <-chan serviceResult {
+	results := make(chan serviceResult, len(services))
+	for _, service := range services {
+		service := service
+		go func() {
+			results <- serviceResult{name: service.name, err: service.server.Start()}
+		}()
+	}
+	return results
+}
+
+func closeServices(services []namedService) error {
+	var result error
+	for i := len(services) - 1; i >= 0; i-- {
+		if err := services[i].server.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("close %s server: %w", services[i].name, err))
+		}
+	}
+	return result
+}
+
+func waitServiceResults(results <-chan serviceResult, count int) error {
+	if count == 0 {
+		return nil
+	}
+	timer := time.NewTimer(serverbase.DefaultShutdownWait)
+	defer timer.Stop()
+	var result error
+	for range count {
+		select {
+		case service := <-results:
+			result = errors.Join(result, serviceResultError(service))
+		case <-timer.C:
+			return errors.Join(result, errors.New("servers did not stop before shutdown timeout"))
+		}
+	}
+	return result
+}
+
+func serviceResultError(result serviceResult) error {
+	if result.err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s server: %w", result.name, result.err)
 }
 
 // newProxyServer constructs the appropriate proxy server based on the proxy

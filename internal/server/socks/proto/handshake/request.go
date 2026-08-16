@@ -1,8 +1,8 @@
-﻿package handshake
+package handshake
 
 import (
-	"io"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto"
+	"io"
 )
 
 // Request is the SOCKS5 method-selection request.

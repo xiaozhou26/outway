@@ -3,10 +3,13 @@ package serverbase
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -398,5 +401,42 @@ func TestLifetimeShardsConcurrentDerivation(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("derived context %d not cancelled after parent cancel", i)
 		}
+	}
+}
+
+type scriptedAcceptListener struct {
+	calls atomic.Int32
+}
+
+func (l *scriptedAcceptListener) Accept() (net.Conn, error) {
+	if l.calls.Add(1) == 1 {
+		return nil, errors.New("injected accept failure")
+	}
+	return nil, net.ErrClosed
+}
+
+func (*scriptedAcceptListener) Close() error   { return nil }
+func (*scriptedAcceptListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestAcceptLoopLogsUnexpectedAcceptError(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var wg sync.WaitGroup
+	err := AcceptLoop(
+		&scriptedAcceptListener{},
+		&wg,
+		NewConnectionGate(1),
+		NewConnectionSet(),
+		func(net.Conn) {},
+	)
+	if err != nil {
+		t.Fatalf("AcceptLoop returned error: %v", err)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "level=ERROR") || !strings.Contains(output, "injected accept failure") {
+		t.Fatalf("unexpected accept error was not logged at error level: %q", output)
 	}
 }

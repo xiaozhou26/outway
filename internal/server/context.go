@@ -1,4 +1,4 @@
-﻿// Package server holds the shared server runtime: context, bidirectional IO,
+// Package server holds the shared server runtime: context, bidirectional IO,
 // and the run entry point.
 package server
 

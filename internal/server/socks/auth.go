@@ -1,4 +1,4 @@
-﻿package socks
+package socks
 
 import (
 	"crypto/subtle"

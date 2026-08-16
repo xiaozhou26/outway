@@ -2,17 +2,214 @@ package connect
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
-	"time"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/ext"
 )
+
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := listener.AcceptTCP()
+	if err != nil {
+		_ = client.Close()
+		t.Fatal(err)
+	}
+	return client, peer
+}
+
+func TestConnectAnyClosesLosingSuccessfulDial(t *testing.T) {
+	connector := New(nil, nil, nil, 2, nil, nil, 0)
+	firstClient, firstPeer := tcpPair(t)
+	secondClient, secondPeer := tcpPair(t)
+	defer func() { _ = firstPeer.Close() }()
+	defer func() { _ = secondPeer.Close() }()
+
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	connector.dialTCP = func(_ context.Context, _ netip.Addr, _ string, target netip.AddrPort) (*net.TCPConn, error) {
+		if target.Port() == 10001 {
+			close(firstStarted)
+			<-firstRelease
+			return firstClient, nil
+		}
+		return secondClient, nil
+	}
+
+	result := make(chan *net.TCPConn, 1)
+	go func() {
+		conn, err := connector.TCP(ext.None).connectAny(context.Background(), []netip.AddrPort{
+			netip.MustParseAddrPort("192.0.2.1:10001"),
+			netip.MustParseAddrPort("192.0.2.2:10002"),
+		})
+		if err != nil {
+			t.Errorf("connectAny() error = %v", err)
+			return
+		}
+		result <- conn
+	}()
+	<-firstStarted
+	var winner *net.TCPConn
+	select {
+	case winner = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connectAny did not return the fast winner")
+	}
+	if winner != secondClient {
+		t.Fatal("connectAny returned the wrong connection")
+	}
+	_ = winner.Close()
+	close(firstRelease)
+
+	_ = firstPeer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var one [1]byte
+	if _, err := firstPeer.Read(one[:]); err == nil {
+		t.Fatal("losing successful dial remained open")
+	}
+}
+
+func TestConnectWithCIDRFallbackStartsFallbackAfterPreferredFailure(t *testing.T) {
+	cidr := netip.MustParsePrefix("192.0.2.0/24")
+	fallback := config.Fallback{Address: netip.MustParseAddr("127.0.0.1")}
+	connector := New(&cidr, nil, &fallback, 2, nil, nil, 0)
+	client, peer := tcpPair(t)
+	defer func() { _ = peer.Close() }()
+	defer func() { _ = client.Close() }()
+	var binds []netip.Addr
+	connector.dialTCP = func(_ context.Context, bind netip.Addr, _ string, _ netip.AddrPort) (*net.TCPConn, error) {
+		binds = append(binds, bind)
+		if len(binds) == 1 {
+			return nil, errors.New("preferred path failed")
+		}
+		return client, nil
+	}
+
+	conn, err := connector.TCP(ext.None).connectWithCIDRFallback(
+		context.Background(),
+		netip.MustParseAddrPort("127.0.0.1:10003"),
+		cidr,
+		fallback,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn != client {
+		t.Fatal("fallback returned the wrong connection")
+	}
+	if len(binds) != 2 || binds[1] != fallback.Address || !binds[0].IsValid() {
+		t.Fatalf("dial bind sequence = %v, want CIDR then %s", binds, fallback.Address)
+	}
+}
+
+func TestConnectWithCIDRFallbackStartsFallbackAfterDelay(t *testing.T) {
+	cidr := netip.MustParsePrefix("192.0.2.0/24")
+	fallback := config.Fallback{Address: netip.MustParseAddr("127.0.0.1")}
+	connector := New(&cidr, nil, &fallback, 2, nil, nil, 0)
+	client, peer := tcpPair(t)
+	defer func() { _ = peer.Close() }()
+	defer func() { _ = client.Close() }()
+
+	preferredStarted := make(chan struct{})
+	fallbackStarted := make(chan time.Time, 1)
+	connector.dialTCP = func(ctx context.Context, bind netip.Addr, _ string, _ netip.AddrPort) (*net.TCPConn, error) {
+		if bind == fallback.Address {
+			fallbackStarted <- time.Now()
+			return client, nil
+		}
+		close(preferredStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	type connectResult struct {
+		conn *net.TCPConn
+		err  error
+	}
+	startedAt := time.Now()
+	result := make(chan connectResult, 1)
+	go func() {
+		conn, err := connector.TCP(ext.None).connectWithCIDRFallback(
+			context.Background(),
+			netip.MustParseAddrPort("127.0.0.1:10004"),
+			cidr,
+			fallback,
+		)
+		result <- connectResult{conn: conn, err: err}
+	}()
+
+	<-preferredStarted
+	select {
+	case <-fallbackStarted:
+		t.Fatal("fallback started before the preferred-path delay elapsed")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	select {
+	case fallbackAt := <-fallbackStarted:
+		if elapsed := fallbackAt.Sub(startedAt); elapsed < 400*time.Millisecond {
+			t.Fatalf("fallback started after %v, want approximately 500ms", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback did not start after the preferred-path delay")
+	}
+
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.conn != client {
+			t.Fatal("fallback returned the wrong connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connectWithCIDRFallback did not return the fallback connection")
+	}
+}
+
+func TestConnectRacePropagatesCancellation(t *testing.T) {
+	connector := New(nil, nil, nil, 2, nil, nil, 0)
+	started := make(chan struct{})
+	connector.dialTCP = func(ctx context.Context, _ netip.Addr, _ string, _ netip.AddrPort) (*net.TCPConn, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := connector.TCP(ext.None).connectAny(ctx, []netip.AddrPort{
+			netip.MustParseAddrPort("192.0.2.10:10010"),
+			netip.MustParseAddrPort("192.0.2.11:10011"),
+		})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("connectAny error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connectAny did not propagate cancellation")
+	}
+}
 
 func TestUDPConnectUsesSameFamilyFallbackWhenCIDRBindFails(t *testing.T) {
 	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})

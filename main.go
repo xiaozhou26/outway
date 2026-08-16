@@ -30,6 +30,7 @@ var (
 	flagReuseAddr              bool
 	flagMaxPendingDials        int
 	flagReusePort              bool
+	flagDiagnostics            string
 	flagUDPMaxPacketSize       int
 	flagUDPBatchSize           int
 	flagUDPBatchBufferBudget   int
@@ -168,6 +169,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.BoolVar(&flagReuseAddr, "reuseaddr", true, "Outbound SO_REUSEADDR for TCP sockets")
 	pf.IntVar(&flagMaxPendingDials, "max-pending-dials", config.DefaultMaxPendingDials, "Maximum concurrent outbound TCP dials (0: unlimited)")
 	pf.BoolVar(&flagReusePort, "reuse-port", false, "Shard the listener with SO_REUSEPORT across accept loops (Linux/BSD)")
+	pf.StringVar(&flagDiagnostics, "diagnostics", "", "Diagnostic HTTP bind address for metrics and pprof (empty: disabled)")
 	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
 	pf.IntVar(&flagUDPBatchSize, "udp-batch-size", config.DefaultUDPBatchSize, "UDP packets per receive/send batch (Linux uses recvmmsg/sendmmsg)")
 	pf.IntVar(&flagUDPBatchBufferBudget, "udp-batch-buffer-budget", config.DefaultUDPBatchBufferBudget, "Maximum extra pooled buffers held by concurrent Linux UDP batches (0: scalar reads)")
@@ -232,6 +234,14 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 				Password: flagPassword,
 			},
 		},
+	}
+
+	if flagDiagnostics != "" {
+		diagnostics, err := netip.ParseAddrPort(flagDiagnostics)
+		if err != nil {
+			return config.BootArgs{}, fmt.Errorf("invalid diagnostics address %q: %w", flagDiagnostics, err)
+		}
+		args.Diagnostics = &diagnostics
 	}
 
 	if flagCIDR != "" {

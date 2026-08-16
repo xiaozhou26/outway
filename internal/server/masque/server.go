@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	masquego "github.com/quic-go/masque-go"
@@ -41,11 +42,10 @@ type Server struct {
 	template *uritemplate.Template
 	limit    chan struct{}
 	close    sync.Once
+	auth     masqueAuthenticator
 
-	mu           sync.Mutex
-	closed       bool
-	tunnels      map[*tunnel]struct{}
-	tunnelsWG    sync.WaitGroup
+	closed       atomic.Bool
+	tunnels      *tunnelRegistry
 	datagramBufs sync.Pool
 }
 
@@ -68,7 +68,8 @@ func NewServer(ctx serverbase.Context, certFile, keyFile string) (*Server, error
 		ctx:      ctx,
 		template: template,
 		limit:    make(chan struct{}, ctx.Concurrent),
-		tunnels:  make(map[*tunnel]struct{}),
+		auth:     newMasqueAuthenticator(ctx.Auth),
+		tunnels:  newTunnelRegistry(),
 	}
 	s.datagramBufs.New = func() any {
 		// One extra byte lets an over-limit packet be detected and dropped
@@ -101,17 +102,11 @@ func (s *Server) Start() error {
 func (s *Server) Close() error {
 	var err error
 	s.close.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		tunnels := make([]*tunnel, 0, len(s.tunnels))
-		for t := range s.tunnels {
-			tunnels = append(tunnels, t)
-		}
-		s.mu.Unlock()
-		for _, t := range tunnels {
+		s.closed.Store(true)
+		for _, t := range s.tunnels.CloseAll() {
 			t.teardown()
 		}
-		s.tunnelsWG.Wait()
+		s.tunnels.Wait()
 		err = s.server.Close()
 	})
 	return err
@@ -120,13 +115,13 @@ func (s *Server) Close() error {
 // closedQuietly reports whether the server is shutting down, so pump errors
 // triggered by teardown are not logged.
 func (s *Server) closedQuietly() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
+	return s.closed.Load()
 }
 
 func (s *Server) getDatagramBuffer() []byte {
-	return s.datagramBufs.Get().([]byte)
+	buf := s.datagramBufs.Get().([]byte)
+	copy(buf, contextIDZero)
+	return buf
 }
 
 func (s *Server) putDatagramBuffer(buf []byte) {
@@ -138,7 +133,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CONNECT-UDP requests must not contain HTTP content fields", http.StatusBadRequest)
 		return
 	}
-	extension, ok := authenticate(r, s.ctx.Auth)
+	extension, ok := s.auth.authenticate(r)
 	if !ok {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="outway"`)
 		w.WriteHeader(http.StatusProxyAuthRequired)
@@ -228,33 +223,68 @@ func proxyErrorStatus(err error) int {
 	return http.StatusServiceUnavailable
 }
 
-func authenticate(r *http.Request, auth config.AuthMode) (ext.Extension, bool) {
+type masqueAuthenticator struct {
+	enabled       bool
+	username      string
+	usernameBytes []byte
+	passwordBytes []byte
+	expectedToken string
+}
+
+func newMasqueAuthenticator(auth config.AuthMode) masqueAuthenticator {
 	if !auth.HasAuth() {
+		return masqueAuthenticator{}
+	}
+	credentials := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
+	return masqueAuthenticator{
+		enabled:       true,
+		username:      auth.Username,
+		usernameBytes: []byte(auth.Username),
+		passwordBytes: []byte(auth.Password),
+		expectedToken: "Basic " + credentials,
+	}
+}
+
+func constantTimeStringEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func (a masqueAuthenticator) authenticate(r *http.Request) (ext.Extension, bool) {
+	if !a.enabled {
 		return ext.Extension{}, true
 	}
 	value := r.Header.Get("Proxy-Authorization")
-	// Decode the Basic credentials directly instead of cloning the request
-	// into an Authorization header for Request.BasicAuth; the scheme match
-	// and first-colon split mirror net/http's parseBasicAuth.
+	if constantTimeStringEqual(value, a.expectedToken) {
+		return ext.TryFrom(a.username, a.username), true
+	}
+
 	const prefix = "Basic "
 	if len(value) < len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
 		return ext.None, false
 	}
-	credentials, err := base64.StdEncoding.DecodeString(value[len(prefix):])
+	encoded := value[len(prefix):]
+	decodedLen := base64.StdEncoding.DecodedLen(len(encoded))
+	var stack [256]byte
+	credentials := stack[:min(decodedLen, len(stack))]
+	if decodedLen > len(stack) {
+		credentials = make([]byte, decodedLen)
+	}
+	n, err := base64.StdEncoding.Decode(credentials, []byte(encoded))
 	if err != nil {
 		return ext.None, false
 	}
+	credentials = credentials[:n]
 	idx := bytes.IndexByte(credentials, ':')
 	if idx < 0 {
 		return ext.None, false
 	}
-	username := string(credentials[:idx])
+	username := credentials[:idx]
 	password := credentials[idx+1:]
-	if !strings.HasPrefix(username, auth.Username) ||
-		subtle.ConstantTimeCompare(password, []byte(auth.Password)) != 1 {
+	if !bytes.HasPrefix(username, a.usernameBytes) ||
+		subtle.ConstantTimeCompare(password, a.passwordBytes) != 1 {
 		return ext.None, false
 	}
-	return ext.TryFrom(auth.Username, username), true
+	return ext.TryFrom(a.username, string(username)), true
 }
 
 func loadTLSCertificate(certFile, keyFile string) (tls.Certificate, error) {

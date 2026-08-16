@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"runtime"
@@ -55,6 +54,10 @@ type Connector struct {
 	// udpCreating is the in-flight UDP-creation gauge exposed for tests and
 	// debugging; it reports the semaphore's occupancy, not a lock.
 	udpCreating atomic.Int32
+
+	// dialTCP is nil in production; tests use it to deterministically exercise
+	// the connection race without depending on kernel routing behavior.
+	dialTCP func(context.Context, netip.Addr, string, netip.AddrPort) (*net.TCPConn, error)
 }
 
 // New creates a Connector from boot configuration. maxPendingDials caps
@@ -260,6 +263,9 @@ func (t TcpConnector) dialContext(ctx context.Context, bindIP netip.Addr, bindIn
 		return nil, err
 	}
 	defer t.inner.releaseSlot(t.inner.dialSlots)
+	if t.inner.dialTCP != nil {
+		return t.inner.dialTCP(ctx, bindIP, bindInterface, target)
+	}
 
 	dialer := &net.Dialer{
 		Timeout:   t.inner.ConnectTimeout,
@@ -820,6 +826,3 @@ func applySocketOptions(fd uintptr, network, iface string, c *Connector) error {
 	}
 	return nil
 }
-
-// readNoop silences unused-import warnings when io is not otherwise referenced.
-var _ = io.EOF

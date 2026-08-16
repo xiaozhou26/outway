@@ -60,6 +60,11 @@ func (a Socks5Acceptor) WaitUDPWorkers(timeout time.Duration) bool {
 	return a.udp.wait(timeout)
 }
 
+// UDPStats returns the current SOCKS5 UDP relay counters.
+func (a Socks5Acceptor) UDPStats() UDPStatsSnapshot {
+	return a.udp.statsSnapshot()
+}
+
 // WithLifetime returns a copy of the acceptor whose handlers derive request
 // contexts from ctx (typically a serverbase.LifetimeShards shard) instead of
 // the root lifetime.
@@ -124,7 +129,9 @@ func (s *Socks5Server) Start() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			_ = s.acceptLoop(listener)
+			if err := s.acceptLoop(listener); err != nil && !serverbase.IsConnClosed(err) {
+				slog.Error("SOCKS5 accept shard stopped", "error", err)
+			}
 		}()
 	}
 	// The main accept loop holds a WaitGroup slot too, so handler goroutines can
@@ -133,6 +140,11 @@ func (s *Socks5Server) Start() error {
 	s.wg.Add(1)
 	defer s.wg.Done()
 	return s.acceptLoop(s.listener)
+}
+
+// UDPStats returns the current SOCKS5 UDP relay counters.
+func (s *Socks5Server) UDPStats() UDPStatsSnapshot {
+	return s.acceptor.UDPStats()
 }
 
 func (s *Socks5Server) acceptLoop(ln net.Listener) error {

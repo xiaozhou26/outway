@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -28,9 +30,27 @@ var contextIDZero = quicvarint.Append([]byte{}, 0)
 // go through slog behind the debug gate instead of one log.Printf per error
 // and per skipped capsule.
 type tunnel struct {
-	server *Server
-	stream *http3.Stream
-	conn   *net.UDPConn
+	server       *Server
+	stream       *http3.Stream
+	conn         *net.UDPConn
+	lastActivity atomic.Int64
+}
+
+func (t *tunnel) idleTimeout() time.Duration {
+	seconds := t.server.ctx.UDP.AssociationIdleTimeoutSecs
+	if seconds == 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (t *tunnel) touch() {
+	t.lastActivity.Store(time.Now().UnixNano())
+}
+
+func (t *tunnel) isIdle(now time.Time, timeout time.Duration) bool {
+	last := time.Unix(0, t.lastActivity.Load())
+	return now.Sub(last) >= timeout
 }
 
 // maxPayload is the largest tunneled datagram accepted in either direction.
@@ -49,23 +69,14 @@ func (s *Server) serveTunnel(w http.ResponseWriter, conn *net.UDPConn) {
 	}
 	stream := streamer.HTTPStream()
 
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	t := &tunnel{server: s, stream: stream, conn: conn}
+	t.touch()
+	if !s.tunnels.Add(t) {
 		_ = conn.Close()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	t := &tunnel{server: s, stream: stream, conn: conn}
-	s.tunnels[t] = struct{}{}
-	s.tunnelsWG.Add(1)
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.tunnels, t)
-		s.mu.Unlock()
-		s.tunnelsWG.Done()
-	}()
+	defer s.tunnels.Remove(t)
 
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 	w.WriteHeader(http.StatusOK)
@@ -75,12 +86,36 @@ func (s *Server) serveTunnel(w http.ResponseWriter, conn *net.UDPConn) {
 	go func() { defer pumps.Done(); t.pumpToTarget() }()
 	go func() { defer pumps.Done(); t.pumpToClient() }()
 
+	idleDone := make(chan struct{})
+	var idleWG sync.WaitGroup
+	if timeout := t.idleTimeout(); timeout > 0 {
+		idleWG.Add(1)
+		go func() {
+			defer idleWG.Done()
+			ticker := time.NewTicker(min(timeout/2, time.Second))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if t.isIdle(time.Now(), timeout) {
+						t.teardown()
+						return
+					}
+				case <-idleDone:
+					return
+				}
+			}
+		}()
+	}
+
 	// The request stream itself only carries capsules; reading it to EOF is
 	// how the server learns that the client closed the tunnel.
 	t.discardCapsules()
 
 	t.teardown()
 	pumps.Wait()
+	close(idleDone)
+	idleWG.Wait()
 }
 
 // pumpToTarget forwards QUIC datagrams from the client to the outbound socket.
@@ -110,6 +145,7 @@ func (t *tunnel) pumpToTarget() {
 			t.logDebug("MASQUE outbound write ended", "error", err)
 			return
 		}
+		t.touch()
 	}
 }
 
@@ -136,6 +172,7 @@ func (t *tunnel) pumpToClient() {
 			t.logDebug("MASQUE datagram send ended", "error", err)
 			return
 		}
+		t.touch()
 	}
 }
 
@@ -166,10 +203,8 @@ func (t *tunnel) teardown() {
 }
 
 func (t *tunnel) logDebug(msg string, args ...any) {
-	if t.server.closedQuietly() {
+	if !serverbase.DebugEnabled() || t.server.closedQuietly() {
 		return
 	}
-	if serverbase.DebugEnabled() {
-		slog.Debug(msg, args...)
-	}
+	slog.Debug(msg, args...)
 }

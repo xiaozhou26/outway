@@ -106,6 +106,7 @@ type BootArgs struct {
 	ReuseAddr       *bool
 	MaxPendingDials int
 	ReusePort       bool
+	Diagnostics     *netip.AddrPort
 	UDP             UDPConfig
 	Proxy           ProxyConfig
 }
@@ -113,6 +114,9 @@ type BootArgs struct {
 // Validate checks cross-field constraints that cannot be expressed by the CLI
 // flag types alone.
 func (a BootArgs) Validate() error {
+	if a.Diagnostics != nil && (!a.Diagnostics.IsValid() || a.Diagnostics.Addr().IsUnspecified()) {
+		return fmt.Errorf("diagnostics address must be a valid, non-wildcard IP endpoint")
+	}
 	if a.Concurrent == 0 {
 		return fmt.Errorf("concurrent connection limit must be greater than zero")
 	}

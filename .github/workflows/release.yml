@@ -14,6 +14,38 @@ permissions:
   contents: write
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Reject UTF-8 BOM in Go sources
+        shell: bash
+        run: |
+          status=0
+          while IFS= read -r -d '' file; do
+            if [ "$(head -c 3 "$file" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
+              echo "UTF-8 BOM: $file"
+              status=1
+            fi
+          done < <(git ls-files -z '*.go')
+          exit "$status"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          only-new-issues: true
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}

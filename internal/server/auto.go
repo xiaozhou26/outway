@@ -103,7 +103,9 @@ func (s *AutoDetectServer) Start() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			_ = s.acceptLoop(listener)
+			if err := s.acceptLoop(listener); err != nil && !serverbase.IsConnClosed(err) {
+				slog.Error("auto-detect accept shard stopped", "error", err)
+			}
 		}()
 	}
 	// The main accept loop holds a WaitGroup slot too, so handler goroutines can
@@ -114,6 +116,11 @@ func (s *AutoDetectServer) Start() error {
 	return s.acceptLoop(s.listener)
 }
 
+// UDPStats returns the current SOCKS5 UDP relay counters used by auto mode.
+func (s *AutoDetectServer) UDPStats() socks.UDPStatsSnapshot {
+	return s.socksAcc.UDPStats()
+}
+
 func (s *AutoDetectServer) acceptLoop(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
@@ -121,7 +128,7 @@ func (s *AutoDetectServer) acceptLoop(ln net.Listener) error {
 			if serverbase.IsConnClosed(err) {
 				return nil
 			}
-			slog.Debug("Failed to accept connection", "error", err)
+			slog.Error("Failed to accept connection", "error", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}

@@ -4,21 +4,28 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/xiaozhou26/outway/internal/state"
 )
 
+var selfSignedCertMu sync.Mutex
+
 // GetSelfSignedCert returns the PEM-encoded certificate and private key,
 // generating and caching them in the platform state directory if needed.
 // Under systemd, STATE_DIRECTORY points at the unit's private StateDirectory.
 func GetSelfSignedCert() (cert, key []byte, err error) {
+	selfSignedCertMu.Lock()
+	defer selfSignedCertMu.Unlock()
+
 	stateDir, err := state.Directory()
 	if err != nil {
 		return nil, nil, err
@@ -30,9 +37,11 @@ func GetSelfSignedCert() (cert, key []byte, err error) {
 	certPath := filepath.Join(stateDir, "cert.pem")
 	keyPath := filepath.Join(stateDir, "key.pem")
 
-	if certData, cerr := os.ReadFile(certPath); cerr == nil {
-		if keyData, kerr := os.ReadFile(keyPath); kerr == nil {
-			return certData, keyData, nil
+	if certData, certErr := os.ReadFile(certPath); certErr == nil {
+		if keyData, keyErr := os.ReadFile(keyPath); keyErr == nil {
+			if _, pairErr := tls.X509KeyPair(certData, keyData); pairErr == nil {
+				return certData, keyData, nil
+			}
 		}
 	}
 
@@ -40,10 +49,13 @@ func GetSelfSignedCert() (cert, key []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if werr := os.WriteFile(certPath, cert, 0o644); werr != nil {
+	// Each file replacement is atomic. If the process stops between the two
+	// replacements, the validation above detects the mismatched pair and
+	// regenerates it on the next call.
+	if werr := writeFileAtomic(keyPath, key, 0o600); werr != nil {
 		return nil, nil, werr
 	}
-	if werr := os.WriteFile(keyPath, key, 0o600); werr != nil {
+	if werr := writeFileAtomic(certPath, cert, 0o644); werr != nil {
 		return nil, nil, werr
 	}
 	return cert, key, nil

@@ -515,7 +515,7 @@ func AcceptLoop(
 			if IsConnClosed(err) {
 				return nil
 			}
-			slog.Debug("Failed to accept connection", "error", err)
+			slog.Error("Failed to accept connection", "error", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}

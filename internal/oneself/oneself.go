@@ -1,4 +1,4 @@
-﻿// Package oneself implements self-update (from GitHub releases) and uninstall
+// Package oneself implements self-update (from GitHub releases) and uninstall
 // functionality, mirroring the Rust oneself module.
 package oneself
 
@@ -28,9 +28,9 @@ var currentVersion = "0.0.0"
 
 // githubRelease represents the relevant fields of a GitHub release API response.
 type githubRelease struct {
-	TagName string       `json:"tag_name"`
-	Name    string       `json:"name"`
-	Body    string       `json:"body"`
+	TagName string        `json:"tag_name"`
+	Name    string        `json:"name"`
+	Body    string        `json:"body"`
 	Assets  []githubAsset `json:"assets"`
 }
 

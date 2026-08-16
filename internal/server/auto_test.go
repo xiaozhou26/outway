@@ -4,20 +4,58 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/connect"
+	"github.com/xiaozhou26/outway/internal/serverbase"
 )
+
+type autoScriptedAcceptListener struct {
+	calls atomic.Int32
+}
+
+func (l *autoScriptedAcceptListener) Accept() (net.Conn, error) {
+	if l.calls.Add(1) == 1 {
+		return nil, errors.New("injected auto accept failure")
+	}
+	return nil, net.ErrClosed
+}
+
+func (*autoScriptedAcceptListener) Close() error   { return nil }
+func (*autoScriptedAcceptListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestAutoAcceptLoopLogsUnexpectedAcceptError(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	server := &AutoDetectServer{
+		gate:  serverbase.NewConnectionGate(1),
+		conns: serverbase.NewConnectionSet(),
+	}
+	if err := server.acceptLoop(&autoScriptedAcceptListener{}); err != nil {
+		t.Fatalf("acceptLoop returned error: %v", err)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "level=ERROR") || !strings.Contains(output, "injected auto accept failure") {
+		t.Fatalf("unexpected accept error was not logged at error level: %q", output)
+	}
+}
 
 func TestAutoHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 	countString := os.Getenv("OUTWAY_STRESS_AUTO_CONNECTIONS")

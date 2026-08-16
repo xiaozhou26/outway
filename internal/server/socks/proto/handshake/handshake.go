@@ -1,9 +1,9 @@
-﻿// Package handshake implements the SOCKS5 method-selection handshake.
+// Package handshake implements the SOCKS5 method-selection handshake.
 package handshake
 
 import (
-	"io"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto"
+	"io"
 )
 
 // SubnegotiationVersion is the username/password sub-negotiation version.
