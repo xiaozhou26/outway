@@ -14,13 +14,38 @@ A high-performance HTTP/HTTPS/SOCKS5/MASQUE proxy server written in Go, with per
 
 ## Installation
 
+### One-line install (Linux and macOS)
+
+Install the latest stable release to `/usr/local/bin/outway`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaozhou26/outway/main/install.sh | sh
 ```
+
+Uninstall it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaozhou26/outway/main/install.sh | sh -s -- uninstall
+```
+
+The script supports Linux and macOS on `amd64` and `arm64`. Set
+`OUTWAY_INSTALL_DIR` to choose another installation directory, or
+`OUTWAY_VERSION` to install a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaozhou26/outway/main/install.sh | \
+  OUTWAY_INSTALL_DIR="$HOME/.local/bin" OUTWAY_VERSION=v0.7.0 sh
+```
+
+### Install with Go
+
+```bash
 go install github.com/xiaozhou26/outway@latest
 ```
 
-Or build from source:
+### Build from source
 
-```
+```bash
 git clone https://github.com/xiaozhou26/outway.git
 cd outway
 go build -o outway .
