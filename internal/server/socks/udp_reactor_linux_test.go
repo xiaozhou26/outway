@@ -40,12 +40,11 @@ func TestUDPReactorDeliversReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sock.Close()
+	defer func() { _ = sock.Close() }()
 	fd := rawUDPFd(t, sock)
 
 	received := make(chan int, 64)
-	var handler func()
-	handler = func() {
+	handler := func() {
 		buf := make([]byte, 2048)
 		for {
 			n, _, err := unix.Recvfrom(fd, buf, unix.MSG_DONTWAIT)
@@ -64,7 +63,7 @@ func TestUDPReactorDeliversReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sender.Close()
+	defer func() { _ = sender.Close() }()
 	target := sock.LocalAddr().(*net.UDPAddr)
 
 	const rounds = 20
@@ -112,8 +111,7 @@ func TestUDPReactorSharesGoroutines(t *testing.T) {
 		}
 		conns = append(conns, sock)
 		fd := rawUDPFd(t, sock)
-		var handler func()
-		handler = func() {
+		handler := func() {
 			buf := make([]byte, 2048)
 			for {
 				if _, _, err := unix.Recvfrom(fd, buf, unix.MSG_DONTWAIT); err != nil {
@@ -141,7 +139,7 @@ func TestUDPReactorSharesGoroutines(t *testing.T) {
 		go func(target *net.UDPAddr) {
 			defer wg.Done()
 			s, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-			defer s.Close()
+			defer func() { _ = s.Close() }()
 			_, _ = s.WriteToUDP([]byte("x"), target)
 		}(sock.LocalAddr().(*net.UDPAddr))
 	}

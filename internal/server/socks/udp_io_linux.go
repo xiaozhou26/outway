@@ -5,12 +5,21 @@ package socks
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 )
+
+func udpAddrPort(addr net.Addr) (netip.AddrPort, bool) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return udpAddr.AddrPort(), true
+}
 
 type linuxUDPBatchReader struct {
 	runtime       *udpRuntime
@@ -21,7 +30,7 @@ type linuxUDPBatchReader struct {
 	v6            *ipv6.PacketConn
 	v4msgs        []ipv4.Message
 	v6msgs        []ipv6.Message
-	bufs          [][]byte
+	bufs          []*udpBuffer
 	packets       []udpReadPacket
 	batchDisabled bool
 	gro           bool
@@ -35,7 +44,7 @@ func newUDPBatchReader(conn *net.UDPConn, runtime *udpRuntime, offset, limit int
 		conn:    conn,
 		offset:  offset,
 		limit:   limit,
-		bufs:    make([][]byte, runtime.config.BatchSize),
+		bufs:    make([]*udpBuffer, runtime.config.BatchSize),
 		packets: make([]udpReadPacket, runtime.config.BatchSize),
 	}
 	if runtime.config.GRO && udpGROSupported() && enableUDPGRO(conn) == nil {
@@ -78,7 +87,7 @@ func (r *linuxUDPBatchReader) readGRO() ([]udpReadPacket, error) {
 	// GRO coalesces several datagrams into one read, so use the whole pooled
 	// buffer (bounded by MaxPacketSize+header) rather than a single-datagram
 	// slice; the per-segment size is validated against the limit below.
-	n, oobn, flags, addr, err := r.conn.ReadMsgUDP(buffer[r.offset:], r.groOOB)
+	n, oobn, flags, addr, err := r.conn.ReadMsgUDP(buffer.data[r.offset:], r.groOOB)
 	if err != nil {
 		r.runtime.putBuffer(buffer)
 		return nil, err
@@ -116,7 +125,7 @@ func (r *linuxUDPBatchReader) readGRO() ([]udpReadPacket, error) {
 		}
 		copied := r.runtime.getBuffer()
 		start := r.offset + i*segmentSize
-		copy(copied[r.offset:r.offset+segmentLen], buffer[start:start+segmentLen])
+		copy(copied.data[r.offset:r.offset+segmentLen], buffer.data[start:start+segmentLen])
 		r.groPackets[i] = udpReadPacket{buffer: copied, n: segmentLen, addr: src}
 	}
 	return r.groPackets[:segments], nil
@@ -127,7 +136,7 @@ func (r *linuxUDPBatchReader) readBatch() ([]udpReadPacket, error) {
 	// batch. Once one datagram arrives, opportunistically drain the socket with
 	// non-blocking recvmmsg into the remaining batch slots.
 	first := r.runtime.getBuffer()
-	n, _, flags, addr, err := r.conn.ReadMsgUDP(first[r.offset:r.offset+r.limit+1], nil)
+	n, _, flags, addr, err := r.conn.ReadMsgUDP(first.data[r.offset:r.offset+r.limit+1], nil)
 	if err != nil {
 		r.runtime.putBuffer(first)
 		return nil, err
@@ -154,9 +163,9 @@ func (r *linuxUDPBatchReader) readBatch() ([]udpReadPacket, error) {
 		r.bufs[i] = buf
 		extraBuffers++
 		if r.v4 != nil {
-			r.v4msgs[i-1].Buffers[0] = buf[r.offset : r.offset+r.limit+1]
+			r.v4msgs[i-1].Buffers[0] = buf.data[r.offset : r.offset+r.limit+1]
 		} else {
-			r.v6msgs[i-1].Buffers[0] = buf[r.offset : r.offset+r.limit+1]
+			r.v6msgs[i-1].Buffers[0] = buf.data[r.offset : r.offset+r.limit+1]
 		}
 	}
 	if extraBuffers == 0 {
@@ -268,9 +277,9 @@ func (p *udpWriterPools) putKit(kit *linuxWriterKit, v4 bool) {
 }
 
 type linuxUDPBatchWriter struct {
-	v4     *ipv4.PacketConn
-	v6     *ipv6.PacketConn
-	kit    *linuxWriterKit
+	v4  *ipv4.PacketConn
+	v6  *ipv6.PacketConn
+	kit *linuxWriterKit
 }
 
 func newUDPBatchWriter(conn *net.UDPConn, runtime *udpRuntime) udpBatchWriter {

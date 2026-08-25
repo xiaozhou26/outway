@@ -17,14 +17,13 @@ func BenchmarkLinuxUDPBatchWriter(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer target.Close()
+	defer func() { _ = target.Close() }()
 	_ = target.SetReadBuffer(8 << 20)
 	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer sender.Close()
-
+	defer func() { _ = sender.Close() }()
 	const batchSize = 32
 	runtime := newUDPRuntime(config.UDPConfig{
 		MaxPacketSize: 1500,

@@ -14,8 +14,7 @@ func TestListenTCPShardsSinglePort(t *testing.T) {
 	if len(single) != 1 {
 		t.Fatalf("shards=1 gave %d listeners, want 1", len(single))
 	}
-	single[0].Close()
-
+	_ = single[0].Close()
 	const shards = 4
 	listeners, err := ListenTCPShards(context.Background(), "tcp4", "127.0.0.1:0", shards)
 	if err != nil {
@@ -61,10 +60,10 @@ func TestListenTCPShardsSinglePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	got := <-results
 	if got.err != nil {
 		t.Fatalf("no shard accepted the connection: %v", got.err)
 	}
-	got.conn.Close()
+	_ = got.conn.Close()
 }

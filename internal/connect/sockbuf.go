@@ -19,7 +19,7 @@ func VerifyUDPBufferTuning(requested int) (applied int, clamped, ok bool) {
 			return 0, false, false
 		}
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	TuneUDPBuffers(conn, requested)
 	applied, ok = currentUDPRecvBuffer(conn)

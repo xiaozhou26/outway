@@ -38,7 +38,7 @@ func TestSOCKS5UDPMultiTargetBatch(t *testing.T) {
 		if err != nil {
 			t.Skipf("cannot bind %s echo target: %v", network, err)
 		}
-		defer echo.Close()
+		defer func() { _ = echo.Close() }()
 		go func(e *net.UDPConn) {
 			buffer := make([]byte, 2048)
 			for {
@@ -62,15 +62,15 @@ func TestSOCKS5UDPMultiTargetBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	association, err := openSOCKS5UDPAssociation(proxy.listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer association.control.Close()
-	defer association.client.Close()
+	defer func() { _ = association.control.Close() }()
+	defer func() { _ = association.client.Close() }()
 	if err := association.client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}

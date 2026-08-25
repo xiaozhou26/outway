@@ -81,8 +81,7 @@ func TestMASQUEInterop(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	defer conn.Close()
-
+	defer func() { _ = conn.Close() }()
 	payload := []byte("outway-masque")
 	if _, err := conn.WriteTo(payload, nil); err != nil {
 		t.Fatal(err)

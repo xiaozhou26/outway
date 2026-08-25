@@ -4,7 +4,6 @@ import (
 	"crypto/subtle"
 	"errors"
 	"io"
-	"net"
 	"strings"
 
 	"github.com/xiaozhou26/outway/internal/ext"
@@ -70,21 +69,4 @@ func (a AuthAdaptor) executePassword(stream io.ReadWriter) (ext.Extension, error
 	}
 
 	return ext.TryFrom(a.username, req.UserPass.Username), nil
-}
-
-// connAddr returns the peer or local address safely.
-func connAddr(c *net.TCPConn, peer bool) string {
-	if c == nil {
-		return "?"
-	}
-	if peer {
-		if a := c.RemoteAddr(); a != nil {
-			return a.String()
-		}
-	} else {
-		if a := c.LocalAddr(); a != nil {
-			return a.String()
-		}
-	}
-	return "?"
 }

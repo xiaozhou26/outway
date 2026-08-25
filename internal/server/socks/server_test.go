@@ -25,13 +25,12 @@ func TestUDPBatchReaderDetectsConfiguredOversize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sender.Close()
-
+	defer func() { _ = sender.Close() }()
 	runtime := newUDPRuntime(config.UDPConfig{
 		MaxPacketSize: 512,
 		BatchSize:     1,
@@ -102,11 +101,13 @@ func TestUDPRuntimeBatchBufferBudget(t *testing.T) {
 	if runtime.tryAcquireBatchBuffer() {
 		t.Fatal("second batch buffer should exceed budget")
 	}
-	runtime.releaseBuffer(runtime.getBuffer(), true)
+	buffer := runtime.getBuffer()
+	runtime.releaseBuffer(buffer, true)
 	if !runtime.tryAcquireBatchBuffer() {
 		t.Fatal("released batch budget should be reusable")
 	}
-	runtime.releaseBuffer(runtime.getBuffer(), true)
+	buffer = runtime.getBuffer()
+	runtime.releaseBuffer(buffer, true)
 }
 
 func TestSOCKS5UDPLargeDatagram(t *testing.T) {
@@ -114,7 +115,7 @@ func TestSOCKS5UDPLargeDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		buffer := make([]byte, 65535)
 		n, remote, err := echo.ReadFromUDP(buffer)
@@ -133,15 +134,15 @@ func TestSOCKS5UDPLargeDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	association, err := openSOCKS5UDPAssociation(proxy.listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer association.control.Close()
-	defer association.client.Close()
+	defer func() { _ = association.control.Close() }()
+	defer func() { _ = association.client.Close() }()
 	if err := association.client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -184,14 +185,12 @@ func TestWriteUDPResponseTargetsClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
-
+	defer func() { _ = client.Close() }()
 	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer relay.Close()
-
+	defer func() { _ = relay.Close() }()
 	remote := netip.MustParseAddrPort("198.51.100.10:5353")
 	pkt := outboundPacket{payload: []byte("response"), remote: remote}
 	clientAddr := client.LocalAddr().(*net.UDPAddr).AddrPort()
@@ -237,7 +236,7 @@ func TestServerCloseCancelsPendingBind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controlConn.Close()
+	defer func() { _ = controlConn.Close() }()
 	if _, err := controlConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +290,7 @@ func TestSOCKS5ConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			conn, err := echo.Accept()
@@ -299,7 +298,7 @@ func TestSOCKS5ConcurrentTunnelsStress(t *testing.T) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(conn, conn)
 			}()
 		}
@@ -314,7 +313,7 @@ func TestSOCKS5ConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	connections := make([]net.Conn, count)
@@ -351,7 +350,7 @@ func TestSOCKS5ConcurrentTunnelsStress(t *testing.T) {
 	if t.Failed() {
 		for _, conn := range connections {
 			if conn != nil {
-				conn.Close()
+				_ = conn.Close()
 			}
 		}
 		return
@@ -458,7 +457,7 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 	proxy.acceptor.udp.startBalanceTracking()
 
@@ -473,10 +472,10 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 	defer func() {
 		for _, association := range associations {
 			if association.client != nil {
-				association.client.Close()
+				_ = association.client.Close()
 			}
 			if association.control != nil {
-				association.control.Close()
+				_ = association.control.Close()
 			}
 		}
 	}()
@@ -530,8 +529,8 @@ func TestSOCKS5UDPAssociationsStress(t *testing.T) {
 	// Pool lifecycle invariant: once every association is torn down and the
 	// workers joined, every acquired buffer must have been released.
 	for _, association := range associations {
-		association.client.Close()
-		association.control.Close()
+		_ = association.client.Close()
+		_ = association.control.Close()
 	}
 	_ = proxy.Close()
 	runtime := proxy.acceptor.udp
@@ -551,7 +550,7 @@ func openSOCKS5UDPAssociation(proxyAddress string) (udpStressAssociation, error)
 	}
 	control := controlConn.(*net.TCPConn)
 	fail := func(err error) (udpStressAssociation, error) {
-		control.Close()
+		_ = control.Close()
 		return udpStressAssociation{}, err
 	}
 	if _, err := control.Write([]byte{0x05, 0x01, 0x00}); err != nil {
@@ -590,7 +589,7 @@ func BenchmarkSOCKS5TunnelRoundTripParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			conn, err := echo.Accept()
@@ -598,7 +597,7 @@ func BenchmarkSOCKS5TunnelRoundTripParallel(b *testing.B) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(conn, conn)
 			}()
 		}
@@ -614,7 +613,7 @@ func BenchmarkSOCKS5TunnelRoundTripParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	target := echo.Addr().(*net.TCPAddr).AddrPort()
@@ -628,7 +627,7 @@ func BenchmarkSOCKS5TunnelRoundTripParallel(b *testing.B) {
 			b.Error(err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		response := make([]byte, len(payload))
 		for pb.Next() {
 			if _, err := conn.Write(payload); err != nil {
@@ -649,32 +648,32 @@ func openSOCKS5Tunnel(proxyAddress string, target netip.AddrPort) (net.Conn, err
 		return nil, err
 	}
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	handshakeResponse := make([]byte, 2)
 	if _, err := io.ReadFull(conn, handshakeResponse); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if handshakeResponse[1] != 0x00 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("unexpected handshake method: %#x", handshakeResponse[1])
 	}
 
 	ip := target.Addr().As4()
 	request := []byte{0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], byte(target.Port() >> 8), byte(target.Port())}
 	if _, err := conn.Write(request); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	connectResponse := make([]byte, 10)
 	if _, err := io.ReadFull(conn, connectResponse); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if connectResponse[1] != 0x00 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("connect failed with reply: %#x", connectResponse[1])
 	}
 	return conn, nil
@@ -688,7 +687,7 @@ func BenchmarkSOCKS5TunnelSetupParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			conn, err := echo.Accept()
@@ -696,7 +695,7 @@ func BenchmarkSOCKS5TunnelSetupParallel(b *testing.B) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(conn, conn)
 			}()
 		}
@@ -712,7 +711,7 @@ func BenchmarkSOCKS5TunnelSetupParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	target := echo.Addr().(*net.TCPAddr).AddrPort()

@@ -54,10 +54,10 @@ func TestAuthenticateRejectsWrongPassword(t *testing.T) {
 
 func TestDatagramBufferWritesContextIDZero(t *testing.T) {
 	s := &Server{}
-	s.datagramBufs.New = func() any { return make([]byte, len(contextIDZero)+8) }
+	s.datagramBufs.New = func() any { return &datagramBuffer{data: make([]byte, len(contextIDZero)+8)} }
 	buf := s.getDatagramBuffer()
-	if !bytes.Equal(buf[:len(contextIDZero)], contextIDZero) {
-		t.Fatalf("context ID prefix = %x, want %x", buf[:len(contextIDZero)], contextIDZero)
+	if !bytes.Equal(buf.data[:len(contextIDZero)], contextIDZero) {
+		t.Fatalf("context ID prefix = %x, want %x", buf.data[:len(contextIDZero)], contextIDZero)
 	}
 }
 

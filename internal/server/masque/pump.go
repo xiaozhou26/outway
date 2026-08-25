@@ -155,9 +155,10 @@ func (t *tunnel) pumpToTarget() {
 func (t *tunnel) pumpToClient() {
 	buffer := t.server.getDatagramBuffer()
 	defer t.server.putDatagramBuffer(buffer)
+	data := buffer.data
 	offset := len(contextIDZero)
 	for {
-		n, err := t.conn.Read(buffer[offset:])
+		n, err := t.conn.Read(data[offset:])
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				t.logDebug("MASQUE inbound read ended", "error", err)
@@ -168,7 +169,7 @@ func (t *tunnel) pumpToClient() {
 			t.logDebug("dropping oversized UDP packet", "size", n)
 			continue
 		}
-		if err := t.stream.SendDatagram(buffer[:offset+n]); err != nil {
+		if err := t.stream.SendDatagram(data[:offset+n]); err != nil {
 			t.logDebug("MASQUE datagram send ended", "error", err)
 			return
 		}

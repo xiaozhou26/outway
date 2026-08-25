@@ -35,6 +35,10 @@ import (
 
 const proxyPath = "/.well-known/masque/udp/"
 
+type datagramBuffer struct {
+	data []byte
+}
+
 // Server serves MASQUE CONNECT-UDP tunnels over HTTP/3.
 type Server struct {
 	ctx      serverbase.Context
@@ -74,7 +78,7 @@ func NewServer(ctx serverbase.Context, certFile, keyFile string) (*Server, error
 	s.datagramBufs.New = func() any {
 		// One extra byte lets an over-limit packet be detected and dropped
 		// instead of silently forwarded truncated.
-		return make([]byte, len(contextIDZero)+ctx.UDP.MaxPacketSize+1)
+		return &datagramBuffer{data: make([]byte, len(contextIDZero)+ctx.UDP.MaxPacketSize+1)}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(proxyPath, s.handle)
@@ -118,13 +122,13 @@ func (s *Server) closedQuietly() bool {
 	return s.closed.Load()
 }
 
-func (s *Server) getDatagramBuffer() []byte {
-	buf := s.datagramBufs.Get().([]byte)
-	copy(buf, contextIDZero)
+func (s *Server) getDatagramBuffer() *datagramBuffer {
+	buf := s.datagramBufs.Get().(*datagramBuffer)
+	copy(buf.data, contextIDZero)
 	return buf
 }
 
-func (s *Server) putDatagramBuffer(buf []byte) {
+func (s *Server) putDatagramBuffer(buf *datagramBuffer) {
 	s.datagramBufs.Put(buf)
 }
 

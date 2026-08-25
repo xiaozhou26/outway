@@ -67,7 +67,7 @@ func Update() error {
 	if err != nil {
 		return fmt.Errorf("download asset: %w", err)
 	}
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -123,7 +123,7 @@ func fetchLatestRelease() (*githubRelease, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -198,7 +198,7 @@ func downloadAsset(url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download returned %d", resp.StatusCode)
@@ -208,12 +208,22 @@ func downloadAsset(url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer tmp.Close()
-
+	tmpPath := tmp.Name()
+	remove := true
+	defer func() {
+		_ = tmp.Close()
+		if remove {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	if _, err := io.Copy(tmp, resp.Body); err != nil {
 		return "", err
 	}
-	return tmp.Name(), nil
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	remove = false
+	return tmpPath, nil
 }
 
 // extractBinary extracts the outway binary from the downloaded file. If the
@@ -238,13 +248,13 @@ func extractFromTarGz(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, err
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	for {
@@ -269,13 +279,13 @@ func readGzip(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, err
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	return io.ReadAll(gz)
 }
 
@@ -288,14 +298,14 @@ func replaceExecutable(exePath string, data []byte) error {
 		return err
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

@@ -5,7 +5,6 @@ import (
 	"net"
 
 	"github.com/xiaozhou26/outway/internal/ext"
-	"github.com/xiaozhou26/outway/internal/server/socks/proto"
 	"github.com/xiaozhou26/outway/internal/server/socks/proto/handshake"
 )
 
@@ -62,11 +61,6 @@ type readWriter struct {
 
 func (rw readWriter) Read(p []byte) (int, error)  { return rw.r.Read(p) }
 func (rw readWriter) Write(p []byte) (int, error) { return rw.w.Write(p) }
-
-// writeReply writes a SOCKS5 reply on the stream.
-func writeReply(w io.Writer, reply proto.Reply, addr proto.Address) error {
-	return proto.NewResponse(reply, addr).MarshalTo(w)
-}
 
 var errNoAcceptableMethods = errStr("no available handshake method provided by client")
 

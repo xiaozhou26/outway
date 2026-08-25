@@ -33,8 +33,7 @@ func TestTuneUDPBuffersAppliesRequestedSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-
+	defer func() { _ = conn.Close() }()
 	before := udpRcvbuf(t, conn)
 	requested := 4 << 20
 	if before >= 2*requested {
@@ -52,8 +51,7 @@ func TestTuneUDPBuffersZeroKeepsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-
+	defer func() { _ = conn.Close() }()
 	before := udpRcvbuf(t, conn)
 	TuneUDPBuffers(conn, 0)
 	TuneUDPBuffers(nil, 1<<20)

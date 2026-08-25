@@ -29,7 +29,7 @@ func TestUDPAssociationFootprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	_ = echo.SetReadBuffer(4 << 20)
 	go func() {
 		buffer := make([]byte, 2048)
@@ -52,7 +52,7 @@ func TestUDPAssociationFootprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	// Let the proxy's own goroutines (accept loop, send workers, metrics) settle

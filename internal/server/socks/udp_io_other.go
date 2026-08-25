@@ -21,7 +21,7 @@ func newUDPBatchReader(conn *net.UDPConn, runtime *udpRuntime, offset, limit int
 
 func (r *genericUDPBatchReader) Read() ([]udpReadPacket, error) {
 	buf := r.runtime.getBuffer()
-	n, _, flags, addr, err := r.conn.ReadMsgUDP(buf[r.offset:r.offset+r.limit+1], nil)
+	n, _, flags, addr, err := r.conn.ReadMsgUDP(buf.data[r.offset:r.offset+r.limit+1], nil)
 	errorTruncated := udpReadErrorTruncated(err)
 	if err != nil && !errorTruncated {
 		r.runtime.putBuffer(buf)

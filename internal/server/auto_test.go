@@ -72,7 +72,7 @@ func TestAutoHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go acceptTCPEchoConnections(echo)
 
 	concurrent := config.DefaultBootArgs().Concurrent
@@ -88,7 +88,7 @@ func TestAutoHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	connections := make([]net.Conn, count)
@@ -179,7 +179,7 @@ func acceptTCPEchoConnections(listener net.Listener) {
 			return
 		}
 		go func() {
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			_, _ = io.Copy(conn, conn)
 		}()
 	}
@@ -191,18 +191,18 @@ func openAutoHTTPConnectTunnel(proxyAddress, targetAddress string) (net.Conn, er
 		return nil, err
 	}
 	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddress, targetAddress); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	request := &http.Request{Method: http.MethodConnect}
 	response, err := http.ReadResponse(bufio.NewReader(conn), request)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("CONNECT returned %s", response.Status)
 	}
 	return conn, nil
@@ -242,7 +242,7 @@ func TestAutoDetectDispatchesSOCKS5(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
@@ -265,7 +265,7 @@ func TestAutoDetectDispatchesHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	request := "CONNECT x HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -276,7 +276,7 @@ func TestAutoDetectDispatchesHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed CONNECT status = %d, want 400", response.StatusCode)
 	}
@@ -291,9 +291,9 @@ func TestAutoDetectDispatchesHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 	tlsConn := tls.Client(raw, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
-	defer tlsConn.Close()
+	defer func() { _ = tlsConn.Close() }()
 	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		t.Fatal(err)
@@ -306,7 +306,7 @@ func TestAutoDetectDispatchesHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("TLS-routed malformed CONNECT status = %d, want 400", response.StatusCode)
 	}
@@ -316,9 +316,8 @@ func TestAutoDetectDispatchesHTTPS(t *testing.T) {
 // the bufio.Reader buffered during the peek must come back in order from Read.
 func TestBufferedConnPreservesPeekedBytes(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 	payload := []byte{0x05, 1, 2, 3, 4, 5, 6, 7, 8, 9}
 	go func() {
 		_, _ = client.Write(payload)

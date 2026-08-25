@@ -33,7 +33,7 @@ func TestRandomU128VariesAcrossCalls(t *testing.T) {
 // not).
 func TestRandomU128AllBytePositionsMove(t *testing.T) {
 	const draws = 1024
-	var first [16]byte = RandomU128()
+	first := RandomU128()
 	moved := [16]bool{}
 	for i := 0; i < draws; i++ {
 		v := RandomU128()

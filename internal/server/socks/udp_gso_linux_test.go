@@ -20,13 +20,12 @@ func TestSendUDPGSOSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer target.Close()
+	defer func() { _ = target.Close() }()
 	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sender.Close()
-
+	defer func() { _ = sender.Close() }()
 	dst := target.LocalAddr().(*net.UDPAddr).AddrPort()
 	const gsoSize = 100
 	sizes := []int{gsoSize, gsoSize, gsoSize, gsoSize, gsoSize, 40}
@@ -36,7 +35,7 @@ func TestSendUDPGSOSegments(t *testing.T) {
 		for j := range buffer {
 			buffer[j] = byte('A' + i)
 		}
-		batch[i] = udpWritePacket{buffer: buffer, owner: buffer, addr: dst}
+		batch[i] = udpWritePacket{buffer: buffer, addr: dst}
 	}
 
 	sent, err := sendUDPGSO(sender, batch, gsoSize)

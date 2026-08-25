@@ -31,14 +31,13 @@ func TestLinuxUDPBatchReaderGRO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recvConn.Close()
+	defer func() { _ = recvConn.Close() }()
 	_ = recvConn.SetReadBuffer(4 << 20)
 	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sender.Close()
-
+	defer func() { _ = sender.Close() }()
 	runtime := newUDPRuntime(config.UDPConfig{
 		MaxPacketSize: config.DefaultUDPMaxPacketSize,
 		BatchSize:     32,
@@ -77,7 +76,7 @@ func TestLinuxUDPBatchReaderGRO(t *testing.T) {
 			if packet.n != size {
 				t.Fatalf("segment length %d, want %d", packet.n, size)
 			}
-			index := binary.BigEndian.Uint32(packet.buffer[:4])
+			index := binary.BigEndian.Uint32(packet.buffer.data[:4])
 			if seen[index] {
 				t.Fatalf("duplicate datagram %d", index)
 			}

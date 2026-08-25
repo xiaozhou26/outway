@@ -92,9 +92,8 @@ func TestConnectionGateAcquireUntilCancellation(t *testing.T) {
 func TestCopyBidirectionalContextCancellation(t *testing.T) {
 	client, proxyClient := net.Pipe()
 	proxyRemote, remote := net.Pipe()
-	defer client.Close()
-	defer remote.Close()
-
+	defer func() { _ = client.Close() }()
+	defer func() { _ = remote.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -112,11 +111,10 @@ func TestCopyBidirectionalContextCancellation(t *testing.T) {
 func TestCopyBidirectionalHalfCloseGrace(t *testing.T) {
 	client, proxyClient := tcpConnPair(t)
 	proxyRemote, remote := tcpConnPair(t)
-	defer client.Close()
-	defer proxyClient.Close()
-	defer proxyRemote.Close()
-	defer remote.Close()
-
+	defer func() { _ = client.Close() }()
+	defer func() { _ = proxyClient.Close() }()
+	defer func() { _ = proxyRemote.Close() }()
+	defer func() { _ = remote.Close() }()
 	done := make(chan struct{})
 	go func() {
 		_, _, _ = CopyBidirectionalContext(context.Background(), proxyClient, proxyRemote, 50*time.Millisecond)
@@ -138,7 +136,7 @@ func tcpConnPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	accepted := make(chan *net.TCPConn, 1)
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -157,10 +155,10 @@ func tcpConnPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	case server := <-accepted:
 		return client, server
 	case err := <-acceptErr:
-		client.Close()
+		_ = client.Close()
 		t.Fatal(err)
 	case <-time.After(time.Second):
-		client.Close()
+		_ = client.Close()
 		t.Fatal("timed out accepting TCP pair")
 	}
 	return nil, nil
@@ -271,9 +269,8 @@ func TestLifetimeShardsCancelWithParent(t *testing.T) {
 	shards := NewLifetimeShards(parent)
 
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 	first := shards.For(client)
 	if first == nil {
 		t.Fatal("For returned nil context")
@@ -301,11 +298,10 @@ func TestLifetimeShardsCancelWithParent(t *testing.T) {
 func TestCopyBidirectionalHalfCloseFlushesRemainingData(t *testing.T) {
 	client, proxyClient := tcpConnPair(t)
 	proxyRemote, remote := tcpConnPair(t)
-	defer client.Close()
-	defer remote.Close()
-	defer proxyClient.Close()
-	defer proxyRemote.Close()
-
+	defer func() { _ = client.Close() }()
+	defer func() { _ = remote.Close() }()
+	defer func() { _ = proxyClient.Close() }()
+	defer func() { _ = proxyRemote.Close() }()
 	payload := bytes.Repeat([]byte("flush!"), 1000)
 	go func() {
 		if _, err := client.Write(payload); err != nil {
@@ -342,9 +338,8 @@ func TestCopyBidirectionalHalfCloseFlushesRemainingData(t *testing.T) {
 func TestCopyBidirectionalDeadlineInterrupt(t *testing.T) {
 	client, proxyClient := tcpConnPair(t)
 	proxyRemote, remote := tcpConnPair(t)
-	defer client.Close()
-	defer remote.Close()
-
+	defer func() { _ = client.Close() }()
+	defer func() { _ = remote.Close() }()
 	done := make(chan struct{})
 	go func() {
 		_, _, _ = CopyBidirectionalContext(context.Background(), proxyClient, proxyRemote, time.Minute)

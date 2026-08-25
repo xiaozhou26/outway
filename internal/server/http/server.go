@@ -215,7 +215,7 @@ func (s *HttpServer) Close() error {
 func (s *HttpServer) accept(ctx context.Context, conn net.Conn) {
 	serverbase.TuneTCPConnection(conn)
 
-	var stream net.Conn = conn
+	stream := conn
 	if s.tlsConfig != nil {
 		_ = conn.SetDeadline(time.Now().Add(s.timeout))
 		tlsConn := tls.Server(conn, s.tlsConfig)
@@ -363,7 +363,7 @@ func (h Handler) forwardRequest(ctx context.Context, req *http.Request, extensio
 		writeResponse(bw, http.StatusBadGateway, "")
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	removeHopHeaders(resp.Header)
 	if err := resp.Write(bw); err != nil {
 		return false, err

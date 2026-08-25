@@ -6,7 +6,7 @@ import (
 )
 
 type udpReadPacket struct {
-	buffer    []byte
+	buffer    *udpBuffer
 	n         int
 	addr      netip.AddrPort
 	truncated bool
@@ -15,7 +15,7 @@ type udpReadPacket struct {
 
 type udpWritePacket struct {
 	buffer    []byte
-	owner     []byte
+	owner     *udpBuffer
 	addr      netip.AddrPort
 	batchSlot bool
 }
@@ -29,14 +29,6 @@ type udpBatchWriter interface {
 	// releaseTo returns the writer's pooled per-message arrays. It must be
 	// called only after the writer's last use.
 	releaseTo(pools *udpWriterPools)
-}
-
-func udpAddrPort(addr net.Addr) (netip.AddrPort, bool) {
-	udpAddr, ok := addr.(*net.UDPAddr)
-	if !ok {
-		return netip.AddrPort{}, false
-	}
-	return udpAddr.AddrPort(), true
 }
 
 // newReusableUDPAddr returns a *net.UDPAddr whose IP slice has 16 bytes of

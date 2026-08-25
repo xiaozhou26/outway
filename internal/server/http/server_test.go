@@ -58,7 +58,7 @@ func TestHTTPSConnectConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			conn, err := echo.Accept()
@@ -66,7 +66,7 @@ func TestHTTPSConnectConcurrentTunnelsStress(t *testing.T) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(conn, conn)
 			}()
 		}
@@ -84,7 +84,7 @@ func TestHTTPSConnectConcurrentTunnelsStress(t *testing.T) {
 	if _, err := proxy.WithHTTPS("", ""); err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	exerciseHTTPConnectLoad(
@@ -133,7 +133,7 @@ func exerciseHTTPConnectLoad(t *testing.T, count, rounds int, open func() (net.C
 	if t.Failed() {
 		for _, conn := range connections {
 			if conn != nil {
-				conn.Close()
+				_ = conn.Close()
 			}
 		}
 		return
@@ -183,18 +183,18 @@ func openHTTPSConnectTunnel(proxyAddress, targetAddress string) (net.Conn, error
 		return nil, err
 	}
 	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddress, targetAddress); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	request := &stdhttp.Request{Method: stdhttp.MethodConnect}
 	response, err := stdhttp.ReadResponse(bufio.NewReader(conn), request)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != stdhttp.StatusOK {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("CONNECT returned %s", response.Status)
 	}
 	return conn, nil
@@ -215,7 +215,7 @@ func TestHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			conn, err := echo.Accept()
@@ -223,7 +223,7 @@ func TestHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(conn, conn)
 			}()
 		}
@@ -238,7 +238,7 @@ func TestHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	connections := make([]net.Conn, count)
@@ -275,7 +275,7 @@ func TestHTTPConnectConcurrentTunnelsStress(t *testing.T) {
 	if t.Failed() {
 		for _, conn := range connections {
 			if conn != nil {
-				conn.Close()
+				_ = conn.Close()
 			}
 		}
 		return
@@ -334,18 +334,18 @@ func openHTTPConnectTunnel(proxyAddress, targetAddress string) (net.Conn, error)
 		return nil, err
 	}
 	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddress, targetAddress); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	request := &stdhttp.Request{Method: stdhttp.MethodConnect}
 	response, err := stdhttp.ReadResponse(bufio.NewReader(conn), request)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != stdhttp.StatusOK {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("CONNECT returned %s", response.Status)
 	}
 	return conn, nil
@@ -363,7 +363,6 @@ func TestForwardRequestReusesOutboundConnection(t *testing.T) {
 	}
 	origin.Start()
 	defer origin.Close()
-
 	handler := NewHandler(serverbase.Context{
 		ConnectTimeout: 1,
 		Connector:      connect.New(nil, nil, nil, 1, nil, nil, 0),
@@ -404,8 +403,7 @@ func TestServerCloseStopsAcceptLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
-
+	defer func() { _ = client.Close() }()
 	if err := srv.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +440,7 @@ func BenchmarkHTTPConnectSetupParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			conn, err := echo.Accept()
@@ -450,7 +448,7 @@ func BenchmarkHTTPConnectSetupParallel(b *testing.B) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(conn, conn)
 			}()
 		}
@@ -465,7 +463,7 @@ func BenchmarkHTTPConnectSetupParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	b.ReportAllocs()
@@ -490,7 +488,7 @@ func TestConnectEstablishedResponseIsValid200(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadResponse: %v", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != stdhttp.StatusOK {
 		t.Fatalf("status = %d, want 200", response.StatusCode)
 	}

@@ -216,8 +216,7 @@ func TestUDPConnectUsesSameFamilyFallbackWhenCIDRBindFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer target.Close()
-
+	defer func() { _ = target.Close() }()
 	cidr := netip.MustParsePrefix("192.0.2.1/32")
 	fallback := config.Fallback{Address: netip.MustParseAddr("127.0.0.1")}
 	connector := New(&cidr, nil, &fallback, 1, nil, nil, 0)
@@ -225,7 +224,7 @@ func TestUDPConnectUsesSameFamilyFallbackWhenCIDRBindFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	local := conn.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Unmap()
 	if local != fallback.Address {
 		t.Fatalf("local address = %s, want fallback %s", local, fallback.Address)

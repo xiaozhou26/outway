@@ -345,14 +345,14 @@ func (a *udpAssociation) inboundPump() bool {
 			a.runtime.releaseReadPacket(packet)
 			continue
 		}
-		hdr, hlen, herr := proto.ParseUdpHeader(packet.buffer[:packet.n])
+		hdr, hlen, herr := proto.ParseUdpHeader(packet.buffer.data[:packet.n])
 		if herr != nil {
 			a.runtime.metrics.malformedDrops.Add(1)
 			a.runtime.releaseReadPacket(packet)
 			continue
 		}
 		if a.processInbound(inboundPacket{
-			payload:   packet.buffer[hlen:packet.n],
+			payload:   packet.buffer.data[hlen:packet.n],
 			buffer:    packet.buffer,
 			frag:      hdr.Frag,
 			dst:       hdr.Address,

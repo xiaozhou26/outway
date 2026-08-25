@@ -22,7 +22,7 @@ var groSupported = sync.OnceValue(func() bool {
 	if err != nil {
 		return false
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	return enableUDPGRO(conn) == nil
 })
 

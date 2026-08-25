@@ -75,7 +75,7 @@ func (a Socks5Acceptor) WithLifetime(ctx context.Context) Socks5Acceptor {
 
 // Accept drives a single SOCKS5 connection to completion.
 func (a Socks5Acceptor) Accept(stream net.Conn, socketAddr netip.AddrPort) {
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	if err := handle(a.ctx, stream, a.auth, socketAddr, a.connector, a.timeout, a.udp); err != nil {
 		if serverbase.DebugEnabled() {
 			slog.Debug("SOCKS5 connection failed", "error", err)
@@ -296,7 +296,7 @@ func handleBind(ctx context.Context, client net.Conn, br *bufio.Reader, _ proto.
 		_ = client.Close()
 		return err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	if timeout > 0 {
 		_ = ln.SetDeadline(time.Now().Add(timeout))
 	}
@@ -335,7 +335,7 @@ func handleBind(ctx context.Context, client net.Conn, br *bufio.Reader, _ proto.
 		_ = client.Close()
 		return err
 	}
-	defer outbound.Close()
+	defer func() { _ = outbound.Close() }()
 	slog.Debug("SOCKS5 bind accepted connection", "remote", outbound.RemoteAddr())
 
 	outboundAddr := serverbase.AddrPortOf(outbound.RemoteAddr())
@@ -424,7 +424,7 @@ func (p *udpResponder) pumpOnce() bool {
 			p.runtime.releaseReadPacket(packet)
 			continue
 		}
-		payload := packet.buffer[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+packet.n]
+		payload := packet.buffer.data[proto.UdpHeaderMaxLen : proto.UdpHeaderMaxLen+packet.n]
 		response := prepareUDPResponse(outboundPacket{
 			payload: payload,
 			buffer:  packet.buffer,
@@ -462,14 +462,14 @@ func (p *udpResponder) pumpOnce() bool {
 }
 
 func prepareUDPResponse(pkt outboundPacket) []byte {
-	if len(pkt.buffer) >= proto.UdpHeaderMaxLen+len(pkt.payload) {
+	if pkt.buffer != nil && len(pkt.buffer.data) >= proto.UdpHeaderMaxLen+len(pkt.payload) {
 		remote := netip.AddrPortFrom(pkt.remote.Addr().Unmap(), pkt.remote.Port())
 		headerLength := 3 + 1 + 16 + 2
 		if remote.Addr().Is4() {
 			headerLength = 3 + 1 + 4 + 2
 		}
 		start := proto.UdpHeaderMaxLen - headerLength
-		header := pkt.buffer[start:proto.UdpHeaderMaxLen]
+		header := pkt.buffer.data[start:proto.UdpHeaderMaxLen]
 		header[0], header[1], header[2] = 0, 0, 0
 		if remote.Addr().Is4() {
 			header[3] = byte(proto.AddrIPv4)
@@ -482,7 +482,7 @@ func prepareUDPResponse(pkt outboundPacket) []byte {
 			copy(header[4:20], ip[:])
 			binary.BigEndian.PutUint16(header[20:22], remote.Port())
 		}
-		return pkt.buffer[start : proto.UdpHeaderMaxLen+len(pkt.payload)]
+		return pkt.buffer.data[start : proto.UdpHeaderMaxLen+len(pkt.payload)]
 	}
 	return proto.BuildUdpPacket(0, proto.SocketAddress(pkt.remote), pkt.payload)
 }
@@ -490,7 +490,7 @@ func prepareUDPResponse(pkt outboundPacket) []byte {
 // inboundPacket is a parsed SOCKS5 UDP relay packet from the client.
 type inboundPacket struct {
 	payload   []byte
-	buffer    []byte
+	buffer    *udpBuffer
 	frag      uint8
 	dst       proto.Address
 	src       netip.AddrPort
@@ -511,7 +511,7 @@ type udpSendJob struct {
 // outboundPacket is a UDP packet received from a remote target.
 type outboundPacket struct {
 	payload []byte
-	buffer  []byte
+	buffer  *udpBuffer
 	remote  netip.AddrPort
 }
 

@@ -55,6 +55,10 @@ type UDPStatsSnapshot struct {
 	Errors             uint64
 }
 
+type udpBuffer struct {
+	data []byte
+}
+
 type udpRuntime struct {
 	config  config.UDPConfig
 	pool    sync.Pool
@@ -162,7 +166,7 @@ func newUDPRuntime(cfg config.UDPConfig, concurrent uint32, lifetime context.Con
 		r.batchSlots = make(chan struct{}, cfg.BatchBufferBudget)
 	}
 	r.pool.New = func() any {
-		return make([]byte, cfg.MaxPacketSize+protoUDPHeaderMaxLen)
+		return &udpBuffer{data: make([]byte, cfg.MaxPacketSize+protoUDPHeaderMaxLen)}
 	}
 	if cfg.MetricsIntervalSecs > 0 {
 		go r.logMetrics(lifetime, time.Duration(cfg.MetricsIntervalSecs)*time.Second)
@@ -186,14 +190,14 @@ func normalizeUDPConfig(cfg config.UDPConfig) config.UDPConfig {
 	return cfg
 }
 
-func (r *udpRuntime) getBuffer() []byte {
+func (r *udpRuntime) getBuffer() *udpBuffer {
 	if r.trackBalance.Load() {
 		r.buffersGot.Add(1)
 	}
-	return r.pool.Get().([]byte)
+	return r.pool.Get().(*udpBuffer)
 }
 
-func (r *udpRuntime) putBuffer(buf []byte) {
+func (r *udpRuntime) putBuffer(buf *udpBuffer) {
 	if r.trackBalance.Load() {
 		r.buffersPut.Add(1)
 	}
@@ -220,7 +224,7 @@ func (r *udpRuntime) tryAcquireBatchBuffer() bool {
 	}
 }
 
-func (r *udpRuntime) releaseBuffer(buf []byte, batchSlot bool) {
+func (r *udpRuntime) releaseBuffer(buf *udpBuffer, batchSlot bool) {
 	if batchSlot {
 		<-r.batchSlots
 	}

@@ -21,7 +21,7 @@ func TestSOCKS5ReusePortServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		buffer := make([]byte, 2048)
 		for {
@@ -73,8 +73,8 @@ func TestSOCKS5ReusePortServer(t *testing.T) {
 		if !bytes.Equal(response[headerLen:n], payload) {
 			t.Fatalf("round %d payload mismatch", round)
 		}
-		association.client.Close()
-		association.control.Close()
+		_ = association.client.Close()
+		_ = association.control.Close()
 	}
 
 	if err := proxy.Close(); err != nil {

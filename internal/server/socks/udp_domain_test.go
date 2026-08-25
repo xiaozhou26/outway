@@ -29,7 +29,7 @@ func TestSOCKS5UDPDomainTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer v4.Close()
+	defer func() { _ = v4.Close() }()
 	port := v4.LocalAddr().(*net.UDPAddr).Port
 
 	echoLoop := func(conn *net.UDPConn) {
@@ -44,7 +44,7 @@ func TestSOCKS5UDPDomainTarget(t *testing.T) {
 	}
 	go echoLoop(v4)
 	if v6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: port}); err == nil {
-		defer v6.Close()
+		defer func() { _ = v6.Close() }()
 		go echoLoop(v6)
 	}
 
@@ -58,15 +58,15 @@ func TestSOCKS5UDPDomainTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	association, err := openSOCKS5UDPAssociation(proxy.listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer association.control.Close()
-	defer association.client.Close()
+	defer func() { _ = association.control.Close() }()
+	defer func() { _ = association.client.Close() }()
 	if err := association.client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}

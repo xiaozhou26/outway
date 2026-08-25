@@ -20,7 +20,7 @@ func newIdleTimeoutProxy(t *testing.T, idleSecs uint64) (*Socks5Server, netip.Ad
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { echo.Close() })
+	t.Cleanup(func() { _ = echo.Close() })
 	go func() {
 		buffer := make([]byte, 2048)
 		for {
@@ -44,7 +44,7 @@ func newIdleTimeoutProxy(t *testing.T, idleSecs uint64) (*Socks5Server, netip.Ad
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { proxy.Close() })
+	t.Cleanup(func() { _ = proxy.Close() })
 	go func() { _ = proxy.Start() }()
 	return proxy, echo.LocalAddr().(*net.UDPAddr).AddrPort()
 }
@@ -76,9 +76,8 @@ func TestSOCKS5UDPIdleTimeoutCloses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer association.client.Close()
-	defer association.control.Close()
-
+	defer func() { _ = association.client.Close() }()
+	defer func() { _ = association.control.Close() }()
 	udpRoundTrip(t, association, target, 1) // one activity, resets idle
 
 	// Go idle. The server must close the control connection within a couple of
@@ -99,9 +98,8 @@ func TestSOCKS5UDPIdleTimeoutStaysAliveWhileActive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer association.client.Close()
-	defer association.control.Close()
-
+	defer func() { _ = association.client.Close() }()
+	defer func() { _ = association.control.Close() }()
 	// Relay every 400ms for ~2s (two idle windows); each round trip must succeed,
 	// proving activity keeps resetting the idle deadline.
 	for seq := uint32(0); seq < 5; seq++ {

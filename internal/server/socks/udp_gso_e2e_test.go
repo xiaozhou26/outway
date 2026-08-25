@@ -24,7 +24,7 @@ func TestSOCKS5UDPGSOAssociation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	// A generous read buffer so the burst is not dropped before the echo drains.
 	_ = echo.SetReadBuffer(4 << 20)
 	go func() {
@@ -50,15 +50,15 @@ func TestSOCKS5UDPGSOAssociation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	go func() { _ = proxy.Start() }()
 
 	association, err := openSOCKS5UDPAssociation(proxy.listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer association.control.Close()
-	defer association.client.Close()
+	defer func() { _ = association.control.Close() }()
+	defer func() { _ = association.client.Close() }()
 	_ = association.client.SetReadBuffer(4 << 20)
 	if err := association.client.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		t.Fatal(err)

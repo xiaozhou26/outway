@@ -432,7 +432,7 @@ func (u UdpConnector) CreateSocketDualStack(ctx context.Context) (*net.UDPConn, 
 		}
 		fallback, err := u.createSocketWithAddr(fb.Address)
 		if err != nil {
-			preferred.Close()
+			_ = preferred.Close()
 			return nil, nil, err
 		}
 		return preferred, fallback, nil
