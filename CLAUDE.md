@@ -59,7 +59,7 @@ The request flow is: **CLI (main.go) → BootArgs (config) → server.Run → pr
 
 ### Configuration boundary
 
-`main.go` parses cobra flags into a `config.BootArgs`. This is the single hand-off from CLI to the rest of the system — `server.Run(args)` is the entry point. Nothing below `main.go` knows about cobra or flags. The `systemd` subcommands reuse this: `buildRunArgsFromOSArgs` (main.go:367) rewrites `outway systemd <action> ...` into the `outway run ...` line baked into `ExecStart`, so flag parsing stays in one place.
+`main.go` parses cobra flags into a `config.BootArgs`. This is the single hand-off from CLI to the rest of the system — an optional `--config <path>` YAML file (parsed strictly by `config.LoadFile`, internal/config/file.go) seeds the flag variables via `preloadConfigFile` before cobra parses, so file values act as defaults and explicit flags win. — `server.Run(args)` is the entry point. Nothing below `main.go` knows about cobra or flags. The `systemd` subcommands reuse this: `buildRunArgsFromOSArgs` (main.go:367) rewrites `outway systemd <action> ...` into the `outway run ...` line baked into `ExecStart`, so flag parsing stays in one place.
 
 ### Protocol auto-detection
 

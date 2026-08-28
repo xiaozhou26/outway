@@ -163,6 +163,99 @@ sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 sysctl -w net.netfilter.nf_conntrack_max=1048576
 ```
 
+### Configuration file
+
+Instead of repeating flags on the command line, pass `--config <path>` to `run`
+or any `systemd` action. The YAML file provides defaults: every setting not
+given as an explicit flag comes from the file, and a flag on the command line
+always wins.
+
+```yaml
+# outway.yaml
+bind: 0.0.0.0:1080
+log: info
+concurrent: 65536
+username: user
+password: password
+
+# Outbound source selection (same values as --cidr / --cidr-range / --fallback)
+cidr: 2001:db8::/56
+cidr-range: 64
+
+# Diagnostics endpoint for /metrics and pprof
+diagnostics: 127.0.0.1:9100
+
+# The --udp-* flags nest under "udp"
+udp:
+  socket-buffer: 8388608
+  max-packet-size: 65536
+  associations: 32768
+  association-idle-timeout: 300
+  gso: true
+  gro: true
+```
+
+```bash
+outway run auto --config outway.yaml          # file values, or
+outway run auto --config outway.yaml -b 127.0.0.1:8080  # -b overrides the file
+```
+
+Unknown keys are rejected at startup so a typoed setting cannot be silently
+ignored. `systemd install/start/restart --config <path>` bakes the flag into
+the unit's `ExecStart`, so the service re-reads the file on every start.
+
+### Recommended production configuration
+
+A battle-tested setup for a busy proxy pool on a Linux server with IPv6 CIDR
+rotation, UDP relay traffic (QUIC/HTTP-3, DNS), and diagnostics enabled:
+
+```bash
+sudo outway systemd install auto \
+  -b 0.0.0.0:1080 \
+  -i 2001:db8::/56 -r 64 \
+  -u user -p password \
+  -c 65536 \
+  --udp-socket-buffer 8388608 \
+  --udp-max-packet-size 65536 \
+  --udp-associations 32768 \
+  --udp-association-idle-timeout 300 \
+  --udp-gso --udp-gro \
+  --reuse-port \
+  --diagnostics 127.0.0.1:9100 \
+  -L info
+```
+
+Why each choice:
+
+- `-r 64` — split the `/56` into `/64` sub-ranges so the `range` username
+  extension can pin clients to a specific /64 block; omit it if you only use
+  `session`/`ttl` extensions.
+- `-c 65536` — a large active-connection ceiling for many-clients workloads;
+  make sure the fd soft limit (`ulimit -n` / systemd `LimitNOFILE`) covers it.
+  On Unix outway raises the soft limit itself and fails startup when the hard
+  limit is too low.
+- `--udp-socket-buffer 8388608` — the first thing to overflow under UDP bursts.
+  With root/CAP_NET_ADMIN it applies via `SO_*BUFFORCE` bypassing sysctl
+  ceilings; otherwise raise `net.core.rmem_max`/`wmem_max` (see above).
+- `--udp-max-packet-size 65536` — keep full-size QUIC datagrams; lower it
+  (e.g. `4096`) for DNS-only pools to cut per-packet pool memory.
+- `--udp-associations 32768` — cap UDP associations below `--concurrent` so a
+  UDP flood cannot starve TCP tunnels; excess ASSOCIATE requests are rejected.
+- `--udp-association-idle-timeout 300` — reap forgotten associations after
+  five idle minutes instead of waiting for the client to close.
+- `--udp-gso --udp-gro` — Linux-only batching offloads; big syscall savings
+  for fat single-flow bursts, no-ops elsewhere. Enable them after confirming
+  your kernel supports `UDP_SEGMENT`/`UDP_GRO` (outway probes once at startup).
+- `--reuse-port` — shard accepts across CPU cores (Linux/BSD only). Leave it
+  off for a single-core box; never use it for MASQUE, which intentionally
+  stays on one UDP socket.
+- `--diagnostics 127.0.0.1:9100` — scrape `/metrics` and pprof locally
+  (e.g. with Prometheus + node_exporter style jobs); keep it off the public
+  interface.
+
+If your source CIDR is IPv6-only but clients need IPv4 destinations, add
+`--fallback` with a local IPv4 address or interface name.
+
 ### Linux systemd
 
 The legacy Unix `start`, `restart`, `stop`, `ps`, and `log` commands have been
@@ -197,6 +290,7 @@ outway self uninstall   # Remove the installed binary
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
+| `--config` | | | YAML config file providing defaults for unset flags (run/systemd) |
 | `--log` | `-L` | `info` | Log level (trace / debug / info / warn / error) |
 | `--bind` | `-b` | `127.0.0.1:1080` | Bind address (listen endpoint) |
 | `--concurrent` | `-c` | `8192` | Maximum concurrent active connections |
@@ -208,6 +302,7 @@ outway self uninstall   # Remove the installed binary
 | `--reuseaddr` | | `true` | Outbound `SO_REUSEADDR` for TCP sockets |
 | `--max-pending-dials` | | `512` | Maximum concurrent outbound TCP dials; `0` is unlimited |
 | `--reuse-port` | | `false` | Shard the listener with `SO_REUSEPORT` across accept loops (Linux/BSD) |
+| `--diagnostics` | | disabled | Diagnostic HTTP bind address exposing `/metrics` and pprof endpoints (e.g. `127.0.0.1:9100`) |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
 | `--udp-max-packet-size` | | `65507` | Maximum complete SOCKS5 UDP relay datagram; larger packets are dropped instead of truncated |
 | `--udp-batch-size` | | `32` | Receive/send batch size (`recvmmsg`/`sendmmsg` on Linux) |

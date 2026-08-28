@@ -10,6 +10,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.46.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

@@ -50,9 +50,32 @@ var (
 	// TLS flags (https/auto subcommands).
 	flagTLSCert string
 	flagTLSKey  string
+
+	// Config file providing defaults for unset flags.
+	flagConfigFile string
 )
 
 func main() {
+	if err := run(os.Args, execRun); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run wires the CLI: it seeds flag variables from --config before cobra parses
+// the command line (file values act as defaults, explicit flags win), builds
+// the command tree, and executes. exec is the entry point for run subcommands,
+// swappable in tests.
+func run(args []string, exec func(cmd *cobra.Command, a []string) error) error {
+	rootCmd := newRootCmd(exec)
+	if err := preloadConfigFile(args); err != nil {
+		return err
+	}
+	rootCmd.SetArgs(args[1:])
+	return rootCmd.Execute()
+}
+
+func newRootCmd(exec func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:           "outway",
 		Short:         "A high-performance HTTP/HTTPS/SOCKS5 proxy server",
@@ -61,7 +84,7 @@ func main() {
 	}
 
 	// run command and its proxy subcommands.
-	runCmd := newProxyCommand("run", "Run server", execRun)
+	runCmd := newProxyCommand("run", "Run server", exec)
 	rootCmd.AddCommand(runCmd)
 
 	// Linux-only systemd service commands.
@@ -87,9 +110,141 @@ func main() {
 	)
 	rootCmd.AddCommand(selfCmd)
 
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	return rootCmd
+}
+
+// preloadConfigFile applies --config values to the flag variables before cobra
+// parses the command line. pflag only overwrites variables for flags present
+// in the arguments, so file values act as defaults and an explicitly given
+// flag always wins. Only run/systemd invocations are seeded; self-update and
+// friends never touch server flags.
+func preloadConfigFile(args []string) error {
+	if len(args) < 2 || (args[1] != "run" && args[1] != "systemd") {
+		return nil
+	}
+	path, ok := configPathFromArgs(args[2:])
+	if !ok {
+		return nil
+	}
+	fc, err := config.LoadFile(path)
+	if err != nil {
+		return err
+	}
+	applyFileConfig(fc)
+	return nil
+}
+
+// configPathFromArgs extracts the value of a --config / --config= occurrence,
+// stopping at the "--" separator that ends flag parsing. ok is false when no
+// --config appears; a dangling --config is left for cobra to reject.
+func configPathFromArgs(args []string) (path string, ok bool) {
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--":
+			return "", false
+		case arg == "--config":
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", false
+		case strings.HasPrefix(arg, "--config="):
+			return strings.TrimPrefix(arg, "--config="), true
+		}
+	}
+	return "", false
+}
+
+// applyFileConfig seeds the flag variables from a parsed config file. Nil
+// fields were absent from the file and leave the flag defaults untouched.
+func applyFileConfig(fc *config.FileConfig) {
+	if fc == nil {
+		return
+	}
+	if fc.Log != nil {
+		flagLogLevel = *fc.Log
+	}
+	if fc.Bind != nil {
+		flagBind = *fc.Bind
+	}
+	if fc.Concurrent != nil {
+		flagConcurrent = *fc.Concurrent
+	}
+	if fc.Workers != nil {
+		flagWorkers = *fc.Workers
+	}
+	if fc.CIDR != nil {
+		flagCIDR = *fc.CIDR
+	}
+	if fc.CIDRRange != nil {
+		flagCIDRRange = *fc.CIDRRange
+	}
+	if fc.Fallback != nil {
+		flagFallback = *fc.Fallback
+	}
+	if fc.ConnectTimeout != nil {
+		flagConnectTimeout = *fc.ConnectTimeout
+	}
+	if fc.TCPUserTimeout != nil {
+		flagTCPUserTimeout = *fc.TCPUserTimeout
+	}
+	if fc.ReuseAddr != nil {
+		flagReuseAddr = *fc.ReuseAddr
+	}
+	if fc.MaxPendingDials != nil {
+		flagMaxPendingDials = *fc.MaxPendingDials
+	}
+	if fc.ReusePort != nil {
+		flagReusePort = *fc.ReusePort
+	}
+	if fc.Diagnostics != nil {
+		flagDiagnostics = *fc.Diagnostics
+	}
+	if fc.Username != nil {
+		flagUsername = *fc.Username
+	}
+	if fc.Password != nil {
+		flagPassword = *fc.Password
+	}
+	if fc.TLSCert != nil {
+		flagTLSCert = *fc.TLSCert
+	}
+	if fc.TLSKey != nil {
+		flagTLSKey = *fc.TLSKey
+	}
+	if u := fc.UDP; u != nil {
+		if u.MaxPacketSize != nil {
+			flagUDPMaxPacketSize = *u.MaxPacketSize
+		}
+		if u.BatchSize != nil {
+			flagUDPBatchSize = *u.BatchSize
+		}
+		if u.BatchBufferBudget != nil {
+			flagUDPBatchBufferBudget = *u.BatchBufferBudget
+		}
+		if u.SendQueueSize != nil {
+			flagUDPSendQueueSize = *u.SendQueueSize
+		}
+		if u.SendWorkers != nil {
+			flagUDPSendWorkers = *u.SendWorkers
+		}
+		if u.SocketBufferBytes != nil {
+			flagUDPSocketBuffer = *u.SocketBufferBytes
+		}
+		if u.GSO != nil {
+			flagUDPGSO = *u.GSO
+		}
+		if u.GRO != nil {
+			flagUDPGRO = *u.GRO
+		}
+		if u.MaxAssociations != nil {
+			flagUDPMaxAssociations = *u.MaxAssociations
+		}
+		if u.MetricsIntervalSecs != nil {
+			flagUDPMetricsInterval = *u.MetricsIntervalSecs
+		}
+		if u.AssociationIdleTimeoutSecs != nil {
+			flagUDPAssociationIdleTime = *u.AssociationIdleTimeoutSecs
+		}
 	}
 }
 
@@ -170,6 +325,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.IntVar(&flagMaxPendingDials, "max-pending-dials", config.DefaultMaxPendingDials, "Maximum concurrent outbound TCP dials (0: unlimited)")
 	pf.BoolVar(&flagReusePort, "reuse-port", false, "Shard the listener with SO_REUSEPORT across accept loops (Linux/BSD)")
 	pf.StringVar(&flagDiagnostics, "diagnostics", "", "Diagnostic HTTP bind address for metrics and pprof (empty: disabled)")
+	pf.StringVar(&flagConfigFile, "config", "", "YAML config file providing defaults for unset flags")
 	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
 	pf.IntVar(&flagUDPBatchSize, "udp-batch-size", config.DefaultUDPBatchSize, "UDP packets per receive/send batch (Linux uses recvmmsg/sendmmsg)")
 	pf.IntVar(&flagUDPBatchBufferBudget, "udp-batch-buffer-budget", config.DefaultUDPBatchBufferBudget, "Maximum extra pooled buffers held by concurrent Linux UDP batches (0: scalar reads)")
