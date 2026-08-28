@@ -122,39 +122,7 @@ func (s *AutoDetectServer) UDPStats() socks.UDPStatsSnapshot {
 }
 
 func (s *AutoDetectServer) acceptLoop(ln net.Listener) error {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if serverbase.IsConnClosed(err) {
-				return nil
-			}
-			slog.Error("Failed to accept connection", "error", err)
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		// Acquire a connection slot before registering: a saturated gate applies
-		// backpressure to this accept loop alone and must not block shutdown or
-		// other SO_REUSEPORT accept shards.
-		if !s.gate.AcquireUntil(s.conns.Done()) {
-			_ = conn.Close()
-			return nil
-		}
-		// A connection registered before CloseAll marked its shard is closed by
-		// CloseAll, so the handler's blocked I/O cannot outlive shutdown; one
-		// that lost the race is refused here.
-		if !s.conns.Add(conn) {
-			s.gate.Release()
-			_ = conn.Close()
-			continue
-		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer s.gate.Release()
-			defer s.conns.Remove(conn)
-			s.accept(conn)
-		}()
-	}
+	return serverbase.AcceptLoop(ln, &s.wg, s.gate, s.conns, s.accept)
 }
 
 // Close stops the listeners.
@@ -162,15 +130,7 @@ func (s *AutoDetectServer) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
 		connectionErr := s.conns.CloseAll()
-		listenerErr := s.listener.Close()
-		if errors.Is(listenerErr, net.ErrClosed) {
-			listenerErr = nil
-		}
-		for _, ln := range s.extraListeners {
-			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				listenerErr = errors.Join(listenerErr, err)
-			}
-		}
+		listenerErr := serverbase.CloseListeners(s.listener, s.extraListeners)
 		s.httpHdl.CloseIdleConnections()
 		var waitErr error
 		if !serverbase.WaitGroupTimeout(&s.wg, serverbase.DefaultShutdownWait) {
@@ -206,6 +166,10 @@ func (s *AutoDetectServer) accept(conn net.Conn) {
 
 	peer := serverbase.AddrPortOf(conn.RemoteAddr())
 	ctx := s.lifetimes.For(conn)
+
+	// Writes to the client carry an idle deadline: a stalled reader must not
+	// park the handler (and its gate slot) forever mid-response.
+	conn = serverbase.NewWriteIdleConn(conn, s.timeout)
 
 	switch {
 	case first[0] == 0x05:

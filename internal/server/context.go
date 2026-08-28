@@ -9,8 +9,5 @@ import (
 // Context is re-exported from serverbase for convenience.
 type Context = serverbase.Context
 
-// CopyBidirectional is re-exported from serverbase.
-var CopyBidirectional = serverbase.CopyBidirectional
-
 // CloseWrite is re-exported from serverbase.
 var CloseWrite = serverbase.CloseWrite

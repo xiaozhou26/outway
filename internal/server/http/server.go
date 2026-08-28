@@ -234,6 +234,9 @@ func (s *HttpServer) accept(ctx context.Context, conn net.Conn) {
 		stream = tlsConn
 	}
 
+	// Writes to the client carry an idle deadline: a stalled reader must not
+	// park the handler (and its gate slot) forever mid-response.
+	stream = serverbase.NewWriteIdleConn(stream, s.timeout)
 	br := serverbase.AcquireBufferedReader(stream)
 	defer serverbase.ReleaseBufferedReader(br)
 	bw := serverbase.AcquireBufferedWriter(stream)

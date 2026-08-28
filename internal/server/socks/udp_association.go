@@ -270,13 +270,17 @@ func (a *udpAssociation) flushBatch(writer udpBatchWriter, conn *net.UDPConn, ba
 // packet counts as association activity.
 func (a *udpAssociation) processInbound(pkt inboundPacket) bool {
 	if pkt.frag != 0 {
-		slog.Debug("[SOCKS5][UDP] packet fragment is not supported")
+		if serverbase.DebugEnabled() {
+			slog.Debug("[SOCKS5][UDP] packet fragment is not supported")
+		}
 		a.runtime.metrics.fragmentDrops.Add(1)
 		a.runtime.releaseInboundPacket(pkt)
 		return false
 	}
 	if !isAuthorized(pkt.src, a.srcIP) {
-		slog.Debug("SOCKS5 UDP packet from unauthorized IP", "source", pkt.src, "expected", a.srcIP)
+		if serverbase.DebugEnabled() {
+			slog.Debug("SOCKS5 UDP packet from unauthorized IP", "source", pkt.src, "expected", a.srcIP)
+		}
 		a.runtime.metrics.unauthorizedDrops.Add(1)
 		a.runtime.releaseInboundPacket(pkt)
 		return false

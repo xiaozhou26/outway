@@ -233,6 +233,10 @@ type masqueAuthenticator struct {
 	usernameBytes []byte
 	passwordBytes []byte
 	expectedToken string
+	// staticExtension is ext.TryFrom(username, username) prerendered: the
+	// fast-path token's username equals the configured one, so the parse
+	// result never varies per request.
+	staticExtension ext.Extension
 }
 
 func newMasqueAuthenticator(auth config.AuthMode) masqueAuthenticator {
@@ -241,11 +245,12 @@ func newMasqueAuthenticator(auth config.AuthMode) masqueAuthenticator {
 	}
 	credentials := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
 	return masqueAuthenticator{
-		enabled:       true,
-		username:      auth.Username,
-		usernameBytes: []byte(auth.Username),
-		passwordBytes: []byte(auth.Password),
-		expectedToken: "Basic " + credentials,
+		enabled:         true,
+		username:        auth.Username,
+		usernameBytes:   []byte(auth.Username),
+		passwordBytes:   []byte(auth.Password),
+		expectedToken:   "Basic " + credentials,
+		staticExtension: ext.TryFrom(auth.Username, auth.Username),
 	}
 }
 
@@ -259,7 +264,7 @@ func (a masqueAuthenticator) authenticate(r *http.Request) (ext.Extension, bool)
 	}
 	value := r.Header.Get("Proxy-Authorization")
 	if constantTimeStringEqual(value, a.expectedToken) {
-		return ext.TryFrom(a.username, a.username), true
+		return a.staticExtension, true
 	}
 
 	const prefix = "Basic "

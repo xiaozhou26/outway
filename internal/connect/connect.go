@@ -478,13 +478,8 @@ func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPC
 	ctx, cancel := context.WithTimeout(ctx, u.inner.ConnectTimeout)
 	defer cancel()
 
-	if err := u.inner.acquireSlot(u.inner.udpDialSlots, ctx); err != nil {
-		return nil, err
-	}
-	defer u.inner.releaseSlot(u.inner.udpDialSlots)
-	u.inner.udpCreating.Add(1)
-	defer u.inner.udpCreating.Add(-1)
-
+	// Resolve before taking a dial slot: a cold DNS lookup must not hold
+	// fd-budget backpressure hostage, mirroring TcpConnector.Connect.
 	var addrs []netip.AddrPort
 	if target.Addr != nil {
 		addrs = []netip.AddrPort{*target.Addr}
@@ -495,6 +490,13 @@ func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPC
 		}
 		addrs = resolved
 	}
+
+	if err := u.inner.acquireSlot(u.inner.udpDialSlots, ctx); err != nil {
+		return nil, err
+	}
+	defer u.inner.releaseSlot(u.inner.udpDialSlots)
+	u.inner.udpCreating.Add(1)
+	defer u.inner.udpCreating.Add(-1)
 
 	var lastErr error
 	if u.inner.CIDR != nil {
@@ -579,7 +581,9 @@ func (u UdpConnector) dialContext(ctx context.Context, bindIP netip.Addr, iface 
 }
 
 // SendPacket sends a UDP packet to the target address using the preferred and
-// optional fallback outbound sockets, racing them after the connect timeout.
+// optional fallback outbound sockets. Resolution is bounded by the connect
+// timeout; the sends themselves are best-effort datagram writes that inherit
+// the caller's context.
 func (u UdpConnector) SendPacket(ctx context.Context, pkt []byte, target TargetAddr, preferred, fallback *net.UDPConn) (int, error) {
 	var addrs []netip.AddrPort
 	if target.Addr != nil {

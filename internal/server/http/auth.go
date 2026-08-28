@@ -25,6 +25,10 @@ type Authenticator struct {
 	usernameBytes []byte
 	passwordBytes []byte
 	expectedToken string
+	// staticExtension is ext.TryFrom(username, username) prerendered: the
+	// fast-path token's username equals the configured one, so the parse
+	// result never varies per request.
+	staticExtension ext.Extension
 }
 
 // NoAuth builds a no-authentication authenticator.
@@ -34,12 +38,13 @@ func NoAuth() Authenticator { return Authenticator{mode: serverbase.AuthNone} }
 func PasswordAuth(username, password string) Authenticator {
 	credentials := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 	return Authenticator{
-		mode:          serverbase.AuthPassword,
-		username:      username,
-		password:      password,
-		usernameBytes: []byte(username),
-		passwordBytes: []byte(password),
-		expectedToken: "Basic " + credentials,
+		mode:            serverbase.AuthPassword,
+		username:        username,
+		password:        password,
+		usernameBytes:   []byte(username),
+		passwordBytes:   []byte(password),
+		expectedToken:   "Basic " + credentials,
+		staticExtension: ext.TryFrom(username, username),
 	}
 }
 
@@ -71,7 +76,7 @@ func (a Authenticator) authenticatePassword(hdr http.Header) (ext.Extension, err
 	// token. This covers requests without a username extension and costs no
 	// decoding or allocation.
 	if constantTimeStringEq(proxyAuth, a.expectedToken) {
-		return ext.TryFrom(a.username, a.username), nil
+		return a.staticExtension, nil
 	}
 	const prefix = "Basic "
 	if !strings.HasPrefix(proxyAuth, prefix) {

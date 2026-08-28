@@ -27,6 +27,31 @@ const (
 	DefaultShutdownWait   = 5 * time.Second
 )
 
+// WriteIdleConn refreshes the write deadline before every underlying write,
+// turning the deadline into an idle timeout: an actively streaming response
+// keeps extending it, while a client that stops reading trips the deadline on
+// the next blocked write and frees the handler goroutine (and its gate slot)
+// instead of parking forever. Reads and everything else delegate unchanged.
+type WriteIdleConn struct {
+	net.Conn
+	// Idle is the write deadline applied before each write.
+	Idle time.Duration
+}
+
+// NewWriteIdleConn wraps conn with per-write deadline refresh; idle <= 0
+// returns conn unchanged.
+func NewWriteIdleConn(conn net.Conn, idle time.Duration) net.Conn {
+	if idle <= 0 {
+		return conn
+	}
+	return &WriteIdleConn{Conn: conn, Idle: idle}
+}
+
+func (c *WriteIdleConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.Idle))
+	return c.Conn.Write(p)
+}
+
 // DebugEnabled reports whether debug logging is enabled on the default logger.
 // Hot paths guard slog.Debug calls with it: evaluating and boxing the
 // arguments of a disabled debug call costs several allocations per request.
@@ -381,18 +406,6 @@ func (g *ConnectionGate) Release() {
 	if g != nil && g.tokens != nil {
 		<-g.tokens
 	}
-}
-
-// CopyBidirectional copies data in both directions between two connections.
-//
-// On Linux, io.Copy uses splice(2) for TCP-to-TCP copies, providing
-// kernel-space zero-copy behavior equivalent to the Rust realm_io
-// bidi_zero_copy path. On other platforms it falls back to userspace copying.
-//
-// When one direction completes (EOF), the write side of the peer is half-closed
-// so the EOF propagates cleanly to the remote.
-func CopyBidirectional(a, b net.Conn) (int64, int64, error) {
-	return CopyBidirectionalContext(context.Background(), a, b, 0)
 }
 
 // CopyBidirectionalContext copies in both directions. Cancellation interrupts

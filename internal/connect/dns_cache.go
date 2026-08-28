@@ -210,11 +210,15 @@ func (c *dnsCache) Lookup(ctx context.Context, host string) ([]netip.Addr, error
 			ttl = c.negativeTTL
 		}
 		if ttl > 0 && c.maxEntries > 0 {
+			// Sweep with the post-resolution clock: the resolver may have
+			// taken hundreds of ms, and "now" from lookup start would evict
+			// entries that are still valid.
+			now = time.Now()
 			c.evictLocked(shard, now)
 			shard.entries[key] = dnsCacheEntry{
 				addrs:     addrs,
 				err:       err,
-				expiresAt: time.Now().Add(ttl),
+				expiresAt: now.Add(ttl),
 			}
 		}
 	}
