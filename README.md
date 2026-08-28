@@ -216,7 +216,7 @@ sudo outway systemd install auto \
   -u user -p password \
   -c 65536 \
   --udp-socket-buffer 8388608 \
-  --udp-max-packet-size 65536 \
+  --udp-max-packet-size 65507 \
   --udp-associations 32768 \
   --udp-association-idle-timeout 300 \
   --udp-gso --udp-gro \
@@ -237,8 +237,9 @@ Why each choice:
 - `--udp-socket-buffer 8388608` — the first thing to overflow under UDP bursts.
   With root/CAP_NET_ADMIN it applies via `SO_*BUFFORCE` bypassing sysctl
   ceilings; otherwise raise `net.core.rmem_max`/`wmem_max` (see above).
-- `--udp-max-packet-size 65536` — keep full-size QUIC datagrams; lower it
-  (e.g. `4096`) for DNS-only pools to cut per-packet pool memory.
+- `--udp-max-packet-size 65507` — keep full-size QUIC datagrams (65507 is the
+  largest possible UDP payload); lower it (e.g. `4096`) for DNS-only pools to
+  cut per-packet pool memory.
 - `--udp-associations 32768` — cap UDP associations below `--concurrent` so a
   UDP flood cannot starve TCP tunnels; excess ASSOCIATE requests are rejected.
 - `--udp-association-idle-timeout 300` — reap forgotten associations after
