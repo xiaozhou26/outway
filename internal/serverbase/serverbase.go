@@ -48,7 +48,7 @@ func NewWriteIdleConn(conn net.Conn, idle time.Duration) net.Conn {
 }
 
 func (c *WriteIdleConn) Write(p []byte) (int, error) {
-	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.Idle))
+	_ = c.SetWriteDeadline(time.Now().Add(c.Idle))
 	return c.Conn.Write(p)
 }
 
