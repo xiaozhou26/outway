@@ -8,6 +8,7 @@ A high-performance HTTP/HTTPS/SOCKS5/MASQUE proxy server written in Go, with per
 - **Auto-detection** — a single port can serve SOCKS5, HTTP, and HTTPS simultaneously, dispatching each connection by inspecting its first byte.
 - **CIDR-based source selection** — bind outbound connections to addresses chosen from a configured CIDR block, selected deterministically per session/TTL/range via username extensions.
 - **High-concurrency SOCKS5 UDP relay** — batched `recvmmsg`/`sendmmsg` I/O on Linux, a bounded buffer pool, per-association source-IP authorization, and tunable socket buffers for large UDP proxy pools.
+- **HTTP/2 CONNECT multiplexing (h2c)** — optional: many CONNECT tunnels on one HTTP/2 cleartext connection, so new tunnels skip the TCP handshake on long links.
 - **Authentication** — optional username/password (Basic auth for HTTP, username/password auth for SOCKS5).
 - **systemd management** — install, enable, start, restart, stop, status, and journal log commands (Linux).
 - **Self-update** — download and install the latest release directly from GitHub.
@@ -217,6 +218,159 @@ sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 sysctl -w net.netfilter.nf_conntrack_max=1048576
 ```
 
+### Fast tunnel setup on long links
+
+On a high-RTT path between the client and outway, every new tunnel pays the
+client↔outway round trips before the target's TLS handshake can even start.
+Three opt-in features remove them:
+
+| Client strategy | Round trips to TLS ready |
+|---|---|
+| HTTP/1.1 CONNECT, wait for `200` | 3 (TCP + CONNECT + TLS) |
+| HTTP/1.1 CONNECT, send ClientHello right behind the request ("optimistic") | 2 |
+| Optimistic CONNECT + `tcp-fastopen` (first flight ≤ one MSS) | 1 |
+| `h2c`: CONNECT stream on an established HTTP/2 connection | 1 |
+
+Measured through outway with netem adding 70 ms RTT between client and proxy
+(p50, TLS 1.3, new tunnel per sample):
+
+| | default ClientHello (X25519MLKEM768) | X25519-only ClientHello |
+|---|---|---|
+| HTTP/1.1 CONNECT, wait for `200` | 230 ms | 231 ms |
+| Optimistic HTTP/1.1 CONNECT | 152 ms | 154 ms |
+| Optimistic CONNECT + TCP Fast Open | 152 ms | 78 ms |
+| h2c stream | 78 ms | 77 ms |
+| *(direct to target over the same path)* | *153 ms* | *155 ms* |
+
+TCP Fast Open only helps when the CONNECT line plus the ClientHello fit in
+the SYN (about 1420 bytes). Go's default post-quantum ClientHello does not,
+so the rest of it waits for the handshake; h2c has no such limit.
+
+**Optimistic HTTP/1.1 CONNECT** needs no flag. Bytes the client sends after
+the CONNECT headers, in the same segment or later ones, are forwarded to the
+target in order once the dial succeeds. If the dial fails, outway answers
+`502` and drops them.
+
+**`h2c`** (`--h2c`, `http` and `auto` only) accepts HTTP/2 cleartext with
+prior knowledge on the same port. Connections that start with the HTTP/2
+preface (`PRI * HTTP/2.0`) go to the HTTP/2 server; everything else is served
+as before. Each stream is one CONNECT tunnel (RFC 9113 §8.5) and is
+authenticated on its own `Proxy-Authorization` header, so username extensions
+such as `user-session-<id>` work per stream. The client may send DATA right
+behind HEADERS, before the `200` arrives. Flow-control windows default to
+16 MiB per connection and 4 MiB per stream, so a single stream can fill a
+fat, long link. Idle connections are pinged every 30 s.
+
+```yaml
+h2c: true
+h2c-max-streams: 1000        # concurrent tunnels per client connection
+h2c-conn-window: 16777216    # receive window per connection (bytes)
+h2c-stream-window: 4194304   # receive window per stream (bytes)
+tcp-fastopen: 256            # TFO queue length on the listen sockets
+```
+
+A minimal Go client (standard library only, Go 1.26+). Open one connection,
+keep it, and open each tunnel as a stream:
+
+```go
+// newProxyConn opens ONE HTTP/2 cleartext connection to outway. Keep it and
+// open every tunnel on it; only the first tunnel pays the TCP handshake.
+func newProxyConn(ctx context.Context, proxyAddr string) (*http.ClientConn, error) {
+	var protocols http.Protocols
+	protocols.SetUnencryptedHTTP2(true) // h2c with prior knowledge
+	tr := &http.Transport{
+		Protocols: &protocols,
+		HTTP2: &http.HTTP2Config{
+			MaxReceiveBufferPerConnection: 64 << 20, // downstream windows
+			MaxReceiveBufferPerStream:     16 << 20,
+			SendPingTimeout:               30 * time.Second,
+		},
+	}
+	return tr.NewClientConn(ctx, "http", proxyAddr)
+}
+
+// dialTunnel opens a CONNECT stream and returns at once. Bytes written to the
+// returned conn go out as DATA frames immediately, before outway answers 200,
+// so a TLS ClientHello rides right behind the HEADERS frame.
+func dialTunnel(cc *http.ClientConn, proxyAddr, target, user, pass string) net.Conn {
+	pr, pw := io.Pipe()
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Scheme: "http", Host: proxyAddr},
+		Host:   target, // "example.com:443" -> :authority
+		Header: http.Header{"Proxy-Authorization": {"Basic " +
+			base64.StdEncoding.EncodeToString([]byte(user+":"+pass))}},
+		Body: pr,
+	}
+	t := &tunnel{pw: pw, ready: make(chan struct{})}
+	go func() {
+		defer close(t.ready)
+		t.resp, t.err = cc.RoundTrip(req)
+		if t.err == nil && t.resp.StatusCode != http.StatusOK {
+			t.resp.Body.Close()
+			t.err = fmt.Errorf("CONNECT %s: %s", target, t.resp.Status)
+		}
+		if t.err != nil {
+			pr.CloseWithError(t.err)
+		}
+	}()
+	return t
+}
+
+type tunnel struct {
+	pw    *io.PipeWriter
+	ready chan struct{}
+	resp  *http.Response
+	err   error
+}
+
+func (t *tunnel) Write(p []byte) (int, error) { return t.pw.Write(p) }
+func (t *tunnel) Read(p []byte) (int, error) {
+	<-t.ready
+	if t.err != nil {
+		return 0, t.err
+	}
+	return t.resp.Body.Read(p)
+}
+func (t *tunnel) Close() error {
+	t.pw.Close()
+	<-t.ready
+	if t.resp != nil {
+		t.resp.Body.Close()
+	}
+	return nil
+}
+func (t *tunnel) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (t *tunnel) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (t *tunnel) SetDeadline(time.Time) error      { return nil }
+func (t *tunnel) SetReadDeadline(time.Time) error  { return nil }
+func (t *tunnel) SetWriteDeadline(time.Time) error { return nil }
+```
+
+`dialTunnel` returns a `net.Conn` that works as a `DialTLSContext` result
+or with `tls.Client`. To use Fast Open with plain HTTP/1.1 instead, set
+`TCP_FASTOPEN_CONNECT` on the client socket (Linux), write the CONNECT
+request and the ClientHello in one write, and enable it on both kernels:
+`net.ipv4.tcp_fastopen = 3`.
+
+#### Kernel settings for long links
+
+These help every protocol and need no outway change:
+
+```bash
+# Do not collapse the congestion window after an idle period (the main cause
+# of slow first requests on a reused, then idle, long-RTT tunnel).
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+# Larger initial windows on the client<->proxy route (replace the route values).
+ip route change default via <gw> dev <iface> initcwnd 64 initrwnd 64
+# Let receive autotuning grow to the bandwidth-delay product. Prefer this over
+# a fixed SO_RCVBUF, which disables autotuning on that socket.
+sysctl -w net.ipv4.tcp_rmem="4096 131072 33554432"
+sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432"
+# Fast Open for both client and server roles.
+sysctl -w net.ipv4.tcp_fastopen=3
+```
+
 ### Configuration file
 
 Instead of repeating flags on the command line, pass `--config <path>` to `run`
@@ -239,6 +393,10 @@ session-spread: false   # see "Per-account sticky IPv6"
 strict-source: false
 # ndp-proxy: eno1
 # ndp-proxy-max: 65536
+
+# HTTP/2 CONNECT multiplexing and TCP Fast Open (see "Fast tunnel setup")
+h2c: false
+tcp-fastopen: 0
 
 # Diagnostics endpoint for /metrics and pprof
 diagnostics: 127.0.0.1:9100
@@ -366,6 +524,11 @@ outway version          # Print the version (also: outway --version)
 | `--strict-source` | | `false` | Keep targets with a CIDR-family address on the CIDR source; never race or fall back |
 | `--ndp-proxy` | | | Install proxy-NDP entries on this interface for chosen IPv6 sources (Linux only; needs `forwarding=1` on it) |
 | `--ndp-proxy-max` | | `65536` | Maximum proxy-NDP entries kept installed; least recently used are removed |
+| `--h2c` | | `false` | Accept HTTP/2 cleartext CONNECT tunnels on the same port (http/auto) |
+| `--h2c-max-streams` | | `1000` | Maximum concurrent tunnels per HTTP/2 connection |
+| `--h2c-conn-window` | | `16777216` | HTTP/2 receive window per connection, in bytes |
+| `--h2c-stream-window` | | `4194304` | HTTP/2 receive window per stream, in bytes |
+| `--tcp-fastopen` | | `0` | `TCP_FASTOPEN` queue length on listen sockets (Linux only; ignored with a warning elsewhere); `0` disables it |
 | `--diagnostics` | | disabled | Diagnostic HTTP bind address exposing `/metrics` and pprof endpoints (e.g. `127.0.0.1:9100`) |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
 | `--udp-max-packet-size` | | `65507` | Maximum complete SOCKS5 UDP relay datagram; larger packets are dropped instead of truncated |

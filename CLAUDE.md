@@ -70,6 +70,10 @@ The request flow is: **CLI (main.go) → BootArgs (config) → server.Run → pr
 
 The peeked byte must not be lost, so connections are wrapped in `bufferedConn` (auto.go:273 — a `net.Conn` whose `Read` is backed by the `bufio.Reader` used for peeking). Any change to the dispatch logic must preserve this wrapping.
 
+**h2c (`--h2c`, off by default).** When enabled, a cleartext connection whose first three bytes are `PRI` (the HTTP/2 preface) is served by `Handler.ServeH2C` (`internal/server/http/h2c.go`) instead of the HTTP/1 loop. The check lives in two places that must stay in step: `serveHTTP` in auto.go (only when the first byte is `'P'`) and `HttpServer.accept` in http/server.go (plain HTTP only, never under TLS). `IsH2CPreface` only peeks, and `prefacedConn` reads through the same `bufio.Reader`, so the preface reaches the x/net `http2.Server`. Each stream is one RFC 9113 §8.5 CONNECT tunnel and is authenticated on its **own** `Proxy-Authorization` header, so username extensions apply per stream. `--concurrent` counts the TCP connection; streams are bounded per connection by `--h2c-max-streams`. Early DATA sent before the `200` waits in the stream's receive buffer, bounded by `--h2c-stream-window`, until the dial succeeds. `tunnelH2C` flushes every target read as its own DATA frame and returns as soon as the target finishes, so END_STREAM is not delayed.
+
+**TCP Fast Open (`--tcp-fastopen <qlen>`, off by default)** is applied in `ListenTCPShards`' control function (`fastopen_linux.go`). Elsewhere it is ignored with a warning. Every TCP listener (http, socks5, auto, all shards) gets it.
+
 ### serverbase breaks an import cycle
 
 `internal/serverbase` holds `Context` (shared runtime state: bind address, auth, connector, UDP config, reuse-port) and the bidirectional-copy helpers. It exists specifically so that the `server`, `server/http`, and `server/socks` packages can share types without a cycle. When adding shared server state, put it here — not in `server`, which imports the protocol subpackages.
