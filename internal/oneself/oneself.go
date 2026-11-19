@@ -4,6 +4,7 @@ package oneself
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	repoOwner = "0x676e67"
+	repoOwner = "xiaozhou26"
 	repoName  = "outway"
 	binName   = "outway"
 )
@@ -25,6 +26,11 @@ const (
 // currentVersion is the build-time version string. It can be overridden via
 // -ldflags "-X github.com/xiaozhou26/outway/internal/oneself.currentVersion=x.y.z".
 var currentVersion = "0.0.0"
+
+// Version returns the build-time version string.
+func Version() string {
+	return currentVersion
+}
 
 // githubRelease represents the relevant fields of a GitHub release API response.
 type githubRelease struct {
@@ -172,8 +178,26 @@ func currentTarget() string {
 	return fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
 }
 
-// findAsset finds the release asset matching the current target.
+// goAssetName returns the archive name this repository's release workflow
+// publishes for goos/goarch: outway-<goos>-<goarch>.tar.gz, or .zip on
+// Windows.
+func goAssetName(goos, goarch string) string {
+	if goos == "windows" {
+		return binName + "-" + goos + "-" + goarch + ".zip"
+	}
+	return binName + "-" + goos + "-" + goarch + ".tar.gz"
+}
+
+// findAsset finds the release asset matching the current target. The exact
+// Go-style archive name this repository publishes wins; Rust-style target
+// triples and a looser OS+arch match remain as fallbacks.
 func findAsset(release *githubRelease, target string) (*githubAsset, error) {
+	exact := goAssetName(runtime.GOOS, runtime.GOARCH)
+	for i, asset := range release.Assets {
+		if strings.EqualFold(asset.Name, exact) {
+			return &release.Assets[i], nil
+		}
+	}
 	for i, asset := range release.Assets {
 		name := strings.ToLower(asset.Name)
 		if strings.Contains(name, strings.ToLower(target)) {
@@ -235,6 +259,9 @@ func extractBinary(path, assetName string) ([]byte, error) {
 	if strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tgz") {
 		return extractFromTarGz(path)
 	}
+	if strings.HasSuffix(name, ".zip") {
+		return extractFromZip(path)
+	}
 	if strings.HasSuffix(name, ".gz") {
 		return readGzip(path)
 	}
@@ -265,12 +292,42 @@ func extractFromTarGz(path string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		base := filepath.Base(hdr.Name)
-		if base == binName || base == binName+".exe" {
+		if hdr.Typeflag == tar.TypeReg && isBinaryName(hdr.Name) {
 			return io.ReadAll(tr)
 		}
 	}
 	return nil, errors.New("binary not found in archive")
+}
+
+// extractFromZip extracts the outway binary from a zip archive (the Windows
+// release format).
+func extractFromZip(path string) ([]byte, error) {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = zr.Close() }()
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() || !isBinaryName(f.Name) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(rc)
+		_ = rc.Close()
+		return data, err
+	}
+	return nil, errors.New("binary not found in archive")
+}
+
+// isBinaryName reports whether an archive member is the outway executable:
+// the plain name, or the per-platform name the release workflow uses
+// (outway-linux-amd64, outway-windows-amd64.exe).
+func isBinaryName(member string) bool {
+	base := strings.TrimSuffix(filepath.Base(member), ".exe")
+	return base == binName || strings.HasPrefix(base, binName+"-")
 }
 
 // readGzip reads a gzipped file.
