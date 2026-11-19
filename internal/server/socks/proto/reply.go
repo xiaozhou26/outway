@@ -6,14 +6,14 @@ import "fmt"
 type Reply uint8
 
 const (
-	ReplySucceeded              Reply = 0x00
-	ReplyGeneralFailure         Reply = 0x01
-	ReplyConnectionNotAllowed   Reply = 0x02
-	ReplyNetworkUnreachable     Reply = 0x03
-	ReplyHostUnreachable        Reply = 0x04
-	ReplyConnectionRefused      Reply = 0x05
-	ReplyTtlExpired             Reply = 0x06
-	ReplyCommandNotSupported    Reply = 0x07
+	ReplySucceeded               Reply = 0x00
+	ReplyGeneralFailure          Reply = 0x01
+	ReplyConnectionNotAllowed    Reply = 0x02
+	ReplyNetworkUnreachable      Reply = 0x03
+	ReplyHostUnreachable         Reply = 0x04
+	ReplyConnectionRefused       Reply = 0x05
+	ReplyTtlExpired              Reply = 0x06
+	ReplyCommandNotSupported     Reply = 0x07
 	ReplyAddressTypeNotSupported Reply = 0x08
 )
 

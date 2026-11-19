@@ -33,9 +33,9 @@ type Extension struct {
 var None = Extension{Type: ExtNone}
 
 const (
-	extTTL    = "-ttl-"
+	extTTL     = "-ttl-"
 	extSession = "-session-"
-	extRange  = "-range-"
+	extRange   = "-range-"
 )
 
 // fxHash64 implements the FxHash64 algorithm (constant 0x517cc1b727220a95,

@@ -23,7 +23,7 @@ func bigToUint128(v *big.Int) uint128 {
 func TestModUint128AgainstBigInt(t *testing.T) {
 	vectors := []struct{ a, b uint128 }{
 		{uint128{0, 10}, uint128{0, 3}},
-		{uint128{1, 0}, uint128{0, 3}},                 // 2^64 % 3
+		{uint128{1, 0}, uint128{0, 3}}, // 2^64 % 3
 		{uint128{0xdeadbeef, 0xcafebabe}, uint128{0, 7}},
 		{uint128{^uint64(0), ^uint64(0)}, uint128{0, 1 << 32}},
 		{uint128{0x1234, 0x5678}, uint128{0xabcd, 0xef01}}, // b.hi != 0, a < b
