@@ -94,6 +94,60 @@ An IPv6-only source CIDR can connect only to IPv6 destinations. Configure
 `--fallback` with a local address or interface when IPv4 destination support is
 required.
 
+### Per-account sticky IPv6
+
+To give every upstream account its own stable IPv6 source address, have each
+client authenticate as `<user>-session-<id>` (for example
+`proxy-session-12345`, where `user` is the configured `--username`) and turn on
+the source-policy options:
+
+```yaml
+# /etc/outway/outway.yaml
+bind: 0.0.0.0:1080
+username: proxy
+password: secret
+
+cidr: 2001:db8:100:47c3::/64   # or a /56; spread then also covers the /64s
+session-spread: true           # well-mixed, per-session address over every host bit
+strict-source: true            # IPv6-capable targets never leave via the fallback
+ndp-proxy: eno1                # answer the provider's neighbor solicitations
+# fallback: 203.0.113.10       # optional: only for targets without any IPv6 address
+```
+
+```bash
+sudo outway systemd start --config /etc/outway/outway.yaml auto
+```
+
+- **`session-spread`** maps `session`/`ttl` extensions through a 64→128-bit
+  splitmix64 mixer onto *every* host bit of the CIDR, including the subnet bits
+  of a prefix shorter than /64, and never picks the all-zero host. Without it,
+  outway keeps the upstream-compatible `base | (hash mod capacity)` mapping,
+  which puts every session of a /56 in its first /64, and adjacent session IDs
+  share most of their low bits. Enabling it **remaps every existing session**,
+  so it is off by default. Addresses stay deterministic per session id. With a
+  /56 there are only 256 /64s, so with many accounts some will share a /64;
+  their addresses are still distinct.
+- **`strict-source`**: when a target resolves to any address in the CIDR's
+  family, only those addresses are used, and the fallback is never raced or
+  retried. The fallback serves only targets that have no address in that
+  family. This applies to TCP, MASQUE, and SOCKS5 UDP. Without it, a slow or
+  failed IPv6 dial races the fallback after 500 ms, and Happy Eyeballs may pick
+  an IPv4 address.
+- **`ndp-proxy`** (Linux only) is for providers that put the prefix *on-link*
+  and solicit every source address. At startup it sets
+  `net.ipv6.conf.<iface>.proxy_ndp=1`, and before each dial it installs a
+  proxy-neighbor entry for the chosen source (`ip -6 neigh replace proxy <addr>
+  dev <iface>`). Up to `ndp-proxy-max` entries (default 65536) are kept. The
+  least recently used entries are removed, and every entry is removed on
+  graceful shutdown. Install failures are logged and never fail the dial. The
+  kernel ignores proxy entries on non-forwarding interfaces, so outway refuses
+  to start unless `net.ipv6.conf.<iface>.forwarding=1`. If the interface takes
+  its default route from router advertisements, also set
+  `net.ipv6.conf.<iface>.accept_ra=2`, which keeps accepting RAs while
+  forwarding. This replaces an external `ndppd`. An evicted address's entry is
+  gone even if a long-lived connection still uses it, so size `ndp-proxy-max`
+  above the number of addresses that are active at once.
+
 ### Tuning the SOCKS5 UDP relay under load
 
 For a busy UDP proxy pool (many simultaneous UDP associations, e.g. QUIC/HTTP-3
@@ -181,6 +235,10 @@ password: password
 # Outbound source selection (same values as --cidr / --cidr-range / --fallback)
 cidr: 2001:db8::/56
 cidr-range: 64
+session-spread: false   # see "Per-account sticky IPv6"
+strict-source: false
+# ndp-proxy: eno1
+# ndp-proxy-max: 65536
 
 # Diagnostics endpoint for /metrics and pprof
 diagnostics: 127.0.0.1:9100
@@ -285,6 +343,7 @@ paths supplied with `--tls-cert` and `--tls-key` are not moved.
 ```
 outway self update      # Update to the latest release
 outway self uninstall   # Remove the installed binary
+outway version          # Print the version (also: outway --version)
 ```
 
 ## Options
@@ -303,6 +362,10 @@ outway self uninstall   # Remove the installed binary
 | `--reuseaddr` | | `true` | Outbound `SO_REUSEADDR` for TCP sockets |
 | `--max-pending-dials` | | `512` | Maximum concurrent outbound TCP dials; `0` is unlimited |
 | `--reuse-port` | | `false` | Shard the listener with `SO_REUSEPORT` across accept loops (Linux/BSD) |
+| `--session-spread` | | `false` | Spread `session`/`ttl` extensions over every host bit of the CIDR with a strong mixer (remaps existing sessions) |
+| `--strict-source` | | `false` | Keep targets with a CIDR-family address on the CIDR source; never race or fall back |
+| `--ndp-proxy` | | | Install proxy-NDP entries on this interface for chosen IPv6 sources (Linux only; needs `forwarding=1` on it) |
+| `--ndp-proxy-max` | | `65536` | Maximum proxy-NDP entries kept installed; least recently used are removed |
 | `--diagnostics` | | disabled | Diagnostic HTTP bind address exposing `/metrics` and pprof endpoints (e.g. `127.0.0.1:9100`) |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
 | `--udp-max-packet-size` | | `65507` | Maximum complete SOCKS5 UDP relay datagram; larger packets are dropped instead of truncated |
@@ -329,7 +392,7 @@ When a base CIDR is configured, the outbound source address can be selected per 
 - `<user>-ttl-<seconds>` — source address rotates on a fixed time window.
 - `<user>-range-<value>` — source address chosen within a sub-range of the CIDR.
 
-The extension value is hashed deterministically to pick an address inside the configured CIDR block.
+The extension value is hashed deterministically to pick an address inside the configured CIDR block. With `--session-spread`, `session` and `ttl` values are additionally mixed across every host bit (see [Per-account sticky IPv6](#per-account-sticky-ipv6)).
 
 ## License
 

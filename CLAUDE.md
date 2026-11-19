@@ -45,7 +45,7 @@ The CLI is structured as `<lifecycle> <protocol>`:
 
 - Lifecycle commands: `run` (foreground), plus Linux-only `systemd install` / `enable` / `start` / `restart` / `stop` / `status` / `logs` service management.
 - Protocol subcommands under each: `http`, `https`, `socks5`, `masque` (`quic` alias), `auto`.
-- `self update` / `self uninstall` manage the installed binary.
+- `self update` / `self uninstall` manage the installed binary; `version` (or `--version`) prints the ldflags-injected version.
 
 Example: `outway run auto -b 127.0.0.1:1080 -u user -p pass`
 
@@ -101,6 +101,12 @@ One `Connector` per process; `TCP()`/`UDP()` return per-request views. Points wo
 - **uint128 math.** `connect/uint128.go` is a hand-rolled hi/lo `uint128` for IPv6 CIDR arithmetic, mirroring Rust's native `u128`; `modUint128` maps onto `math/bits.Div64` (with a long-division fallback for the both-halves-set case, cross-checked against `math/big` in tests). `internal/randx` supplies the random host bits (`RandomU128` returns big-endian to match Rust).
 - An address-family mismatch between the CIDR and the target is a hard error unless a fallback is configured.
 
+**Source policy options (all off by default; defaults must keep existing users' addresses).** All three hook into `Connector.sourceIP`, the single place a CIDR source is chosen (TCP, UDP `Connect`, SOCKS5 UDP sockets, BIND's `SocketAddr`):
+
+- `--session-spread` / `SessionSpread`: `assignSourceIP(..., spread)` sends `session`/`ttl` values through two splitmix64 outputs (`spreadIPv6`/`spreadIPv4`) onto every host bit. The legacy `base | value mod capacity` path (`assignIPv6FromExtension`, which mirrors Rust) stays the default because switching remaps every session. Under a /56 the legacy path puts all sessions in the first /64, and FxHash avoids collisions poorly for adjacent IDs; `policy_test.go` pins both regressions. Do not change `ext.go` hashing.
+- `--strict-source` / `StrictSource`: `strictAddrs` drops other-family addresses whenever the target has a CIDR-family one, `connectAddr` skips `connectWithCIDRFallback`, and `pinnedToCIDR` blocks UDP fallback retries. The SOCKS5 UDP batch path picks its own address (`pickFamilyTarget`, socks/server.go), so it asks `UdpConnector.PreferCIDRFamily()`. Any new outbound path that chooses among resolved addresses must apply the same rule.
+- `--ndp-proxy <iface>` / `PrepareSource`: `internal/ndp` is a CLOCK (second-chance) cache bounded by `--ndp-proxy-max`. Install and delete are injected `Func`s, so the cache is testable anywhere; `ndp_linux.go` backs them with netlink `NeighSet`/`NeighDel` using `NTF_PROXY`. A hit costs an RLock, a map lookup, and an atomic store. Misses, evictions, and `Close` serialize on the write lock so kernel install and delete for one address never interleave. New entries start unreferenced. Failures are rate-limited warnings and never fail a dial. `Open` refuses to start when `net.ipv6.conf.<iface>.forwarding=0`, because the kernel ignores proxy entries on non-forwarding interfaces. `run.go` closes the cache (removing all entries) after the services stop. Off Linux, `Open` returns an error.
+
 ### DNS cache
 
 `internal/connect/dns_cache.go` is a **process-wide singleton** (`defaultDNSCache`), not per-Connector. It stacks three mechanisms: a bounded TTL cache (30 s positive, 3 s negative, 4096 entries — **failures are cached too**, so readers must check `entry.err`), singleflight collapsing of concurrent lookups for the same host, and a 128-slot resolution budget. Everything is **sharded 16 ways by FNV-1a of the normalized hostname**: each shard owns its entries, its in-flight map, and its share of the resolution slots (8 each, at least 1), so hits, misses, and cold lookups on different hosts never contend on one lock. Eviction is intentionally *not* LRU (a global LRU would be a hot lock); each shard sweeps its own expired entries and otherwise drops an arbitrary key.
@@ -139,13 +145,13 @@ Several concerns split by build constraint (`_linux.go` / `_unix.go` / `_windows
 - `internal/server/socks/udp_{reactor,io,gso,gro,trunc}_*.go` — the UDP fast paths.
 - `internal/serverbase/{copy,reuseport}_*.go` — splice and SO_REUSEPORT.
 - `internal/systemd` installs and controls the Linux service; `systemd_linux.go` / `systemd_other.go` keep the root package cross-platform. The generated unit sets `StateDirectory=outway` (0700), sandboxing directives, and only the capabilities the flags actually require.
-- `internal/state` resolves persistent certificate storage, preferring systemd's `STATE_DIRECTORY` (tests set it via `t.Setenv`).
+- `internal/state` resolves persistent certificate storage, preferring systemd's `STATE_DIRECTORY` (tests set it via `t.Setenv`). On Linux, root with no `HOME` (a bare unit without `StateDirectory=`) falls back to `/var/lib/outway`; `goos`/`geteuid`/`userHomeDir` are swappable for tests.
 
 When touching connection setup, routing, systemd service management, or state paths, check platform build tags and keep variants in sync.
 
 ### Self-update
 
-`internal/oneself` downloads release assets from GitHub and replaces the running executable. Two things surprise people:
+`internal/oneself` downloads release assets from GitHub and replaces the running executable. It also owns `currentVersion` (injected via ldflags by release.yml from the tag; `oneself.Version()` backs `outway --version` and `outway version`).
 
-- The constants point at the **upstream Rust repo** (`repoOwner = "0x676e67"`, `repoName = "outway"`), not the `xiaozhou26` module path.
-- `currentTarget()` maps Go's `GOOS`/`GOARCH` to Rust-style target triples (e.g. `x86_64-unknown-linux-gnu`) to match that project's asset naming. This repo's own CI publishes Go-style names (`outway-linux-amd64.tar.gz`), which only resolve through the looser OS+arch fallback in `findAsset` (oneself.go:183). Changing the release asset naming or these constants affects whether `self update` finds anything.
+- The constants point at **this repo** (`repoOwner = "xiaozhou26"`, `repoName = "outway"`). Before v0.9.0 they pointed at the upstream Rust repo, so older binaries' `self update` looks there.
+- `findAsset` first matches the exact name release.yml publishes (`goAssetName`: `outway-<goos>-<goarch>.tar.gz`, or `.zip` on Windows). Rust-style triples from `currentTarget()` and a loose OS+arch match are fallbacks. The archives contain `outway-<goos>-<goarch>[.exe]`, which `isBinaryName` accepts alongside a plain `outway`. Changing the release asset naming affects whether `self update` finds anything; `TestGoAssetNameMatchesReleaseWorkflow` pins it.
