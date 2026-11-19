@@ -194,3 +194,20 @@ func TestBootArgsValidateH2C(t *testing.T) {
 		}
 	}
 }
+
+func TestBootArgsValidateUpstreamCongestion(t *testing.T) {
+	for _, name := range []string{"", "bbr", "cubic", "bbr2", "dctcp", "htcp"} {
+		args := DefaultBootArgs()
+		args.UpstreamCongestion = name
+		if err := args.Validate(); err != nil {
+			t.Errorf("%q: %v", name, err)
+		}
+	}
+	for _, name := range []string{"BBR", "bbr cubic", "a_very_long_name_x", "bbr\x00"} {
+		args := DefaultBootArgs()
+		args.UpstreamCongestion = name
+		if err := args.Validate(); err == nil {
+			t.Errorf("%q: expected a validation error", name)
+		}
+	}
+}

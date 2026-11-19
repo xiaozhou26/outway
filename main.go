@@ -39,6 +39,7 @@ var (
 	flagH2CConnWindow          int32
 	flagH2CStreamWindow        int32
 	flagTCPFastOpen            int
+	flagUpstreamCongestion     string
 	flagDiagnostics            string
 	flagUDPMaxPacketSize       int
 	flagUDPBatchSize           int
@@ -243,6 +244,9 @@ func applyFileConfig(fc *config.FileConfig) {
 	if fc.TCPFastOpen != nil {
 		flagTCPFastOpen = *fc.TCPFastOpen
 	}
+	if fc.UpstreamCongestion != nil {
+		flagUpstreamCongestion = *fc.UpstreamCongestion
+	}
 	if fc.Diagnostics != nil {
 		flagDiagnostics = *fc.Diagnostics
 	}
@@ -380,6 +384,7 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.Int32Var(&flagH2CConnWindow, "h2c-conn-window", config.DefaultH2CConnWindow, "h2c connection-level receive window in bytes")
 	pf.Int32Var(&flagH2CStreamWindow, "h2c-stream-window", config.DefaultH2CStreamWindow, "h2c per-tunnel receive window in bytes")
 	pf.IntVar(&flagTCPFastOpen, "tcp-fastopen", 0, "TCP Fast Open queue length for TCP listeners (Linux only; 0 disables)")
+	pf.StringVar(&flagUpstreamCongestion, "upstream-congestion", "", "TCP congestion control for outbound TCP sockets, e.g. bbr (Linux only; empty keeps the system default)")
 	pf.StringVar(&flagDiagnostics, "diagnostics", "", "Diagnostic HTTP bind address for metrics and pprof (empty: disabled)")
 	pf.StringVar(&flagConfigFile, "config", "", "YAML config file providing defaults for unset flags")
 	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
@@ -437,7 +442,8 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 			ConnWindow:   flagH2CConnWindow,
 			StreamWindow: flagH2CStreamWindow,
 		},
-		TCPFastOpen: flagTCPFastOpen,
+		TCPFastOpen:        flagTCPFastOpen,
+		UpstreamCongestion: flagUpstreamCongestion,
 		UDP: config.UDPConfig{
 			MaxPacketSize:              flagUDPMaxPacketSize,
 			BatchSize:                  flagUDPBatchSize,

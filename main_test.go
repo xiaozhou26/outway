@@ -185,7 +185,7 @@ func TestRunSourcePolicyFromFileAndFlags(t *testing.T) {
 
 func TestRunH2CAndFastOpenFromFileAndFlags(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outway.yaml")
-	content := "h2c: true\nh2c-stream-window: 8388608\ntcp-fastopen: 128\n"
+	content := "h2c: true\nh2c-stream-window: 8388608\ntcp-fastopen: 128\nupstream-congestion: bbr\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -200,15 +200,15 @@ func TestRunH2CAndFastOpenFromFileAndFlags(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	want := config.H2CConfig{Enabled: true, MaxStreams: 64, ConnWindow: config.DefaultH2CConnWindow, StreamWindow: 8 << 20}
-	if got.H2C != want || got.TCPFastOpen != 128 {
-		t.Fatalf("got h2c=%+v fastopen=%d, want %+v and 128", got.H2C, got.TCPFastOpen, want)
+	if got.H2C != want || got.TCPFastOpen != 128 || got.UpstreamCongestion != "bbr" {
+		t.Fatalf("got h2c=%+v fastopen=%d congestion=%q, want %+v, 128, bbr", got.H2C, got.TCPFastOpen, got.UpstreamCongestion, want)
 	}
 
 	resetFlagVars()
 	if err := run([]string{"outway", "run", "http"}, exec); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if got.H2C != config.DefaultH2CConfig() || got.TCPFastOpen != 0 {
+	if got.H2C != config.DefaultH2CConfig() || got.TCPFastOpen != 0 || got.UpstreamCongestion != "" {
 		t.Fatalf("defaults changed: h2c=%+v fastopen=%d", got.H2C, got.TCPFastOpen)
 	}
 }

@@ -111,3 +111,15 @@ func TestInstallReloadsOnlyAfterWritingUnit(t *testing.T) {
 		t.Fatalf("unchanged install should not reload systemd, calls: %v", calls)
 	}
 }
+
+func TestRequiredCapabilitiesUpstreamCongestion(t *testing.T) {
+	args := config.DefaultBootArgs()
+	args.Bind = netip.MustParseAddrPort("127.0.0.1:1080")
+	if got := requiredCapabilities(args); len(got) != 0 {
+		t.Fatalf("default capabilities = %v, want none", got)
+	}
+	args.UpstreamCongestion = "bbr"
+	if got, want := requiredCapabilities(args), []string{"CAP_NET_ADMIN"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("capabilities = %v, want %v", got, want)
+	}
+}

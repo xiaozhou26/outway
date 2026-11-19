@@ -81,6 +81,13 @@ func Run(args config.BootArgs) error {
 		args.ReuseAddr,
 		args.MaxPendingDials,
 	)
+	if args.UpstreamCongestion != "" {
+		if err := connect.ProbeCongestion(args.UpstreamCongestion); err != nil {
+			return err
+		}
+		connector.Congestion = args.UpstreamCongestion
+		slog.Info("Outbound TCP congestion control", "algorithm", args.UpstreamCongestion)
+	}
 	connector.SessionSpread = args.SessionSpread
 	connector.StrictSource = args.StrictSource
 	if args.SessionSpread || args.StrictSource {

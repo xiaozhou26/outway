@@ -241,7 +241,9 @@ func requiredCapabilities(args config.BootArgs) []string {
 	if args.Bind.Port() < 1024 {
 		capabilities = append(capabilities, "CAP_NET_BIND_SERVICE")
 	}
-	if args.CIDR != nil || args.UDP.SocketBufferBytes > 0 {
+	// --upstream-congestion needs CAP_NET_ADMIN for any algorithm outside
+	// net.ipv4.tcp_allowed_congestion_control, which usually excludes bbr.
+	if args.CIDR != nil || args.UDP.SocketBufferBytes > 0 || args.UpstreamCongestion != "" {
 		capabilities = append(capabilities, "CAP_NET_ADMIN")
 	}
 	if args.Fallback != nil && args.Fallback.IsInterface() {

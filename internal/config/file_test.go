@@ -103,6 +103,7 @@ h2c-max-streams: 500
 h2c-conn-window: 33554432
 h2c-stream-window: 8388608
 tcp-fastopen: 256
+upstream-congestion: bbr
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -123,6 +124,9 @@ tcp-fastopen: 256
 	if fc.H2C == nil || !*fc.H2C || fc.H2CMaxStreams == nil || *fc.H2CMaxStreams != 500 ||
 		fc.H2CConnWindow == nil || *fc.H2CConnWindow != 32<<20 || fc.H2CStreamWindow == nil || *fc.H2CStreamWindow != 8<<20 {
 		t.Errorf("h2c keys = %v %v %v %v", fc.H2C, fc.H2CMaxStreams, fc.H2CConnWindow, fc.H2CStreamWindow)
+	}
+	if fc.UpstreamCongestion == nil || *fc.UpstreamCongestion != "bbr" {
+		t.Errorf("upstream-congestion = %v, want bbr", fc.UpstreamCongestion)
 	}
 	if fc.TCPFastOpen == nil || *fc.TCPFastOpen != 256 {
 		t.Errorf("tcp-fastopen = %v, want 256", fc.TCPFastOpen)

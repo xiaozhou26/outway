@@ -45,7 +45,11 @@ type Connector struct {
 	Fallback       *config.Fallback
 	ConnectTimeout time.Duration
 	TCPUserTimeout *time.Duration // Linux only
-	ReuseAddr      *bool
+	// Congestion, when non-empty, is set with TCP_CONGESTION on every
+	// outbound TCP socket (Linux only). Run probes it at startup with
+	// ProbeCongestion, so a per-dial failure means the kernel changed since.
+	Congestion string
+	ReuseAddr  *bool
 	// SessionSpread maps session/TTL extensions onto the whole host field
 	// through a strong 64→128-bit mixer instead of the Rust-compatible
 	// `base | value mod capacity`, so sessions spread across every subnet of a
@@ -947,8 +951,8 @@ func uint32ToIPv4(v uint32) netip.Addr {
 	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
 }
 
-// applySocketOptions sets SO_REUSEADDR, TCP_USER_TIMEOUT (Linux) and
-// SO_BINDTODEVICE (Linux) on the given socket fd.
+// applySocketOptions sets SO_REUSEADDR, TCP_USER_TIMEOUT (Linux),
+// TCP_CONGESTION (Linux), and SO_BINDTODEVICE (Linux) on the given socket fd.
 func applySocketOptions(fd uintptr, network, iface string, c *Connector) error {
 	if c.ReuseAddr != nil && *c.ReuseAddr {
 		_ = setReuseAddr(fd)
@@ -958,6 +962,11 @@ func applySocketOptions(fd uintptr, network, iface string, c *Connector) error {
 		if c.TCPUserTimeout != nil && (network == "tcp" || network == "tcp4" || network == "tcp6") {
 			ms := int(c.TCPUserTimeout.Milliseconds())
 			_ = setTCPUserTimeout(int(fd), ms)
+		}
+		if c.Congestion != "" && (network == "tcp" || network == "tcp4" || network == "tcp6") {
+			if err := setCongestion(int(fd), c.Congestion); err != nil {
+				return fmt.Errorf("set TCP congestion control %q: %w", c.Congestion, err)
+			}
 		}
 		if iface != "" {
 			if err := bindToDevice(int(fd), iface); err != nil {

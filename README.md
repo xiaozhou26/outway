@@ -389,6 +389,23 @@ sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432"
 sysctl -w net.ipv4.tcp_fastopen=3
 ```
 
+On a lossy long path, one TCP flow with CUBIC slows down sharply. BBR is
+much less sensitive to random loss. On a path with 2.4% retransmissions and
+77 ms RTT, one upload tunnel went from 2.5–5.6 MB/s with CUBIC to 28–30 MB/s
+with BBR. When you cannot change the host default because other services
+share the host, set it on outway's own outbound sockets:
+
+```bash
+modprobe tcp_bbr                                    # once; persist via /etc/modules-load.d
+outway run auto --upstream-congestion bbr ...       # TCP_CONGESTION on every outbound TCP socket
+```
+
+The setting covers outbound TCP only: the proxy→target leg, which carries the
+request uploads. Client-facing sockets keep the system default. outway refuses
+to start if the algorithm is not available. An algorithm outside
+`net.ipv4.tcp_allowed_congestion_control` (bbr usually is) needs
+`CAP_NET_ADMIN`, which `systemd install` grants when the option is set.
+
 ### Configuration file
 
 Instead of repeating flags on the command line, pass `--config <path>` to `run`
@@ -415,6 +432,7 @@ strict-source: false
 # HTTP/2 CONNECT multiplexing and TCP Fast Open (see "Fast tunnel setup")
 h2c: false
 tcp-fastopen: 0
+# upstream-congestion: bbr  # outbound TCP congestion control (Linux)
 
 # Diagnostics endpoint for /metrics and pprof
 diagnostics: 127.0.0.1:9100
@@ -546,6 +564,7 @@ outway version          # Print the version (also: outway --version)
 | `--h2c-max-streams` | | `1000` | Maximum concurrent tunnels per HTTP/2 connection |
 | `--h2c-conn-window` | | `2097152` | HTTP/2 upload window per connection, in bytes (size near the path's bandwidth-delay product) |
 | `--h2c-stream-window` | | `2097152` | HTTP/2 upload window per stream, in bytes |
+| `--upstream-congestion` | | | TCP congestion control for outbound TCP sockets, e.g. `bbr` (Linux only; empty keeps the system default) |
 | `--tcp-fastopen` | | `0` | `TCP_FASTOPEN` queue length on listen sockets (Linux only; ignored with a warning elsewhere); `0` disables it |
 | `--diagnostics` | | disabled | Diagnostic HTTP bind address exposing `/metrics` and pprof endpoints (e.g. `127.0.0.1:9100`) |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |

@@ -40,12 +40,14 @@ type FileConfig struct {
 	H2CConnWindow   *int32  `yaml:"h2c-conn-window"`
 	H2CStreamWindow *int32  `yaml:"h2c-stream-window"`
 	TCPFastOpen     *int    `yaml:"tcp-fastopen"`
-	Diagnostics     *string `yaml:"diagnostics"`
-	Username        *string `yaml:"username"`
-	Password        *string `yaml:"password"`
-	TLSCert         *string `yaml:"tls-cert"`
-	TLSKey          *string `yaml:"tls-key"`
-	UDP             *FileUDPConfig
+	// UpstreamCongestion mirrors --upstream-congestion.
+	UpstreamCongestion *string `yaml:"upstream-congestion"`
+	Diagnostics        *string `yaml:"diagnostics"`
+	Username           *string `yaml:"username"`
+	Password           *string `yaml:"password"`
+	TLSCert            *string `yaml:"tls-cert"`
+	TLSKey             *string `yaml:"tls-key"`
+	UDP                *FileUDPConfig
 }
 
 // FileUDPConfig mirrors the --udp-* flags under the "udp" config-file key.

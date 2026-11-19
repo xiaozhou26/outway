@@ -158,9 +158,13 @@ type BootArgs struct {
 	// TCPFastOpen sets the TCP_FASTOPEN queue length on TCP listeners
 	// (Linux only; zero disables).
 	TCPFastOpen int
-	Diagnostics *netip.AddrPort
-	UDP         UDPConfig
-	Proxy       ProxyConfig
+	// UpstreamCongestion names the TCP congestion control algorithm (for
+	// example "bbr") set with TCP_CONGESTION on every outbound TCP socket.
+	// Empty keeps the system default. Linux only.
+	UpstreamCongestion string
+	Diagnostics        *netip.AddrPort
+	UDP                UDPConfig
+	Proxy              ProxyConfig
 }
 
 // Validate checks cross-field constraints that cannot be expressed by the CLI
@@ -230,6 +234,9 @@ func (a BootArgs) Validate() error {
 	if a.TCPFastOpen < 0 {
 		return fmt.Errorf("tcp-fastopen queue length must not be negative")
 	}
+	if err := validCongestionName(a.UpstreamCongestion); err != nil {
+		return err
+	}
 	if a.CIDRRange != nil {
 		if a.CIDR == nil {
 			return fmt.Errorf("CIDR range requires a CIDR")
@@ -280,4 +287,23 @@ func ParseLogLevel(s string) string {
 	default:
 		return "INFO"
 	}
+}
+
+// validCongestionName checks the shape of a TCP congestion control name. The
+// kernel limits names to 15 bytes (TCP_CA_NAME_MAX includes the NUL), and
+// every in-tree algorithm uses lowercase letters, digits, and underscores.
+// Whether the algorithm is available is checked at startup.
+func validCongestionName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 15 {
+		return fmt.Errorf("upstream-congestion %q is longer than 15 bytes", name)
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			return fmt.Errorf("upstream-congestion %q contains %q; expected a kernel algorithm name such as bbr or cubic", name, r)
+		}
+	}
+	return nil
 }
