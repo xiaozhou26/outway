@@ -44,6 +44,7 @@ type Handler struct {
 	auth       Authenticator
 	connector  *connect.Connector
 	transports *transportPool
+	h2c        *h2cServer
 }
 
 const maxTransportEntries = 128
@@ -109,6 +110,7 @@ func NewHandler(ctx serverbase.Context) Handler {
 		auth:       auth,
 		connector:  ctx.Connector,
 		transports: newTransportPool(ctx.Connector),
+		h2c:        newH2CServer(ctx.H2C),
 	}
 }
 
@@ -120,7 +122,7 @@ func NewServer(ctx serverbase.Context) (*HttpServer, error) {
 		network = "tcp6"
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort))
+	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort), ctx.TCPFastOpen)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -241,6 +243,18 @@ func (s *HttpServer) accept(ctx context.Context, conn net.Conn) {
 	defer serverbase.ReleaseBufferedReader(br)
 	bw := serverbase.AcquireBufferedWriter(stream)
 	defer serverbase.ReleaseBufferedWriter(bw)
+
+	// HTTP/2 prior-knowledge clients open with the "PRI" preface; everything
+	// else is HTTP/1. h2c is cleartext only, so TLS listeners skip it.
+	if s.tlsConfig == nil && s.handler.H2CEnabled() {
+		_ = stream.SetReadDeadline(time.Now().Add(s.timeout))
+		if IsH2CPreface(br) {
+			_ = stream.SetReadDeadline(time.Time{})
+			s.handler.ServeH2C(ctx, stream, br)
+			_ = stream.Close()
+			return
+		}
+	}
 
 	for {
 		_ = stream.SetReadDeadline(time.Now().Add(s.timeout))

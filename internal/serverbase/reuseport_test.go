@@ -7,7 +7,7 @@ import (
 )
 
 func TestListenTCPShardsSinglePort(t *testing.T) {
-	single, err := ListenTCPShards(context.Background(), "tcp4", "127.0.0.1:0", 1)
+	single, err := ListenTCPShards(context.Background(), "tcp4", "127.0.0.1:0", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16,7 +16,7 @@ func TestListenTCPShardsSinglePort(t *testing.T) {
 	}
 	_ = single[0].Close()
 	const shards = 4
-	listeners, err := ListenTCPShards(context.Background(), "tcp4", "127.0.0.1:0", shards)
+	listeners, err := ListenTCPShards(context.Background(), "tcp4", "127.0.0.1:0", shards, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

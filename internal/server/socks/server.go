@@ -105,7 +105,7 @@ func NewServer(ctx serverbase.Context) (*Socks5Server, error) {
 		network = "tcp6"
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort))
+	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort), ctx.TCPFastOpen)
 	if err != nil {
 		cancel()
 		return nil, err

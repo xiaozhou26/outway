@@ -98,6 +98,11 @@ session-spread: true
 strict-source: true
 ndp-proxy: eno1
 ndp-proxy-max: 1024
+h2c: true
+h2c-max-streams: 500
+h2c-conn-window: 33554432
+h2c-stream-window: 8388608
+tcp-fastopen: 256
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -114,6 +119,13 @@ ndp-proxy-max: 1024
 	}
 	if fc.NDPProxy == nil || *fc.NDPProxy != "eno1" {
 		t.Errorf("ndp-proxy = %v, want eno1", fc.NDPProxy)
+	}
+	if fc.H2C == nil || !*fc.H2C || fc.H2CMaxStreams == nil || *fc.H2CMaxStreams != 500 ||
+		fc.H2CConnWindow == nil || *fc.H2CConnWindow != 32<<20 || fc.H2CStreamWindow == nil || *fc.H2CStreamWindow != 8<<20 {
+		t.Errorf("h2c keys = %v %v %v %v", fc.H2C, fc.H2CMaxStreams, fc.H2CConnWindow, fc.H2CStreamWindow)
+	}
+	if fc.TCPFastOpen == nil || *fc.TCPFastOpen != 256 {
+		t.Errorf("tcp-fastopen = %v, want 256", fc.TCPFastOpen)
 	}
 	if fc.NDPProxyMax == nil || *fc.NDPProxyMax != 1024 {
 		t.Errorf("ndp-proxy-max = %v, want 1024", fc.NDPProxyMax)

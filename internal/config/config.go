@@ -62,6 +62,34 @@ const DefaultMaxPendingDials = 512
 // installed at once.
 const DefaultNDPProxyMax = 65536
 
+// HTTP/2 cleartext (h2c) CONNECT defaults. The receive windows are sized for
+// long fat links: HTTP/2's 64 KiB default window would cap a 70 ms RTT tunnel
+// at under 1 MB/s, far below raw TCP.
+const (
+	DefaultH2CMaxStreams   = 1000
+	DefaultH2CConnWindow   = 16 << 20
+	DefaultH2CStreamWindow = 4 << 20
+)
+
+// H2CConfig controls HTTP/2 cleartext CONNECT multiplexing (RFC 9113 §8.5) on
+// the HTTP and auto-detect listeners. ConnWindow and StreamWindow are the
+// receive windows outway advertises for client-to-target data.
+type H2CConfig struct {
+	Enabled      bool
+	MaxStreams   uint32
+	ConnWindow   int32
+	StreamWindow int32
+}
+
+// DefaultH2CConfig returns the disabled h2c configuration with default limits.
+func DefaultH2CConfig() H2CConfig {
+	return H2CConfig{
+		MaxStreams:   DefaultH2CMaxStreams,
+		ConnWindow:   DefaultH2CConnWindow,
+		StreamWindow: DefaultH2CStreamWindow,
+	}
+}
+
 // UDPConfig controls SOCKS5 UDP relay resource usage. SendWorkers set to zero
 // selects an automatic value derived from GOMAXPROCS. MetricsIntervalSecs and
 // AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
@@ -122,6 +150,11 @@ type BootArgs struct {
 	NDPProxy string
 	// NDPProxyMax bounds the installed proxy-neighbor entries.
 	NDPProxyMax int
+	// H2C enables HTTP/2 cleartext CONNECT multiplexing on HTTP listeners.
+	H2C H2CConfig
+	// TCPFastOpen sets the TCP_FASTOPEN queue length on TCP listeners
+	// (Linux only; zero disables).
+	TCPFastOpen int
 	Diagnostics *netip.AddrPort
 	UDP         UDPConfig
 	Proxy       ProxyConfig
@@ -177,6 +210,23 @@ func (a BootArgs) Validate() error {
 			return fmt.Errorf("ndp-proxy-max must be at least 1")
 		}
 	}
+	if a.H2C.Enabled {
+		if a.Proxy.Kind != ProxyHTTP && a.Proxy.Kind != ProxyAuto {
+			return fmt.Errorf("h2c is only supported by the http and auto proxies")
+		}
+		if a.H2C.MaxStreams < 1 {
+			return fmt.Errorf("h2c-max-streams must be at least 1")
+		}
+		if a.H2C.ConnWindow < 65535 {
+			return fmt.Errorf("h2c-conn-window must be at least 65535 bytes")
+		}
+		if a.H2C.StreamWindow < 1 {
+			return fmt.Errorf("h2c-stream-window must be positive")
+		}
+	}
+	if a.TCPFastOpen < 0 {
+		return fmt.Errorf("tcp-fastopen queue length must not be negative")
+	}
 	if a.CIDRRange != nil {
 		if a.CIDR == nil {
 			return fmt.Errorf("CIDR range requires a CIDR")
@@ -200,6 +250,7 @@ func DefaultBootArgs() BootArgs {
 		ReuseAddr:       &reuse,
 		MaxPendingDials: DefaultMaxPendingDials,
 		NDPProxyMax:     DefaultNDPProxyMax,
+		H2C:             DefaultH2CConfig(),
 		UDP: UDPConfig{
 			MaxPacketSize:       DefaultUDPMaxPacketSize,
 			BatchSize:           DefaultUDPBatchSize,

@@ -47,7 +47,7 @@ func NewAutoDetectServer(ctx Context, certPath, keyPath string) (*AutoDetectServ
 		network = "tcp6"
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort))
+	listeners, err := serverbase.ListenTCPShards(lifetime, network, ctx.Bind.String(), serverbase.AcceptShards(ctx.ReusePort), ctx.TCPFastOpen)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -181,7 +181,7 @@ func (s *AutoDetectServer) accept(conn net.Conn) {
 		s.serveHTTPS(ctx, &bufferedConn{Conn: conn, br: br})
 	default:
 		// HTTP: serve plain HTTP.
-		s.serveHTTP(ctx, conn, br)
+		s.serveHTTP(ctx, conn, br, first[0])
 	}
 }
 
@@ -221,7 +221,16 @@ func (s *AutoDetectServer) serveHTTPS(ctx context.Context, conn net.Conn) {
 }
 
 // serveHTTP serves plain HTTP on the connection.
-func (s *AutoDetectServer) serveHTTP(ctx context.Context, conn net.Conn, br *bufio.Reader) {
+func (s *AutoDetectServer) serveHTTP(ctx context.Context, conn net.Conn, br *bufio.Reader, first byte) {
+	if s.httpHdl.H2CEnabled() && first == 'P' {
+		_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
+		if http.IsH2CPreface(br) {
+			_ = conn.SetReadDeadline(time.Time{})
+			s.httpHdl.ServeH2C(ctx, conn, br)
+			_ = conn.Close()
+			return
+		}
+	}
 	bw := serverbase.AcquireBufferedWriter(conn)
 	defer serverbase.ReleaseBufferedWriter(bw)
 	for {

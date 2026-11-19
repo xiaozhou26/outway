@@ -183,6 +183,36 @@ func TestRunSourcePolicyFromFileAndFlags(t *testing.T) {
 	}
 }
 
+func TestRunH2CAndFastOpenFromFileAndFlags(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outway.yaml")
+	content := "h2c: true\nh2c-stream-window: 8388608\ntcp-fastopen: 128\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetFlagVars()
+	var got config.BootArgs
+	exec := func(cmd *cobra.Command, _ []string) error {
+		a, err := buildBootArgs(proxyNameFromArgs(cmd))
+		got = a
+		return err
+	}
+	if err := run([]string{"outway", "run", "http", "--h2c-max-streams", "64", "--config", path}, exec); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := config.H2CConfig{Enabled: true, MaxStreams: 64, ConnWindow: config.DefaultH2CConnWindow, StreamWindow: 8 << 20}
+	if got.H2C != want || got.TCPFastOpen != 128 {
+		t.Fatalf("got h2c=%+v fastopen=%d, want %+v and 128", got.H2C, got.TCPFastOpen, want)
+	}
+
+	resetFlagVars()
+	if err := run([]string{"outway", "run", "http"}, exec); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got.H2C != config.DefaultH2CConfig() || got.TCPFastOpen != 0 {
+		t.Fatalf("defaults changed: h2c=%+v fastopen=%d", got.H2C, got.TCPFastOpen)
+	}
+}
+
 func TestVersionOutput(t *testing.T) {
 	for _, args := range [][]string{{"--version"}, {"version"}} {
 		cmd := newRootCmd(func(*cobra.Command, []string) error { return nil })

@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -77,6 +78,10 @@ type Context struct {
 	Connector      *connect.Connector
 	UDP            config.UDPConfig
 	ReusePort      bool
+	// H2C enables HTTP/2 cleartext CONNECT tunnels on HTTP listeners.
+	H2C config.H2CConfig
+	// TCPFastOpen is the TCP_FASTOPEN queue length for listeners (0: off).
+	TCPFastOpen int
 }
 
 // AcceptShards returns how many SO_REUSEPORT listeners/accept loops to run.
@@ -134,11 +139,30 @@ func AddrPortOf(a net.Addr) netip.AddrPort {
 // spreads incoming connections across them and a separate accept goroutine can
 // run per shard. It falls back to a single listener when sharding is off or
 // unsupported. A tcp6 network retries as tcp to allow dual-stack binds.
-func ListenTCPShards(ctx context.Context, network, addr string, shards int) ([]net.Listener, error) {
+//
+// fastOpen > 0 enables TCP Fast Open on every listener with that queue length
+// (Linux only; elsewhere it is ignored with a warning).
+func ListenTCPShards(ctx context.Context, network, addr string, shards, fastOpen int) ([]net.Listener, error) {
 	sharded := shards > 1 && reusePortSupported
+	if fastOpen > 0 && !fastOpenSupported {
+		slog.Warn("tcp-fastopen is only supported on Linux; ignoring it")
+		fastOpen = 0
+	}
 	var control func(string, string, syscall.RawConn) error
-	if sharded {
-		control = controlReusePort
+	if sharded || fastOpen > 0 {
+		control = func(network, address string, c syscall.RawConn) error {
+			if sharded {
+				if err := controlReusePort(network, address, c); err != nil {
+					return err
+				}
+			}
+			if fastOpen > 0 {
+				if err := setFastOpen(c, fastOpen); err != nil {
+					return fmt.Errorf("enable TCP Fast Open: %w", err)
+				}
+			}
+			return nil
+		}
 	}
 	lc := net.ListenConfig{Control: control}
 

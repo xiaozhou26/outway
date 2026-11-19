@@ -35,6 +35,11 @@ type FileConfig struct {
 	StrictSource    *bool   `yaml:"strict-source"`
 	NDPProxy        *string `yaml:"ndp-proxy"`
 	NDPProxyMax     *int    `yaml:"ndp-proxy-max"`
+	H2C             *bool   `yaml:"h2c"`
+	H2CMaxStreams   *uint32 `yaml:"h2c-max-streams"`
+	H2CConnWindow   *int32  `yaml:"h2c-conn-window"`
+	H2CStreamWindow *int32  `yaml:"h2c-stream-window"`
+	TCPFastOpen     *int    `yaml:"tcp-fastopen"`
 	Diagnostics     *string `yaml:"diagnostics"`
 	Username        *string `yaml:"username"`
 	Password        *string `yaml:"password"`

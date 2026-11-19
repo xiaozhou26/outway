@@ -156,3 +156,36 @@ func TestBootArgsValidateNDPProxy(t *testing.T) {
 		t.Error("ndp-proxy-max 0 was accepted")
 	}
 }
+
+func TestH2CAndFastOpenOffByDefault(t *testing.T) {
+	args := DefaultBootArgs()
+	if args.H2C.Enabled || args.TCPFastOpen != 0 {
+		t.Fatalf("h2c=%v tcp-fastopen=%d, want both off by default", args.H2C.Enabled, args.TCPFastOpen)
+	}
+	if args.H2C.ConnWindow < 16<<20 || args.H2C.StreamWindow < 4<<20 {
+		t.Fatalf("default h2c windows conn=%d stream=%d are too small for long fat links", args.H2C.ConnWindow, args.H2C.StreamWindow)
+	}
+}
+
+func TestBootArgsValidateH2C(t *testing.T) {
+	valid := DefaultBootArgs()
+	valid.Proxy.Kind = ProxyAuto
+	valid.H2C.Enabled = true
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("h2c on auto: %v", err)
+	}
+	for name, mutate := range map[string]func(*BootArgs){
+		"socks5 proxy":       func(a *BootArgs) { a.Proxy.Kind = ProxySocks5 },
+		"https proxy":        func(a *BootArgs) { a.Proxy.Kind = ProxyHTTPS },
+		"zero streams":       func(a *BootArgs) { a.H2C.MaxStreams = 0 },
+		"tiny conn window":   func(a *BootArgs) { a.H2C.ConnWindow = 1024 },
+		"zero stream window": func(a *BootArgs) { a.H2C.StreamWindow = 0 },
+		"negative fastopen":  func(a *BootArgs) { a.TCPFastOpen = -1 },
+	} {
+		args := valid
+		mutate(&args)
+		if err := args.Validate(); err == nil {
+			t.Errorf("%s: expected a validation error", name)
+		}
+	}
+}

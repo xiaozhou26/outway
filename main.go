@@ -34,6 +34,11 @@ var (
 	flagStrictSource           bool
 	flagNDPProxy               string
 	flagNDPProxyMax            int
+	flagH2C                    bool
+	flagH2CMaxStreams          uint32
+	flagH2CConnWindow          int32
+	flagH2CStreamWindow        int32
+	flagTCPFastOpen            int
 	flagDiagnostics            string
 	flagUDPMaxPacketSize       int
 	flagUDPBatchSize           int
@@ -223,6 +228,21 @@ func applyFileConfig(fc *config.FileConfig) {
 	if fc.NDPProxyMax != nil {
 		flagNDPProxyMax = *fc.NDPProxyMax
 	}
+	if fc.H2C != nil {
+		flagH2C = *fc.H2C
+	}
+	if fc.H2CMaxStreams != nil {
+		flagH2CMaxStreams = *fc.H2CMaxStreams
+	}
+	if fc.H2CConnWindow != nil {
+		flagH2CConnWindow = *fc.H2CConnWindow
+	}
+	if fc.H2CStreamWindow != nil {
+		flagH2CStreamWindow = *fc.H2CStreamWindow
+	}
+	if fc.TCPFastOpen != nil {
+		flagTCPFastOpen = *fc.TCPFastOpen
+	}
 	if fc.Diagnostics != nil {
 		flagDiagnostics = *fc.Diagnostics
 	}
@@ -355,6 +375,11 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.BoolVar(&flagStrictSource, "strict-source", false, "Never race or fall back away from the CIDR source for targets that have an address in its family")
 	pf.StringVar(&flagNDPProxy, "ndp-proxy", "", "Install proxy-NDP entries on this interface for chosen IPv6 source addresses (Linux only)")
 	pf.IntVar(&flagNDPProxyMax, "ndp-proxy-max", config.DefaultNDPProxyMax, "Maximum proxy-NDP entries kept installed (least recently used are removed)")
+	pf.BoolVar(&flagH2C, "h2c", false, "Accept HTTP/2 cleartext (prior knowledge) CONNECT tunnels multiplexed on one connection (http and auto)")
+	pf.Uint32Var(&flagH2CMaxStreams, "h2c-max-streams", config.DefaultH2CMaxStreams, "Maximum concurrent h2c CONNECT tunnels per client connection")
+	pf.Int32Var(&flagH2CConnWindow, "h2c-conn-window", config.DefaultH2CConnWindow, "h2c connection-level receive window in bytes")
+	pf.Int32Var(&flagH2CStreamWindow, "h2c-stream-window", config.DefaultH2CStreamWindow, "h2c per-tunnel receive window in bytes")
+	pf.IntVar(&flagTCPFastOpen, "tcp-fastopen", 0, "TCP Fast Open queue length for TCP listeners (Linux only; 0 disables)")
 	pf.StringVar(&flagDiagnostics, "diagnostics", "", "Diagnostic HTTP bind address for metrics and pprof (empty: disabled)")
 	pf.StringVar(&flagConfigFile, "config", "", "YAML config file providing defaults for unset flags")
 	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
@@ -406,6 +431,13 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 		StrictSource:    flagStrictSource,
 		NDPProxy:        flagNDPProxy,
 		NDPProxyMax:     flagNDPProxyMax,
+		H2C: config.H2CConfig{
+			Enabled:      flagH2C,
+			MaxStreams:   flagH2CMaxStreams,
+			ConnWindow:   flagH2CConnWindow,
+			StreamWindow: flagH2CStreamWindow,
+		},
+		TCPFastOpen: flagTCPFastOpen,
 		UDP: config.UDPConfig{
 			MaxPacketSize:              flagUDPMaxPacketSize,
 			BatchSize:                  flagUDPBatchSize,

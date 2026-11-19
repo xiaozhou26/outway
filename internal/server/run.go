@@ -108,6 +108,8 @@ func Run(args config.BootArgs) error {
 		Connector:      connector,
 		UDP:            args.UDP,
 		ReusePort:      args.ReusePort,
+		H2C:            args.H2C,
+		TCPFastOpen:    args.TCPFastOpen,
 	}
 
 	srv, err := newProxyServer(args.Proxy, ctx)
