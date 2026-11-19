@@ -30,6 +30,15 @@ const (
 	// are detected without waiting for TCP keepalive.
 	h2cPingInterval = 30 * time.Second
 	h2cPingTimeout  = 15 * time.Second
+	// h2cMaxFrameSize is the SETTINGS_MAX_FRAME_SIZE outway advertises: the
+	// largest DATA frame a client may send. It is the RFC 9113 default, not
+	// x/net's 1 MiB. Go's client writes each DATA frame while holding its
+	// connection write lock, and that write blocks while the socket is full.
+	// So the HEADERS of a new tunnel waits behind one frame from every busy
+	// upload stream on the connection. With 1 MiB frames and 64 uploading
+	// streams that wait reached seconds; 16 KiB frames keep it short at the
+	// same throughput.
+	h2cMaxFrameSize = 16 << 10
 	// h2cCopyBufferSize matches the userspace TCP copy buffer.
 	h2cCopyBufferSize = 32 * 1024
 )
@@ -52,6 +61,7 @@ func newH2CServer(cfg config.H2CConfig) *h2cServer {
 	return &h2cServer{
 		server: &http2.Server{
 			MaxConcurrentStreams:         cfg.MaxStreams,
+			MaxReadFrameSize:             h2cMaxFrameSize,
 			MaxUploadBufferPerConnection: cfg.ConnWindow,
 			MaxUploadBufferPerStream:     cfg.StreamWindow,
 			ReadIdleTimeout:              h2cPingInterval,

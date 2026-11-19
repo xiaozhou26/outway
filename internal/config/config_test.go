@@ -162,8 +162,13 @@ func TestH2CAndFastOpenOffByDefault(t *testing.T) {
 	if args.H2C.Enabled || args.TCPFastOpen != 0 {
 		t.Fatalf("h2c=%v tcp-fastopen=%d, want both off by default", args.H2C.Enabled, args.TCPFastOpen)
 	}
-	if args.H2C.ConnWindow < 16<<20 || args.H2C.StreamWindow < 4<<20 {
-		t.Fatalf("default h2c windows conn=%d stream=%d are too small for long fat links", args.H2C.ConnWindow, args.H2C.StreamWindow)
+	// Large enough for a long link, small enough that a new tunnel's
+	// HEADERS does not queue behind megabytes of other streams' uploads.
+	if w := args.H2C.ConnWindow; w < 1<<20 || w > 4<<20 {
+		t.Fatalf("default h2c connection window %d outside [1 MiB, 4 MiB]", w)
+	}
+	if args.H2C.StreamWindow > args.H2C.ConnWindow {
+		t.Fatalf("default stream window %d exceeds connection window %d", args.H2C.StreamWindow, args.H2C.ConnWindow)
 	}
 }
 

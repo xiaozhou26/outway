@@ -62,13 +62,16 @@ const DefaultMaxPendingDials = 512
 // installed at once.
 const DefaultNDPProxyMax = 65536
 
-// HTTP/2 cleartext (h2c) CONNECT defaults. The receive windows are sized for
-// long fat links: HTTP/2's 64 KiB default window would cap a 70 ms RTT tunnel
-// at under 1 MB/s, far below raw TCP.
+// HTTP/2 cleartext (h2c) CONNECT defaults. The receive windows bound the
+// upload direction. HTTP/2's 64 KiB default would cap a 70 ms RTT connection
+// at under 1 MB/s. A window much larger than the path's bandwidth-delay
+// product does not add throughput. It lets the client queue megabytes of DATA
+// ahead of a new tunnel's HEADERS, which then waits seconds for its 200 while
+// other streams upload. 2 MiB covers about 28 MB/s per connection at 70 ms.
 const (
 	DefaultH2CMaxStreams   = 1000
-	DefaultH2CConnWindow   = 16 << 20
-	DefaultH2CStreamWindow = 4 << 20
+	DefaultH2CConnWindow   = 2 << 20
+	DefaultH2CStreamWindow = 2 << 20
 )
 
 // H2CConfig controls HTTP/2 cleartext CONNECT multiplexing (RFC 9113 §8.5) on

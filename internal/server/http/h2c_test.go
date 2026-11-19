@@ -314,7 +314,7 @@ func TestH2CEarlyDataAndFlowControlWindows(t *testing.T) {
 
 	rd := http2.NewFramer(io.Discard, conn)
 	rd.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
-	var streamWindow, connIncrement uint32
+	var streamWindow, connIncrement, maxFrame uint32
 	var status string
 	var echoed []byte
 	for len(echoed) < len(early) {
@@ -326,6 +326,9 @@ func TestH2CEarlyDataAndFlowControlWindows(t *testing.T) {
 		case *http2.SettingsFrame:
 			if v, ok := f.Value(http2.SettingInitialWindowSize); ok {
 				streamWindow = v
+			}
+			if v, ok := f.Value(http2.SettingMaxFrameSize); ok {
+				maxFrame = v
 			}
 		case *http2.WindowUpdateFrame:
 			if f.StreamID == 0 && connIncrement == 0 {
@@ -350,6 +353,11 @@ func TestH2CEarlyDataAndFlowControlWindows(t *testing.T) {
 	}
 	if want := uint32(cfg.ConnWindow) - 65535; connIncrement != want {
 		t.Fatalf("connection window update %d, want %d", connIncrement, want)
+	}
+	// Small DATA frames keep a new stream's HEADERS from waiting behind a
+	// 1 MiB frame from every uploading stream in the client's write path.
+	if maxFrame != h2cMaxFrameSize {
+		t.Fatalf("advertised max frame size %d, want %d", maxFrame, h2cMaxFrameSize)
 	}
 }
 

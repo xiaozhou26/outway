@@ -257,15 +257,33 @@ preface (`PRI * HTTP/2.0`) go to the HTTP/2 server; everything else is served
 as before. Each stream is one CONNECT tunnel (RFC 9113 §8.5) and is
 authenticated on its own `Proxy-Authorization` header, so username extensions
 such as `user-session-<id>` work per stream. The client may send DATA right
-behind HEADERS, before the `200` arrives. Flow-control windows default to
-16 MiB per connection and 4 MiB per stream, so a single stream can fill a
-fat, long link. Idle connections are pinged every 30 s.
+behind HEADERS, before the `200` arrives. Idle connections are pinged every
+30 s.
+
+The upload windows default to 2 MiB per connection and per stream. That is
+about 28 MB/s per connection at 70 ms RTT. Size `h2c-conn-window` near the
+bandwidth-delay product of the client→proxy path, not far above it. Every
+tunnel on a connection shares one TCP flow. When other streams are uploading,
+a new tunnel's HEADERS queues behind whatever DATA the window lets the client
+send first. Measured at 70 ms RTT with 24 streams uploading on one
+connection:
+
+| `h2c-conn-window` | no loss: upload, new-tunnel `200` p50 | 0.1% loss: upload, `200` p50 |
+|---|---|---|
+| 16 MiB | 16 MB/s, 350 ms | 1.4–2.3 MB/s, 2.6–6.3 s |
+| 2 MiB (default) | 16 MB/s, 113 ms | 4.1 MB/s, 1.0 s |
+| 1 MiB | 10–13 MB/s, 77 ms | 6.5 MB/s, 180 ms |
+
+Keep bulk uploads and latency-sensitive new tunnels from piling onto one
+connection. Spread streams over several connections, or cap streams per
+connection in the client. One TCP flow over a lossy long path is slow
+whatever the protocol, and h2c puts all its streams in that one flow.
 
 ```yaml
 h2c: true
 h2c-max-streams: 1000        # concurrent tunnels per client connection
-h2c-conn-window: 16777216    # receive window per connection (bytes)
-h2c-stream-window: 4194304   # receive window per stream (bytes)
+h2c-conn-window: 2097152     # upload window per connection (bytes); ~ path BDP
+h2c-stream-window: 2097152   # upload window per stream (bytes)
 tcp-fastopen: 256            # TFO queue length on the listen sockets
 ```
 
@@ -526,8 +544,8 @@ outway version          # Print the version (also: outway --version)
 | `--ndp-proxy-max` | | `65536` | Maximum proxy-NDP entries kept installed; least recently used are removed |
 | `--h2c` | | `false` | Accept HTTP/2 cleartext CONNECT tunnels on the same port (http/auto) |
 | `--h2c-max-streams` | | `1000` | Maximum concurrent tunnels per HTTP/2 connection |
-| `--h2c-conn-window` | | `16777216` | HTTP/2 receive window per connection, in bytes |
-| `--h2c-stream-window` | | `4194304` | HTTP/2 receive window per stream, in bytes |
+| `--h2c-conn-window` | | `2097152` | HTTP/2 upload window per connection, in bytes (size near the path's bandwidth-delay product) |
+| `--h2c-stream-window` | | `2097152` | HTTP/2 upload window per stream, in bytes |
 | `--tcp-fastopen` | | `0` | `TCP_FASTOPEN` queue length on listen sockets (Linux only; ignored with a warning elsewhere); `0` disables it |
 | `--diagnostics` | | disabled | Diagnostic HTTP bind address exposing `/metrics` and pprof endpoints (e.g. `127.0.0.1:9100`) |
 | `--tcp-user-timeout` | | `30` | Outbound TCP user timeout (seconds, Linux only) |
