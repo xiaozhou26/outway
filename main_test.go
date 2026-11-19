@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/xiaozhou26/outway/internal/config"
+	"github.com/xiaozhou26/outway/internal/oneself"
 )
 
 func TestConfigPathFromArgs(t *testing.T) {
@@ -149,5 +151,20 @@ func TestPreloadConfigFileIgnoresNonRunCommands(t *testing.T) {
 	err := preloadConfigFile([]string{"outway", "self", "update", "--config", filepath.Join(t.TempDir(), "absent.yaml")})
 	if err != nil {
 		t.Errorf("preloadConfigFile(self update) = %v, want nil", err)
+	}
+}
+
+func TestVersionOutput(t *testing.T) {
+	for _, args := range [][]string{{"--version"}, {"version"}} {
+		cmd := newRootCmd(func(*cobra.Command, []string) error { return nil })
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if got, want := out.String(), "outway "+oneself.Version()+"\n"; got != want {
+			t.Fatalf("%v printed %q, want %q", args, got, want)
+		}
 	}
 }

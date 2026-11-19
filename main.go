@@ -81,7 +81,18 @@ func newRootCmd(exec func(cmd *cobra.Command, args []string) error) *cobra.Comma
 		Short:         "A high-performance HTTP/HTTPS/SOCKS5 proxy server",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Version:       oneself.Version(),
 	}
+	rootCmd.SetVersionTemplate("outway {{.Version}}\n")
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "version",
+		Short: "Print the version",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "outway %s\n", oneself.Version())
+			return err
+		},
+	})
 
 	// run command and its proxy subcommands.
 	runCmd := newProxyCommand("run", "Run server", exec)
