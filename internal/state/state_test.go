@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -78,5 +79,68 @@ func TestPreparePrivateDirectoryTightensPermissions(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o700 {
 		t.Fatalf("state directory mode = %o, want 700", got)
+	}
+}
+
+func stubPlatform(t *testing.T, os string, euid int, homeErr error) {
+	t.Helper()
+	savedGOOS, savedEUID, savedHome := goos, geteuid, userHomeDir
+	goos = os
+	geteuid = func() int { return euid }
+	userHomeDir = func() (string, error) {
+		if homeErr != nil {
+			return "", homeErr
+		}
+		return "/home/someone", nil
+	}
+	t.Cleanup(func() { goos, geteuid, userHomeDir = savedGOOS, savedEUID, savedHome })
+}
+
+func TestDirectoryLinuxRootWithoutHomeUsesVarLib(t *testing.T) {
+	t.Setenv("STATE_DIRECTORY", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	stubPlatform(t, "linux", 0, errors.New("$HOME is not defined"))
+	got, err := Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/var/lib/outway" {
+		t.Fatalf("Directory() = %q, want /var/lib/outway", got)
+	}
+}
+
+func TestDirectoryLinuxNonRootWithoutHomeFails(t *testing.T) {
+	t.Setenv("STATE_DIRECTORY", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	stubPlatform(t, "linux", 1000, errors.New("$HOME is not defined"))
+	if got, err := Directory(); err == nil {
+		t.Fatalf("Directory() = %q, want an error for non-root without HOME", got)
+	}
+}
+
+func TestDirectoryLinuxRootWithHomeKeepsHomeState(t *testing.T) {
+	t.Setenv("STATE_DIRECTORY", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	stubPlatform(t, "linux", 0, nil)
+	got, err := Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join("/home/someone", ".local", "state", directoryName); got != want {
+		t.Fatalf("Directory() = %q, want %q", got, want)
+	}
+}
+
+func TestDirectoryLinuxPrefersXDGOverVarLib(t *testing.T) {
+	t.Setenv("STATE_DIRECTORY", "")
+	xdg := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", xdg)
+	stubPlatform(t, "linux", 0, errors.New("$HOME is not defined"))
+	got, err := Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(xdg, directoryName); got != want {
+		t.Fatalf("Directory() = %q, want %q", got, want)
 	}
 }
