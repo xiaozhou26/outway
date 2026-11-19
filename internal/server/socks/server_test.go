@@ -736,3 +736,22 @@ func writeUDPResponse(inbound *net.UDPConn, clientAddr netip.AddrPort, pkt outbo
 	_, err := inbound.WriteToUDPAddrPort(packet, clientAddr)
 	return err
 }
+
+func TestPickFamilyTargetStrictPrefersPrimaryFamily(t *testing.T) {
+	v4 := netip.MustParseAddr("198.51.100.1")
+	v6 := netip.MustParseAddr("2001:db8::1")
+	addrs := []netip.Addr{v4, v6}
+	// Preferred socket IPv6 (CIDR), fallback IPv4.
+	got, ok := pickFamilyTarget(addrs, 53, false, true, true, false)
+	if !ok || got.Addr() != v4 {
+		t.Fatalf("non-strict = %v,%v; want first usable (%s)", got, ok, v4)
+	}
+	got, ok = pickFamilyTarget(addrs, 53, false, true, true, true)
+	if !ok || got.Addr() != v6 {
+		t.Fatalf("strict = %v,%v; want CIDR-family %s", got, ok, v6)
+	}
+	got, ok = pickFamilyTarget([]netip.Addr{v4}, 53, false, true, true, true)
+	if !ok || got.Addr() != v4 {
+		t.Fatalf("strict with IPv4-only target = %v,%v; want fallback %s", got, ok, v4)
+	}
+}

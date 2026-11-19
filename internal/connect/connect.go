@@ -46,7 +46,22 @@ type Connector struct {
 	ConnectTimeout time.Duration
 	TCPUserTimeout *time.Duration // Linux only
 	ReuseAddr      *bool
-	dialSlots      chan struct{}
+	// SessionSpread maps session/TTL extensions onto the whole host field
+	// through a strong 64→128-bit mixer instead of the Rust-compatible
+	// `base | value mod capacity`, so sessions spread across every subnet of a
+	// short prefix and adjacent IDs land on unrelated addresses. Off by
+	// default because enabling it remaps every existing session.
+	SessionSpread bool
+	// StrictSource pins targets that have an address in the CIDR's family to
+	// the CIDR source: other-family addresses are discarded and the fallback
+	// is never raced. The fallback serves only targets with no CIDR-family
+	// address.
+	StrictSource bool
+	// PrepareSource, when non-nil, runs on every source address chosen from
+	// the CIDR before it is bound (e.g. installing a proxy-NDP entry). It must
+	// be cheap for already-seen addresses and must not fail the dial.
+	PrepareSource func(netip.Addr)
+	dialSlots     chan struct{}
 	// udpDialSlots bounds concurrent outbound UDP socket creations with the
 	// same budget and semantics as dialSlots (0 = unbounded), so association
 	// or tunnel bursts cannot exhaust fds without backpressure.
@@ -126,12 +141,7 @@ type TcpConnector struct {
 // the default function. Used by SOCKS5 BIND.
 func (t TcpConnector) SocketAddr(defaultFn func() (netip.Addr, error)) (netip.AddrPort, error) {
 	if t.inner.CIDR != nil {
-		if t.inner.CIDR.Addr().Is4() {
-			addr := assignIPv4FromExtension(*t.inner.CIDR, t.inner.CIDRRange, t.extension)
-			return netip.AddrPortFrom(addr, 0), nil
-		}
-		addr := assignIPv6FromExtension(*t.inner.CIDR, t.inner.CIDRRange, t.extension)
-		return netip.AddrPortFrom(addr, 0), nil
+		return netip.AddrPortFrom(t.inner.sourceIP(t.extension), 0), nil
 	}
 	if t.inner.Fallback != nil && !t.inner.Fallback.IsInterface() {
 		return netip.AddrPortFrom(t.inner.Fallback.Address, 0), nil
@@ -156,7 +166,7 @@ func (t TcpConnector) Connect(ctx context.Context, target TargetAddr) (*net.TCPC
 		if err != nil {
 			return nil, err
 		}
-		addrs = resolved
+		addrs = t.inner.strictAddrs(resolved)
 	}
 
 	return t.connectAny(ctx, addrs)
@@ -245,7 +255,7 @@ func (t TcpConnector) connectAddr(ctx context.Context, target netip.AddrPort) (*
 		return nil, fmt.Errorf("target %s address family does not match source CIDR %s; configure a fallback for dual-stack proxying", target, *t.inner.CIDR)
 	}
 	switch {
-	case t.inner.CIDR != nil && t.inner.Fallback != nil:
+	case t.inner.CIDR != nil && t.inner.Fallback != nil && !t.inner.StrictSource:
 		return t.connectWithCIDRFallback(ctx, target, *t.inner.CIDR, *t.inner.Fallback)
 	case t.inner.CIDR != nil:
 		return t.connectWithCIDR(ctx, target, *t.inner.CIDR)
@@ -307,8 +317,8 @@ func (t TcpConnector) connectPlain(ctx context.Context, target netip.AddrPort) (
 	return t.dialContext(ctx, netip.Addr{}, "", target)
 }
 
-func (t TcpConnector) connectWithCIDR(ctx context.Context, target netip.AddrPort, cidr netip.Prefix) (*net.TCPConn, error) {
-	bindIP := assignSourceIP(cidr, t.inner.CIDRRange, t.extension)
+func (t TcpConnector) connectWithCIDR(ctx context.Context, target netip.AddrPort, _ netip.Prefix) (*net.TCPConn, error) {
+	bindIP := t.inner.sourceIP(t.extension)
 	return t.dialContext(ctx, bindIP, "", target)
 }
 
@@ -465,8 +475,8 @@ func (u UdpConnector) createSocketWithAddr(ip netip.Addr) (*net.UDPConn, error) 
 	return net.ListenUDP("udp", &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: 0})
 }
 
-func (u UdpConnector) createSocketWithCIDR(cidr netip.Prefix) (*net.UDPConn, error) {
-	ip := assignSourceIP(cidr, u.inner.CIDRRange, u.extension)
+func (u UdpConnector) createSocketWithCIDR(_ netip.Prefix) (*net.UDPConn, error) {
+	ip := u.inner.sourceIP(u.extension)
 	return u.createSocketWithAddr(ip)
 }
 
@@ -488,7 +498,7 @@ func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPC
 		if err != nil {
 			return nil, err
 		}
-		addrs = resolved
+		addrs = u.inner.strictAddrs(resolved)
 	}
 
 	if err := u.inner.acquireSlot(u.inner.udpDialSlots, ctx); err != nil {
@@ -504,7 +514,7 @@ func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPC
 			if u.inner.CIDR.Addr().Is4() != addr.Addr().Is4() {
 				continue
 			}
-			bindIP := assignSourceIP(*u.inner.CIDR, u.inner.CIDRRange, u.extension)
+			bindIP := u.inner.sourceIP(u.extension)
 			conn, err := u.dialContext(ctx, bindIP, "", addr)
 			if err == nil {
 				return conn, nil
@@ -513,6 +523,9 @@ func (u UdpConnector) Connect(ctx context.Context, target TargetAddr) (*net.UDPC
 		}
 	}
 	for _, addr := range addrs {
+		if u.inner.pinnedToCIDR(addr) {
+			continue
+		}
 		bindIP, iface, ok := u.fallbackBindForTarget(addr)
 		if !ok {
 			continue
@@ -595,7 +608,7 @@ func (u UdpConnector) SendPacket(ctx context.Context, pkt []byte, target TargetA
 		if err != nil {
 			return 0, err
 		}
-		addrs = resolved
+		addrs = u.inner.strictAddrs(resolved)
 	}
 
 	var lastErr error
@@ -617,7 +630,7 @@ func (u UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr n
 		return 0, err
 	}
 	n, err := u.trySendTo(pkt, addr, preferred)
-	if err == nil || fallback == nil {
+	if err == nil || fallback == nil || u.inner.pinnedToCIDR(addr) {
 		return n, err
 	}
 	return u.trySendTo(pkt, addr, fallback)
@@ -626,6 +639,13 @@ func (u UdpConnector) sendPacketWithAddr(ctx context.Context, pkt []byte, addr n
 func (u UdpConnector) trySendTo(pkt []byte, addr netip.AddrPort, s *net.UDPConn) (int, error) {
 	// WriteToUDPAddrPort avoids the *net.UDPAddr allocation of WriteToUDP.
 	return s.WriteToUDPAddrPort(pkt, addr)
+}
+
+// PreferCIDRFamily reports whether StrictSource is in effect, so callers that
+// pick among resolved addresses themselves (the SOCKS5 UDP batch path) must
+// choose a CIDR-family address whenever one exists.
+func (u UdpConnector) PreferCIDRFamily() bool {
+	return u.inner.StrictSource && u.inner.CIDR != nil
 }
 
 // LookupCachedHost returns resolved addresses for host from the DNS cache
@@ -660,12 +680,129 @@ func resolveHost(ctx context.Context, host string, port uint16) ([]netip.AddrPor
 	return addrs, nil
 }
 
+// sourceIP picks the CIDR source address for e and runs the PrepareSource
+// hook on it. The caller must have checked that c.CIDR is set.
+func (c *Connector) sourceIP(e ext.Extension) netip.Addr {
+	ip := assignSourceIP(*c.CIDR, c.CIDRRange, e, c.SessionSpread)
+	if c.PrepareSource != nil {
+		c.PrepareSource(ip)
+	}
+	return ip
+}
+
+// pinnedToCIDR reports whether StrictSource forbids sending traffic for addr
+// anywhere but the CIDR source, i.e. addr is in the CIDR's family.
+func (c *Connector) pinnedToCIDR(addr netip.AddrPort) bool {
+	return c.StrictSource && c.CIDR != nil && c.CIDR.Addr().Is4() == addr.Addr().Unmap().Is4()
+}
+
+// strictAddrs applies StrictSource to a resolved address list: when any
+// address is in the CIDR's family, only those are kept, so neither the
+// Happy-Eyeballs race nor the fallback can carry the connection out over the
+// other family. A target with no CIDR-family address is returned unchanged
+// and is served by the fallback.
+func (c *Connector) strictAddrs(addrs []netip.AddrPort) []netip.AddrPort {
+	if !c.StrictSource || c.CIDR == nil {
+		return addrs
+	}
+	matching := 0
+	for _, addr := range addrs {
+		if c.pinnedToCIDR(addr) {
+			matching++
+		}
+	}
+	if matching == 0 || matching == len(addrs) {
+		return addrs
+	}
+	kept := make([]netip.AddrPort, 0, matching)
+	for _, addr := range addrs {
+		if c.pinnedToCIDR(addr) {
+			kept = append(kept, addr)
+		}
+	}
+	return kept
+}
+
 // assignSourceIP picks a source IP from the CIDR for the given extension.
-func assignSourceIP(cidr netip.Prefix, cidrRange *uint8, e ext.Extension) netip.Addr {
+// spread selects the session-spread mapping for session/TTL extensions.
+func assignSourceIP(cidr netip.Prefix, cidrRange *uint8, e ext.Extension, spread bool) netip.Addr {
+	if spread {
+		if value, ok := sessionValue(e); ok {
+			if cidr.Addr().Is4() {
+				return spreadIPv4(cidr, value)
+			}
+			return spreadIPv6(cidr, value)
+		}
+	}
 	if cidr.Addr().Is4() {
 		return assignIPv4FromExtension(cidr, cidrRange, e)
 	}
 	return assignIPv6FromExtension(cidr, cidrRange, e)
+}
+
+// sessionValue returns the hash carried by a session or TTL extension, the
+// two extension types that pin a client to one address.
+func sessionValue(e ext.Extension) (uint64, bool) {
+	switch e.Type {
+	case ext.ExtSession, ext.ExtTTL:
+		return e.Value, true
+	default:
+		return 0, false
+	}
+}
+
+// splitmixGamma is the splitmix64 increment (2^64 / golden ratio).
+const splitmixGamma = 0x9e3779b97f4a7c15
+
+// splitmix64 is one splitmix64 step on state x: a full-avalanche 64-bit
+// bijection, so inputs that differ in a single bit produce unrelated outputs.
+func splitmix64(x uint64) uint64 {
+	x += splitmixGamma
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	return x ^ (x >> 31)
+}
+
+// spreadBits expands value into 128 well-mixed bits: two consecutive outputs
+// of a splitmix64 generator seeded with value.
+func spreadBits(value uint64) uint128 {
+	return uint128{hi: splitmix64(value), lo: splitmix64(value + splitmixGamma)}
+}
+
+// spreadIPv6 deterministically maps value onto every host bit of cidr
+// (including the subnet bits of a prefix shorter than /64). A zero low word
+// is replaced with 1, which rules out the all-zero host and, for prefixes up
+// to /64, the subnet-router anycast interface ID.
+func spreadIPv6(cidr netip.Prefix, value uint64) netip.Addr {
+	prefixLen := uint(cidr.Bits())
+	if prefixLen >= 128 {
+		return cidr.Masked().Addr()
+	}
+	hostMask := newUint128FromBitRange(128 - prefixLen)
+	host := andUint128(spreadBits(value), hostMask)
+	if host.lo == 0 {
+		host.lo = 1
+	}
+	base := andUint128(ipv6ToUint128(cidr.Masked().Addr()), notUint128(hostMask))
+	return uint128ToIPv6(orUint128(base, host))
+}
+
+// spreadIPv4 deterministically maps value onto the host bits of cidr,
+// avoiding the network (all-zero) and, when the prefix has room for it, the
+// broadcast (all-ones) address.
+func spreadIPv4(cidr netip.Prefix, value uint64) netip.Addr {
+	prefixLen := uint(cidr.Bits())
+	if prefixLen >= 32 {
+		return cidr.Masked().Addr()
+	}
+	hostBits := 32 - prefixLen
+	base := ipv4ToUint32(cidr.Masked().Addr())
+	host := uint32(1) // a /31 has no broadcast; its non-zero host is .1
+	if hostBits >= 2 {
+		usable := (uint64(1) << hostBits) - 2
+		host = uint32(1 + splitmix64(value)%usable)
+	}
+	return uint32ToIPv4(base | host)
 }
 
 // extractValue returns the u64 carried by the extension, if any.

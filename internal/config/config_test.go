@@ -123,3 +123,36 @@ func TestBootArgsValidateAcceptsLoopbackDiagnostics(t *testing.T) {
 		t.Fatalf("expected loopback diagnostics address to validate: %v", err)
 	}
 }
+
+func TestDefaultBootArgsSourcePolicyIsOff(t *testing.T) {
+	args := DefaultBootArgs()
+	if args.SessionSpread || args.StrictSource || args.NDPProxy != "" {
+		t.Fatalf("source policy defaults changed: spread=%v strict=%v ndp=%q", args.SessionSpread, args.StrictSource, args.NDPProxy)
+	}
+	if args.NDPProxyMax != DefaultNDPProxyMax || DefaultNDPProxyMax != 65536 {
+		t.Fatalf("NDPProxyMax = %d, want 65536", args.NDPProxyMax)
+	}
+}
+
+func TestBootArgsValidateNDPProxy(t *testing.T) {
+	v6 := netip.MustParsePrefix("2001:db8::/64")
+	v4 := netip.MustParsePrefix("192.0.2.0/24")
+
+	args := DefaultBootArgs()
+	args.NDPProxy = "eno1"
+	if err := args.Validate(); err == nil {
+		t.Error("ndp-proxy without a CIDR was accepted")
+	}
+	args.CIDR = &v4
+	if err := args.Validate(); err == nil {
+		t.Error("ndp-proxy with an IPv4 CIDR was accepted")
+	}
+	args.CIDR = &v6
+	if err := args.Validate(); err != nil {
+		t.Errorf("valid ndp-proxy rejected: %v", err)
+	}
+	args.NDPProxyMax = 0
+	if err := args.Validate(); err == nil {
+		t.Error("ndp-proxy-max 0 was accepted")
+	}
+}

@@ -31,6 +31,10 @@ type FileConfig struct {
 	ReuseAddr       *bool   `yaml:"reuseaddr"`
 	MaxPendingDials *int    `yaml:"max-pending-dials"`
 	ReusePort       *bool   `yaml:"reuse-port"`
+	SessionSpread   *bool   `yaml:"session-spread"`
+	StrictSource    *bool   `yaml:"strict-source"`
+	NDPProxy        *string `yaml:"ndp-proxy"`
+	NDPProxyMax     *int    `yaml:"ndp-proxy-max"`
 	Diagnostics     *string `yaml:"diagnostics"`
 	Username        *string `yaml:"username"`
 	Password        *string `yaml:"password"`

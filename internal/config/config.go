@@ -58,6 +58,10 @@ const (
 // zero to leave dialing unbounded.
 const DefaultMaxPendingDials = 512
 
+// DefaultNDPProxyMax bounds the proxy-neighbor entries --ndp-proxy keeps
+// installed at once.
+const DefaultNDPProxyMax = 65536
+
 // UDPConfig controls SOCKS5 UDP relay resource usage. SendWorkers set to zero
 // selects an automatic value derived from GOMAXPROCS. MetricsIntervalSecs and
 // AssociationIdleTimeoutSecs set to zero disable the corresponding timer.
@@ -106,9 +110,21 @@ type BootArgs struct {
 	ReuseAddr       *bool
 	MaxPendingDials int
 	ReusePort       bool
-	Diagnostics     *netip.AddrPort
-	UDP             UDPConfig
-	Proxy           ProxyConfig
+	// SessionSpread selects the well-mixed session/TTL → address mapping
+	// (default false keeps the Rust-compatible mapping and existing
+	// addresses).
+	SessionSpread bool
+	// StrictSource keeps targets with a CIDR-family address on the CIDR
+	// source; the fallback serves only targets without one.
+	StrictSource bool
+	// NDPProxy names the interface to answer neighbor solicitations on for
+	// chosen IPv6 source addresses (Linux only; empty disables).
+	NDPProxy string
+	// NDPProxyMax bounds the installed proxy-neighbor entries.
+	NDPProxyMax int
+	Diagnostics *netip.AddrPort
+	UDP         UDPConfig
+	Proxy       ProxyConfig
 }
 
 // Validate checks cross-field constraints that cannot be expressed by the CLI
@@ -153,6 +169,14 @@ func (a BootArgs) Validate() error {
 	if (a.Proxy.TLSCert == "") != (a.Proxy.TLSKey == "") {
 		return fmt.Errorf("TLS certificate and key must be configured together")
 	}
+	if a.NDPProxy != "" {
+		if a.CIDR == nil || !a.CIDR.Addr().Is6() {
+			return fmt.Errorf("ndp-proxy requires an IPv6 CIDR")
+		}
+		if a.NDPProxyMax < 1 {
+			return fmt.Errorf("ndp-proxy-max must be at least 1")
+		}
+	}
 	if a.CIDRRange != nil {
 		if a.CIDR == nil {
 			return fmt.Errorf("CIDR range requires a CIDR")
@@ -175,6 +199,7 @@ func DefaultBootArgs() BootArgs {
 		ConnectTimeout:  10,
 		ReuseAddr:       &reuse,
 		MaxPendingDials: DefaultMaxPendingDials,
+		NDPProxyMax:     DefaultNDPProxyMax,
 		UDP: UDPConfig{
 			MaxPacketSize:       DefaultUDPMaxPacketSize,
 			BatchSize:           DefaultUDPBatchSize,

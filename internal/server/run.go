@@ -13,6 +13,7 @@ import (
 
 	"github.com/xiaozhou26/outway/internal/config"
 	"github.com/xiaozhou26/outway/internal/connect"
+	"github.com/xiaozhou26/outway/internal/ndp"
 	httpsvr "github.com/xiaozhou26/outway/internal/server/http"
 	"github.com/xiaozhou26/outway/internal/server/masque"
 	"github.com/xiaozhou26/outway/internal/server/socks"
@@ -80,6 +81,23 @@ func Run(args config.BootArgs) error {
 		args.ReuseAddr,
 		args.MaxPendingDials,
 	)
+	connector.SessionSpread = args.SessionSpread
+	connector.StrictSource = args.StrictSource
+	if args.SessionSpread || args.StrictSource {
+		slog.Info("Source address policy", "session_spread", args.SessionSpread, "strict_source", args.StrictSource)
+	}
+	if args.NDPProxy != "" {
+		proxyNDP, err := openNDPProxy(args.NDPProxy, args.NDPProxyMax)
+		if err != nil {
+			return err
+		}
+		connector.PrepareSource = proxyNDP.Ensure
+		defer func() {
+			if err := proxyNDP.Close(); err != nil {
+				slog.Warn("Failed to remove proxy NDP entries", "error", err)
+			}
+		}()
+	}
 
 	// Build the context.
 	ctx := Context{
@@ -271,6 +289,9 @@ var configureRoutes = func(cidr netip.Prefix) error { return nil }
 
 // validateSourceCIDR is implemented on Linux and is a no-op elsewhere.
 var validateSourceCIDR = func(cidr netip.Prefix) error { return nil }
+
+// openNDPProxy is swappable so tests can run Run without touching the kernel.
+var openNDPProxy = ndp.Open
 
 // prepareResourceLimits is implemented on Unix and is a no-op elsewhere.
 var prepareResourceLimits = func(args config.BootArgs) error { return nil }

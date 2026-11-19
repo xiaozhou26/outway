@@ -550,8 +550,10 @@ func isAuthorized(src netip.AddrPort, expected netip.Addr) bool {
 // cachedTargetForFamily returns a resolved target for a domain from the DNS
 // cache, choosing a resolved address whose family has an outbound socket. ok is
 // false on a cache miss or when no resolved address matches an available
-// family, so the caller falls back to the resolving worker path.
-func cachedTargetForFamily(domain string, port uint16, preferredV4, hasFallback, fallbackV4 bool) (netip.AddrPort, bool) {
+// family, so the caller falls back to the resolving worker path. With
+// preferPrimary (--strict-source), an address in the preferred socket's family
+// wins whenever one was resolved, so traffic never leaks out the fallback.
+func cachedTargetForFamily(domain string, port uint16, preferredV4, hasFallback, fallbackV4, preferPrimary bool) (netip.AddrPort, bool) {
 	// Literal-IP fast path: parse inline to avoid the per-packet slice
 	// allocation that a cache lookup on an IP literal would cost.
 	if ip, err := netip.ParseAddr(domain); err == nil {
@@ -564,6 +566,20 @@ func cachedTargetForFamily(domain string, port uint16, preferredV4, hasFallback,
 	addrs, ok := connect.LookupCachedHost(domain)
 	if !ok {
 		return netip.AddrPort{}, false
+	}
+	return pickFamilyTarget(addrs, port, preferredV4, hasFallback, fallbackV4, preferPrimary)
+}
+
+// pickFamilyTarget chooses the resolved address cachedTargetForFamily sends to:
+// the first one with an outbound socket of its family, or with preferPrimary
+// the first one in the preferred socket's family when any exists.
+func pickFamilyTarget(addrs []netip.Addr, port uint16, preferredV4, hasFallback, fallbackV4, preferPrimary bool) (netip.AddrPort, bool) {
+	if preferPrimary {
+		for _, addr := range addrs {
+			if unmapped := addr.Unmap(); preferredV4 == unmapped.Is4() {
+				return netip.AddrPortFrom(unmapped, port), true
+			}
+		}
 	}
 	for _, addr := range addrs {
 		unmapped := addr.Unmap()

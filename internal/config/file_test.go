@@ -89,3 +89,33 @@ func TestLoadFileMissingErrors(t *testing.T) {
 		t.Fatal("LoadFile succeeded on a missing file")
 	}
 }
+
+func TestLoadFileSourcePolicyKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outway.yaml")
+	content := `
+cidr: 2001:db8::/64
+session-spread: true
+strict-source: true
+ndp-proxy: eno1
+ndp-proxy-max: 1024
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fc.SessionSpread == nil || !*fc.SessionSpread {
+		t.Errorf("session-spread = %v, want true", fc.SessionSpread)
+	}
+	if fc.StrictSource == nil || !*fc.StrictSource {
+		t.Errorf("strict-source = %v, want true", fc.StrictSource)
+	}
+	if fc.NDPProxy == nil || *fc.NDPProxy != "eno1" {
+		t.Errorf("ndp-proxy = %v, want eno1", fc.NDPProxy)
+	}
+	if fc.NDPProxyMax == nil || *fc.NDPProxyMax != 1024 {
+		t.Errorf("ndp-proxy-max = %v, want 1024", fc.NDPProxyMax)
+	}
+}

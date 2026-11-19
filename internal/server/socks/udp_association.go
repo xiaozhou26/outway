@@ -297,7 +297,7 @@ func (a *udpAssociation) processInbound(pkt inboundPacket) bool {
 	case pkt.dst.Socket != nil:
 		target = netip.AddrPortFrom(pkt.dst.Socket.Addr().Unmap(), pkt.dst.Socket.Port())
 	default:
-		resolved, ok := cachedTargetForFamily(pkt.dst.Domain, pkt.dst.Port, a.preferredV4, a.fallbackWriter != nil, a.fallbackV4)
+		resolved, ok := cachedTargetForFamily(pkt.dst.Domain, pkt.dst.Port, a.preferredV4, a.fallbackWriter != nil, a.fallbackV4, a.connector.PreferCIDRFamily())
 		if !ok {
 			if !a.runtime.dispatch(udpSendJob{
 				associationID: a.associationID,

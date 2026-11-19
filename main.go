@@ -30,6 +30,10 @@ var (
 	flagReuseAddr              bool
 	flagMaxPendingDials        int
 	flagReusePort              bool
+	flagSessionSpread          bool
+	flagStrictSource           bool
+	flagNDPProxy               string
+	flagNDPProxyMax            int
 	flagDiagnostics            string
 	flagUDPMaxPacketSize       int
 	flagUDPBatchSize           int
@@ -207,6 +211,18 @@ func applyFileConfig(fc *config.FileConfig) {
 	if fc.ReusePort != nil {
 		flagReusePort = *fc.ReusePort
 	}
+	if fc.SessionSpread != nil {
+		flagSessionSpread = *fc.SessionSpread
+	}
+	if fc.StrictSource != nil {
+		flagStrictSource = *fc.StrictSource
+	}
+	if fc.NDPProxy != nil {
+		flagNDPProxy = *fc.NDPProxy
+	}
+	if fc.NDPProxyMax != nil {
+		flagNDPProxyMax = *fc.NDPProxyMax
+	}
 	if fc.Diagnostics != nil {
 		flagDiagnostics = *fc.Diagnostics
 	}
@@ -335,6 +351,10 @@ func addBootArgsFlags(cmd *cobra.Command) {
 	pf.BoolVar(&flagReuseAddr, "reuseaddr", true, "Outbound SO_REUSEADDR for TCP sockets")
 	pf.IntVar(&flagMaxPendingDials, "max-pending-dials", config.DefaultMaxPendingDials, "Maximum concurrent outbound TCP dials (0: unlimited)")
 	pf.BoolVar(&flagReusePort, "reuse-port", false, "Shard the listener with SO_REUSEPORT across accept loops (Linux/BSD)")
+	pf.BoolVar(&flagSessionSpread, "session-spread", false, "Spread session/TTL extensions over every host bit of the CIDR with a strong mixer (remaps existing sessions)")
+	pf.BoolVar(&flagStrictSource, "strict-source", false, "Never race or fall back away from the CIDR source for targets that have an address in its family")
+	pf.StringVar(&flagNDPProxy, "ndp-proxy", "", "Install proxy-NDP entries on this interface for chosen IPv6 source addresses (Linux only)")
+	pf.IntVar(&flagNDPProxyMax, "ndp-proxy-max", config.DefaultNDPProxyMax, "Maximum proxy-NDP entries kept installed (least recently used are removed)")
 	pf.StringVar(&flagDiagnostics, "diagnostics", "", "Diagnostic HTTP bind address for metrics and pprof (empty: disabled)")
 	pf.StringVar(&flagConfigFile, "config", "", "YAML config file providing defaults for unset flags")
 	pf.IntVar(&flagUDPMaxPacketSize, "udp-max-packet-size", config.DefaultUDPMaxPacketSize, "Maximum SOCKS5 UDP relay datagram size")
@@ -382,6 +402,10 @@ func buildBootArgs(proxyName string) (config.BootArgs, error) {
 		ReuseAddr:       &flagReuseAddr,
 		MaxPendingDials: flagMaxPendingDials,
 		ReusePort:       flagReusePort,
+		SessionSpread:   flagSessionSpread,
+		StrictSource:    flagStrictSource,
+		NDPProxy:        flagNDPProxy,
+		NDPProxyMax:     flagNDPProxyMax,
 		UDP: config.UDPConfig{
 			MaxPacketSize:              flagUDPMaxPacketSize,
 			BatchSize:                  flagUDPBatchSize,

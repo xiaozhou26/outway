@@ -154,6 +154,35 @@ func TestPreloadConfigFileIgnoresNonRunCommands(t *testing.T) {
 	}
 }
 
+func TestRunSourcePolicyFromFileAndFlags(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outway.yaml")
+	content := "cidr: 2001:db8::/64\nsession-spread: true\nndp-proxy: eno1\nndp-proxy-max: 4096\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetFlagVars()
+	var got config.BootArgs
+	exec := func(cmd *cobra.Command, _ []string) error {
+		a, err := buildBootArgs(proxyNameFromArgs(cmd))
+		got = a
+		return err
+	}
+	if err := run([]string{"outway", "run", "auto", "--strict-source", "--config", path}, exec); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !got.SessionSpread || !got.StrictSource || got.NDPProxy != "eno1" || got.NDPProxyMax != 4096 {
+		t.Fatalf("got spread=%v strict=%v ndp=%q max=%d", got.SessionSpread, got.StrictSource, got.NDPProxy, got.NDPProxyMax)
+	}
+
+	resetFlagVars()
+	if err := run([]string{"outway", "run", "auto"}, exec); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got.SessionSpread || got.StrictSource || got.NDPProxy != "" || got.NDPProxyMax != config.DefaultNDPProxyMax {
+		t.Fatalf("defaults changed: spread=%v strict=%v ndp=%q max=%d", got.SessionSpread, got.StrictSource, got.NDPProxy, got.NDPProxyMax)
+	}
+}
+
 func TestVersionOutput(t *testing.T) {
 	for _, args := range [][]string{{"--version"}, {"version"}} {
 		cmd := newRootCmd(func(*cobra.Command, []string) error { return nil })
